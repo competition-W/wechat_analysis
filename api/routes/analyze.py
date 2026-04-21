@@ -3,7 +3,7 @@ from loguru import logger
 from datetime import datetime
 import asyncio
 import time
-from typing import List
+from typing import List, Optional
 
 from models.request import AnalyzeRequest, AnalysisType, BatchAnalyzeRequest, RoomData
 from models.response import (
@@ -38,6 +38,11 @@ summary_generator = SummaryGenerator()
 highfreq_analyzer = HighFreqAnalyzer()
 unanswered_analyzer = UnansweredAnalyzer()
 
+SUMMARY_SHORT_CIRCUIT_THRESHOLD = 5
+HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD = 3
+HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD = 50
+DEFAULT_SUMMARY_FOR_SHORT = "群内互动较少，暂无核心议题。"
+
 
 @router.post("/chat/analyze", response_model=AnalyzeResponse)
 async def analyze_chat(request: AnalyzeRequest):
@@ -45,7 +50,7 @@ async def analyze_chat(request: AnalyzeRequest):
     
     try:
         messages_dict = [msg.model_dump(by_alias=True) for msg in request.messages]
-        normalized = preprocessor.process(messages_dict)
+        normalized = await asyncio.to_thread(preprocessor.process, messages_dict)
         
         if not normalized:
             return AnalyzeResponse(
@@ -59,43 +64,74 @@ async def analyze_chat(request: AnalyzeRequest):
             )
         
         analysis_types = request.get_analysis_types()
+        msg_count = len(normalized)
+        total_chars = sum(len(m.text_content or "") for m in normalized)
         
         async def run_sentiment():
             if AnalysisType.SENTIMENT in analysis_types:
-                return sentiment_analyzer.analyze(normalized)
+                try:
+                    return await asyncio.to_thread(sentiment_analyzer.analyze, normalized)
+                except Exception as e:
+                    logger.error(f"情感分析失败: {e}")
+                    return None
             return None
         
         async def run_sensitive():
             if AnalysisType.SENSITIVE in analysis_types:
-                detected = sensitive_detector.detect(normalized)
-                return SensitiveResult(
-                    total_hits=detected["total_hits"],
-                    words=[SensitiveWordItem(**w) for w in detected["words"]],
-                )
+                try:
+                    detected = await asyncio.to_thread(sensitive_detector.detect, normalized)
+                    return SensitiveResult(
+                        total_hits=detected["total_hits"],
+                        words=[SensitiveWordItem(**w) for w in detected["words"]],
+                    )
+                except Exception as e:
+                    logger.error(f"敏感词检测失败: {e}")
+                    return None
             return None
         
         async def run_summary():
             if AnalysisType.SUMMARY in analysis_types:
-                return summary_generator.generate(normalized)
+                if msg_count < SUMMARY_SHORT_CIRCUIT_THRESHOLD:
+                    logger.info(f"消息数 {msg_count} < {SUMMARY_SHORT_CIRCUIT_THRESHOLD}，摘要短路返回默认值")
+                    return DEFAULT_SUMMARY_FOR_SHORT
+                try:
+                    return await asyncio.to_thread(summary_generator.generate, normalized)
+                except Exception as e:
+                    logger.error(f"摘要生成失败: {e}")
+                    return None
             return None
         
         async def run_highfreq():
             if AnalysisType.HIGHFREQ in analysis_types:
-                words = highfreq_analyzer.analyze(normalized)
-                return HighFreqResult(
-                    words=[HighFreqWordItem(**w) for w in words],
-                )
+                if msg_count < HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD:
+                    logger.info(f"消息数 {msg_count} < {HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD}，高频词短路返回空列表")
+                    return HighFreqResult(words=[])
+                if total_chars < HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD:
+                    logger.info(f"总字数 {total_chars} < {HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD}，高频词短路返回空列表")
+                    return HighFreqResult(words=[])
+                try:
+                    words = await asyncio.to_thread(highfreq_analyzer.analyze, normalized)
+                    return HighFreqResult(
+                        words=[HighFreqWordItem(**w) for w in words],
+                    )
+                except Exception as e:
+                    logger.error(f"高频词分析失败: {e}")
+                    return HighFreqResult(words=[])
             return None
         
         async def run_unanswered():
             if AnalysisType.UNANSWERED in analysis_types:
-                result = unanswered_analyzer.analyze(normalized)
-                return UnansweredResult(
-                    is_missed=result["is_missed"],
-                    risk_level=result["risk_level"],
-                    missed_messages=[UnansweredDetail(**m) for m in result["missed_messages"]],
-                    suggested_action=result["suggested_action"],
-                )
+                try:
+                    result = await asyncio.to_thread(unanswered_analyzer.analyze, normalized)
+                    return UnansweredResult(
+                        is_missed=result["is_missed"],
+                        risk_level=result["risk_level"],
+                        missed_messages=[UnansweredDetail(**m) for m in result["missed_messages"]],
+                        suggested_action=result["suggested_action"],
+                    )
+                except Exception as e:
+                    logger.error(f"漏回分析失败: {e}")
+                    return None
             return None
         
         sentiment_result, sensitive_result, summary_result, highfreq_result, unanswered_result = await asyncio.gather(
@@ -144,7 +180,7 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
         async with semaphore:
             try:
                 messages_dict = [msg.model_dump(by_alias=True) for msg in room.messages]
-                normalized = preprocessor.process(messages_dict)
+                normalized = await asyncio.to_thread(preprocessor.process, messages_dict)
                 
                 if not normalized:
                     return RoomAnalysisResult(
@@ -158,39 +194,80 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
                         )
                     )
                 
-                sentiment_result = None
-                sensitive_result = None
-                summary_result = None
-                highfreq_result = None
-                unanswered_result = None
+                msg_count = len(normalized)
+                total_chars = sum(len(m.text_content or "") for m in normalized)
                 
-                if AnalysisType.SENTIMENT in analysis_types:
-                    sentiment_result = sentiment_analyzer.analyze(normalized)
+                async def run_sentiment():
+                    if AnalysisType.SENTIMENT in analysis_types:
+                        try:
+                            return await asyncio.to_thread(sentiment_analyzer.analyze, normalized)
+                        except Exception as e:
+                            logger.error(f"群 {room.room_id} 情感分析失败: {e}")
+                            return None
+                    return None
                 
-                if AnalysisType.SENSITIVE in analysis_types:
-                    detected = sensitive_detector.detect(normalized)
-                    sensitive_result = SensitiveResult(
-                        total_hits=detected["total_hits"],
-                        words=[SensitiveWordItem(**w) for w in detected["words"]],
-                    )
+                async def run_sensitive():
+                    if AnalysisType.SENSITIVE in analysis_types:
+                        try:
+                            detected = await asyncio.to_thread(sensitive_detector.detect, normalized)
+                            return SensitiveResult(
+                                total_hits=detected["total_hits"],
+                                words=[SensitiveWordItem(**w) for w in detected["words"]],
+                            )
+                        except Exception as e:
+                            logger.error(f"群 {room.room_id} 敏感词检测失败: {e}")
+                            return None
+                    return None
                 
-                if AnalysisType.SUMMARY in analysis_types:
-                    summary_result = summary_generator.generate(normalized)
+                async def run_summary():
+                    if AnalysisType.SUMMARY in analysis_types:
+                        if msg_count < SUMMARY_SHORT_CIRCUIT_THRESHOLD:
+                            return DEFAULT_SUMMARY_FOR_SHORT
+                        try:
+                            return await asyncio.to_thread(summary_generator.generate, normalized)
+                        except Exception as e:
+                            logger.error(f"群 {room.room_id} 摘要生成失败: {e}")
+                            return None
+                    return None
                 
-                if AnalysisType.HIGHFREQ in analysis_types:
-                    words = highfreq_analyzer.analyze(normalized)
-                    highfreq_result = HighFreqResult(
-                        words=[HighFreqWordItem(**w) for w in words],
-                    )
+                async def run_highfreq():
+                    if AnalysisType.HIGHFREQ in analysis_types:
+                        if msg_count < HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD:
+                            return HighFreqResult(words=[])
+                        if total_chars < HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD:
+                            return HighFreqResult(words=[])
+                        try:
+                            words = await asyncio.to_thread(highfreq_analyzer.analyze, normalized)
+                            return HighFreqResult(
+                                words=[HighFreqWordItem(**w) for w in words],
+                            )
+                        except Exception as e:
+                            logger.error(f"群 {room.room_id} 高频词分析失败: {e}")
+                            return HighFreqResult(words=[])
+                    return None
                 
-                if AnalysisType.UNANSWERED in analysis_types:
-                    result = unanswered_analyzer.analyze(normalized)
-                    unanswered_result = UnansweredResult(
-                        is_missed=result["is_missed"],
-                        risk_level=result["risk_level"],
-                        missed_messages=[UnansweredDetail(**m) for m in result["missed_messages"]],
-                        suggested_action=result["suggested_action"],
-                    )
+                async def run_unanswered():
+                    if AnalysisType.UNANSWERED in analysis_types:
+                        try:
+                            result = await asyncio.to_thread(unanswered_analyzer.analyze, normalized)
+                            return UnansweredResult(
+                                is_missed=result["is_missed"],
+                                risk_level=result["risk_level"],
+                                missed_messages=[UnansweredDetail(**m) for m in result["missed_messages"]],
+                                suggested_action=result["suggested_action"],
+                            )
+                        except Exception as e:
+                            logger.error(f"群 {room.room_id} 漏回分析失败: {e}")
+                            return None
+                    return None
+                
+                sentiment_result, sensitive_result, summary_result, highfreq_result, unanswered_result = await asyncio.gather(
+                    run_sentiment(),
+                    run_sensitive(),
+                    run_summary(),
+                    run_highfreq(),
+                    run_unanswered(),
+                )
                 
                 return RoomAnalysisResult(
                     room_id=room.room_id,
