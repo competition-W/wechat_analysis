@@ -31,7 +31,6 @@ sys.path.insert(0, str(__file__).rsplit("/tests", 1)[0])
 
 from config.settings import settings
 
-
 @dataclass
 class RoomData:
     room_id: str

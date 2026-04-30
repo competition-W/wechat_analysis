@@ -30,6 +30,13 @@ import argparse
 
 import httpx
 
+try:
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
 sys.path.insert(0, str(__file__).rsplit("/tests", 1)[0])
 
 from config.settings import settings
@@ -41,6 +48,7 @@ class RoomData:
     room_id: str
     room_name: Optional[str]
     messages: List[Dict[str, Any]]
+    members: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,6 +63,7 @@ class PerformanceMetrics:
     failed_count: int = 0
     analysis_types: List[str] = field(default_factory=list)
     room_details: List[Dict[str, Any]] = field(default_factory=list)
+    room_members: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=dict)
 
 
 class SystemPerformanceTester:
@@ -93,22 +102,37 @@ class SystemPerformanceTester:
                 print("✗ 没有消息数据")
                 return []
 
-            rooms_dict = defaultdict(lambda: {"room_id": "", "room_name": "", "messages": []})
+            rooms_dict = defaultdict(lambda: {"room_id": "", "room_name": "", "messages": [], "members": defaultdict(dict)})
 
             for msg in messages:
                 room_id = msg.get("roomid", "unknown")
                 if not rooms_dict[room_id]["room_id"]:
                     rooms_dict[room_id]["room_id"] = room_id
-                    rooms_dict[room_id]["room_name"] = msg.get("roomname", f"群-{room_id[:8]}")
+                    room_name = msg.get("re_truename") or msg.get("roomname") or f"群-{room_id[:8]}"
+                    rooms_dict[room_id]["room_name"] = room_name
                 rooms_dict[room_id]["messages"].append(msg)
+                
+                members_str = msg.get("members", "")
+                if members_str:
+                    try:
+                        members_list = json.loads(members_str) if isinstance(members_str, str) else members_str
+                        if isinstance(members_list, list):
+                            for m in members_list:
+                                userid = m.get("userid", "")
+                                if userid:
+                                    rooms_dict[room_id]["members"][userid] = m
+                    except:
+                        pass
 
             rooms = []
             for room_id, room_info in rooms_dict.items():
                 rooms.append(RoomData(
                     room_id=room_info["room_id"],
                     room_name=room_info["room_name"],
-                    messages=room_info["messages"]
+                    messages=room_info["messages"],
+                    members=room_info["members"]
                 ))
+                self.metrics.room_members[room_info["room_id"]] = room_info["members"]
 
             if self.max_rooms and len(rooms) > self.max_rooms:
                 rooms = rooms[:self.max_rooms]
@@ -150,11 +174,18 @@ class SystemPerformanceTester:
 
         rooms_data = []
         for room in rooms:
-            rooms_data.append({
+            room_data = {
                 "room_id": room.room_id,
                 "room_name": room.room_name,
                 "messages": room.messages
-            })
+            }
+            
+            if room.members:
+                all_members = list(room.members.values())
+                if all_members:
+                    room_data["members"] = json.dumps(all_members, ensure_ascii=False)
+            
+            rooms_data.append(room_data)
 
         request_body = {
             "rooms": rooms_data,
@@ -275,10 +306,9 @@ class SystemPerformanceTester:
                     sentiment = room_data.get("sentiment", {})
                     if sentiment:
                         summary = sentiment.get("summary", {})
-                        print(f"     情感分析: 积极={summary.get('positive', 0)}, "
-                              f"中性={summary.get('neutral', 0)}, "
-                              f"消极={summary.get('negative', 0)}, "
-                              f"恶劣={summary.get('very_negative', 0)}")
+                        customer_summary = summary.get("customer", {})
+                        employee_summary = summary.get("employee", {})
+                        print(f"     情感分析: 客户好评={customer_summary.get('good_reviews', 0)}, 客户差评={customer_summary.get('bad_reviews', 0)}, 员工积极={employee_summary.get('positive', 0)}, 员工恶劣={employee_summary.get('bad_attitude', 0)}")
 
                     sensitive = room_data.get("sensitive_words", {})
                     if sensitive:
@@ -403,7 +433,9 @@ class SystemPerformanceTester:
                     sentiment = room_data.get("sentiment", {})
                     if sentiment:
                         summary = sentiment.get("summary", {})
-                        md_content += f"**情感分析**: 积极={summary.get('positive', 0)}, 中性={summary.get('neutral', 0)}, 消极={summary.get('negative', 0)}, 恶劣={summary.get('very_negative', 0)}\n\n"
+                        customer_summary = summary.get("customer", {})
+                        employee_summary = summary.get("employee", {})
+                        md_content += f"**情感分析**: 客户好评={customer_summary.get('good_reviews', 0)}, 客户差评={customer_summary.get('bad_reviews', 0)}, 员工积极={employee_summary.get('positive', 0)}, 员工恶劣={employee_summary.get('bad_attitude', 0)}\n\n"
                     
                     sensitive = room_data.get("sensitive_words", {})
                     if sensitive:
@@ -581,8 +613,8 @@ class SystemPerformanceTester:
 
 ## 详细分析结果表格
 
-| 序号 | 权限群聊名称（外部群）（助理机器人、销售VIP账号） | 当日消息总量(体现群活跃程度) | 售后同事回复消息量 | 核心信息摘要（通知/决策/待办） | 高频词统计 | 客户情感分析 | 客户负面情感信息输出 | 售后情感分析 | 售后负面情感信息输出 | 敏感词触发情况 | 风险等级（高/中/低/无） | 备注（建议/跟进要求） |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 序号 | 权限群聊名称 | 客户 | 售后人员 | 当日消息总量 | 售后回复量 | 核心信息摘要（通知/决策/待办） | 漏报消息分析（风险预警） | 漏报消息证据 | 高频词统计 | 客户情感分析 | 客户差评证据 | 客户负面内容 | 售后情感分析 | 售后负面内容 | 敏感词触发 | 风险等级 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 """.format(
             test_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             total_rooms=data.get('total_rooms', 0),
@@ -594,6 +626,7 @@ class SystemPerformanceTester:
         table_rows = []
         
         for i, room_result in enumerate(results, 1):
+            room_id = room_result.get("room_id", "")
             room_name = room_result.get("room_name", "未知")
             status = room_result.get("status", "unknown")
             room_data = room_result.get("data", {})
@@ -607,35 +640,47 @@ class SystemPerformanceTester:
                 
                 core_summary = self._extract_core_summary(room_data.get("summary", ""))
                 
+                unanswered_data = room_data.get("unanswered_status", {})
+                unanswered_analysis = self._extract_unanswered_analysis(unanswered_data)
+                missed_evidence = self._extract_missed_message_evidence(unanswered_data)
+                
                 highfreq_words = self._extract_highfreq_words(room_data.get("high_freq_words", {}))
                 
-                customer_sentiment = self._extract_customer_sentiment(room_data.get("sentiment", {}))
-                customer_negative = self._extract_customer_negative(room_data.get("sentiment", {}))
+                sentiment_data = room_data.get("sentiment", {})
+                customer_sentiment = self._extract_customer_sentiment(sentiment_data)
+                customer_bad_evidence = self._extract_customer_bad_review_evidence(sentiment_data)
+                customer_negative = self._extract_customer_negative(sentiment_data)
                 
-                employee_sentiment = self._extract_employee_sentiment(room_data.get("sentiment", {}))
-                employee_negative = self._extract_employee_negative(room_data.get("sentiment", {}))
+                employee_sentiment = self._extract_employee_sentiment(sentiment_data)
+                employee_negative = self._extract_employee_negative(sentiment_data)
                 
                 sensitive_words = self._extract_sensitive_words(room_data.get("sensitive_words", {}))
                 
-                unanswered = room_data.get("unanswered_status", {})
-                risk_level = self._determine_risk_level(room_data, unanswered)
+                risk_level = self._determine_risk_level(room_data, unanswered_data)
                 
-                remarks = self._extract_remarks(unanswered)
+                remarks = self._extract_remarks(room_data, unanswered_data)
+                
+                customer_names, employee_names = self._extract_participants(room_data, room_id)
                 
             else:
                 msg_total = "-"
                 employee_reply = "-"
                 core_summary = f"分析失败: {room_result.get('error_message', '未知错误')}"
+                unanswered_analysis = "✅无漏回"
+                missed_evidence = "-"
                 highfreq_words = "-"
-                customer_sentiment = "-"
-                customer_negative = "-"
-                employee_sentiment = "-"
-                employee_negative = "-"
-                sensitive_words = "-"
-                risk_level = "高"
+                customer_sentiment = "暂无分析"
+                customer_bad_evidence = "-"
+                customer_negative = "无"
+                employee_sentiment = "暂无分析"
+                employee_negative = "无"
+                sensitive_words = "无"
+                risk_level = "🔴高"
                 remarks = "需人工核查"
+                customer_names = "-"
+                employee_names = "-"
             
-            row = f"| {i} | {room_name} | {msg_total} | {employee_reply} | {core_summary} | {highfreq_words} | {customer_sentiment} | {customer_negative} | {employee_sentiment} | {employee_negative} | {sensitive_words} | {risk_level} | {remarks} |"
+            row = f"| {i} | {room_name} | {customer_names} | {employee_names} | {msg_total} | {employee_reply} | {core_summary} | {unanswered_analysis} | {missed_evidence} | {highfreq_words} | {customer_sentiment} | {customer_bad_evidence} | {customer_negative} | {employee_sentiment} | {employee_negative} | {sensitive_words} | {risk_level} | {remarks} |"
             table_rows.append(row)
         
         table_content = table_header + "\n".join(table_rows)
@@ -644,18 +689,21 @@ class SystemPerformanceTester:
 
 ## 字段说明
 
-1. **权限群聊名称**: 企业微信群聊的完整名称
+1. **权限群聊名称**: 企业微信群聊的完整名称（优先显示room_name，如为空则显示room_id）
 2. **当日消息总量**: 群聊中的消息总数，反映群活跃程度
-3. **售后同事回复消息量**: 售后人员回复的消息数量
-4. **核心信息摘要**: 从群聊中提取的关键信息，包括通知、决策和待办事项
-5. **高频词统计**: 群聊中出现频率最高的业务相关词汇
-6. **客户情感分析**: 客户消息的情感倾向统计（好评/差评数量）
-7. **客户负面情感信息**: 客户表达不满或抱怨的具体消息内容
-8. **售后情感分析**: 售后人员消息的情感倾向统计（积极/恶劣数量）
-9. **售后负面情感信息**: 售后人员表达恶劣态度的具体消息内容
-10. **敏感词触发情况**: 群聊中触发的敏感词详情
-11. **风险等级**: 综合评估的风险等级（高/中/低/无）
-12. **备注**: 系统生成的跟进建议或人工备注
+3. **售后回复量**: 售后人员回复的消息数量
+4. **核心信息摘要**: 从群聊JSON摘要中提取的核心概述、客户诉求、处理进展（LLM生成JSON格式）
+5. **漏报消息分析（风险预警）**: 检测是否存在消息漏回情况及建议行动
+6. **漏报消息证据**: 存在漏回时，展示漏回消息的原始内容（发送者、时间、消息内容）
+7. **高频词统计**: 群聊中出现频率最高的业务相关词汇
+8. **客户情感分析**: 客户消息的情感倾向统计（好评/差评数量）
+9. **客户差评证据**: 客户表达不满或抱怨的原始消息内容（发送者、时间、消息内容）
+10. **客户负面内容**: 客户表达不满或抱怨的具体消息内容
+11. **售后情感分析**: 售后人员消息的情感倾向统计（积极/恶劣数量）
+12. **售后负面内容**: 售后人员表达恶劣态度的具体消息内容
+13. **敏感词触发**: 群聊中触发的敏感词详情
+14. **风险等级**: 综合评估的风险等级（🔴高/🟡中/🟢低/无）
+15. **备注**: 从摘要JSON中提取的待办事项(todos)，以及漏回建议
 
 ---
 
@@ -668,40 +716,101 @@ class SystemPerformanceTester:
         print(f"✓ 可视化表格已保存到: {output_file}")
 
     def _extract_employee_reply_count(self, room_data: Dict[str, Any]) -> int:
-        sentiment = room_data.get("sentiment", {})
-        if not sentiment:
-            return 0
-        details = sentiment.get("details", [])
-        if not details or not isinstance(details, list):
-            return 0
-        count = 0
-        for msg in details:
-            if isinstance(msg, dict) and msg.get("sender_role") in ["售后", "员工", "销售"]:
-                count += 1
-        return count
+        return room_data.get("employee_reply_count", 0)
 
-    def _extract_core_summary(self, summary_text: str) -> str:
+    def _extract_core_summary(self, summary_text: str, for_html: bool = False) -> str:
         if not summary_text:
-            return "-"
+            return "群内互动较少，暂无核心议题。"
         
-        parts = []
+        try:
+            import json
+            cleaned = summary_text.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            elif cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+            
+            summary_json = json.loads(cleaned)
+            
+            parts = []
+            
+            overview = summary_json.get("overview", "")
+            if overview and overview != "无":
+                overview = self._clean_markdown_text(overview)
+                if for_html:
+                    parts.append(f'<div class="summary-item"><div class="summary-label">【核心概述】</div><div class="summary-content">{overview}</div></div>')
+                else:
+                    parts.append(f"【核心概述】{overview}")
+            
+            demands = summary_json.get("demands", [])
+            if isinstance(demands, list) and demands:
+                demands_text = self._format_list_items(demands, for_html)
+                if for_html:
+                    parts.append(f'<div class="summary-item"><div class="summary-label">【客户诉求】</div><div class="summary-content">{demands_text}</div></div>')
+                else:
+                    parts.append(f"【客户诉求】{demands_text}")
+            
+            actions = summary_json.get("actions", [])
+            if isinstance(actions, list) and actions:
+                actions_text = self._format_list_items(actions, for_html)
+                if for_html:
+                    parts.append(f'<div class="summary-item"><div class="summary-label">【处理进展】</div><div class="summary-content">{actions_text}</div></div>')
+                else:
+                    parts.append(f"【处理进展】{actions_text}")
+            
+            todos = summary_json.get("todos", [])
+            if isinstance(todos, list) and todos:
+                todos_text = self._format_list_items(todos, for_html)
+                if for_html:
+                    parts.append(f'<div class="summary-item"><div class="summary-label">【待办跟进】</div><div class="summary-content">{todos_text}</div></div>')
+                else:
+                    parts.append(f"【待办跟进】{todos_text}")
+            
+            if for_html:
+                return "".join(parts) if parts else "群内互动较少，暂无核心议题。"
+            else:
+                return "<br>".join(parts) if parts else "群内互动较少，暂无核心议题。"
+            
+        except (json.JSONDecodeError, TypeError):
+            formatted = self._clean_markdown_text(summary_text)
+            return formatted
+    
+    def _format_list_items(self, items: list, for_html: bool = False) -> str:
+        if not items:
+            return ""
         
-        if "【核心概述】" in summary_text or "核心概述" in summary_text:
-            parts.append("已生成摘要")
+        formatted_items = []
+        for item in items:
+            if item and item != "无":
+                item = self._clean_markdown_text(item)
+                if for_html:
+                    formatted_items.append(f"• {item}")
+                else:
+                    formatted_items.append(f"• {item}")
         
-        if "【待办与跟进】" in summary_text or "待办" in summary_text:
-            parts.append("有待办事项")
+        if for_html:
+            return "<br>".join(formatted_items)
+        else:
+            return "<br>".join(formatted_items)
+    
+    def _clean_markdown_text(self, text: str) -> str:
+        import re
+        if not text:
+            return text
         
-        if "【风险/商机预警】" in summary_text:
-            if "无" not in summary_text.split("【风险/商机预警】")[1].split("\n")[0]:
-                parts.append("有风险预警")
+        text = text.replace('\n', '<br>')
+        text = re.sub(r'(?<!<br>)^- ', '• ', text, flags=re.MULTILINE)
+        text = re.sub(r'^\* ', '• ', text, flags=re.MULTILINE)
+        text = re.sub(r'-\s*-\s*-\s*-\s*-\s*-\s*-\s*-\s*-\s*-\s*-\s*-\s*-\s*-', '——', text)
+        text = re.sub(r'\s*<br>\s*', '<br>', text)
+        text = re.sub(r'(<br>){3,}', '<br><br>', text)
+        text = re.sub(r'^\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\s+$', '', text, flags=re.MULTILINE)
         
-        if parts:
-            return "<br>".join(parts)
-        
-        if len(summary_text) > 100:
-            return summary_text[:100] + "..."
-        return summary_text if summary_text else "-"
+        return text
 
     def _extract_highfreq_words(self, highfreq_data: Dict[str, Any]) -> str:
         if not highfreq_data or not highfreq_data.get("words"):
@@ -718,11 +827,128 @@ class SystemPerformanceTester:
             if word:
                 word_list.append(f"{word}（{count}次）")
         
-        return "、".join(word_list) if word_list else "-"
+        return "<br>".join(word_list) if word_list else "-"
+    
+    def _extract_unanswered_analysis(self, unanswered_data: Dict[str, Any]) -> str:
+        if not unanswered_data:
+            return "✅无漏回"
+        
+        is_missed = unanswered_data.get("is_missed", False)
+        
+        if is_missed:
+            suggested_action = unanswered_data.get("suggested_action", "请及时跟进")
+            return f"❗存在漏回<br>建议：{suggested_action}"
+        else:
+            return "✅无漏回"
+
+    def _extract_missed_message_evidence(self, unanswered_data: Dict[str, Any]) -> str:
+        if not unanswered_data:
+            return "-"
+        
+        is_missed = unanswered_data.get("is_missed", False)
+        if not is_missed:
+            return "-"
+        
+        missed_messages = unanswered_data.get("missed_messages", [])
+        if not missed_messages:
+            return "-"
+        
+        evidence_list = []
+        for msg in missed_messages[:3]:
+            sender = msg.get("sender_name", "未知")
+            time = msg.get("msgtime", "")
+            content = msg.get("content", "")
+            if content:
+                evidence_list.append(f"【{sender}】{time}<br>{content[:80]}{'...' if len(content) > 80 else ''}")
+        
+        return "<br><br>".join(evidence_list) if evidence_list else "-"
+
+    def _extract_customer_bad_review_evidence(self, sentiment_data: Dict[str, Any]) -> str:
+        if not sentiment_data:
+            return "-"
+        
+        details = sentiment_data.get("details", {})
+        if not isinstance(details, dict):
+            return "-"
+        
+        customer_bad = details.get("customer_bad", [])
+        if not isinstance(customer_bad, list) or not customer_bad:
+            return "-"
+        
+        bad_reviews = []
+        for msg in customer_bad[:3]:
+            if isinstance(msg, dict):
+                sender = msg.get("sender_name", "未知")
+                time = msg.get("msgtime", "")
+                content = msg.get("content", "")
+                if content:
+                    bad_reviews.append(f"【{sender}】{time}<br>{content[:80]}{'...' if len(content) > 80 else ''}")
+        
+        if not bad_reviews:
+            return "-"
+        
+        return "<br><br>".join(bad_reviews)
+
+    def _extract_participants(self, room_data: Dict[str, Any], room_id: str = None) -> tuple:
+        customer_set = set()
+        employee_set = set()
+        
+        members = {}
+        if room_id and room_id in self.metrics.room_members:
+            members = self.metrics.room_members[room_id]
+        
+        for userid, member in members.items():
+            member_type = member.get("type", 1)
+            name = member.get("name", "")
+            group_nickname = member.get("group_nickname", "")
+            display_name = name or group_nickname
+            
+            if not display_name:
+                continue
+            
+            if member_type == 2:
+                customer_set.add(display_name)
+            else:
+                employee_set.add(display_name)
+        
+        sentiment = room_data.get("sentiment", {})
+        if sentiment:
+            details = sentiment.get("details", {})
+            if isinstance(details, dict):
+                for key in ["customer_good", "customer_bad", "customer_neutral"]:
+                    for msg in details.get(key, []):
+                        if isinstance(msg, dict):
+                            name = msg.get("sender_name", "")
+                            if name:
+                                customer_set.add(name)
+                
+                for key in ["employee_positive", "employee_bad"]:
+                    for msg in details.get(key, []):
+                        if isinstance(msg, dict):
+                            name = msg.get("sender_name", "")
+                            if name:
+                                employee_set.add(name)
+        
+        unanswered = room_data.get("unanswered_status", {})
+        if unanswered:
+            for msg in unanswered.get("missed_messages", []):
+                if isinstance(msg, dict):
+                    name = msg.get("sender_name", "")
+                    role = msg.get("sender_role", "")
+                    if name:
+                        if role == "客户":
+                            customer_set.add(name)
+                        elif role in ["售后", "员工", "销售"]:
+                            employee_set.add(name)
+        
+        customer_names = "、".join(sorted(customer_set)) if customer_set else "-"
+        employee_names = "、".join(sorted(employee_set)) if employee_set else "-"
+        
+        return customer_names, employee_names
 
     def _extract_customer_sentiment(self, sentiment_data: Dict[str, Any]) -> str:
         if not sentiment_data:
-            return "-"
+            return "暂无分析"
         
         summary = sentiment_data.get("summary", {})
         customer = summary.get("customer", {})
@@ -731,22 +957,26 @@ class SystemPerformanceTester:
         bad = customer.get("bad_reviews", 0)
         
         if good == 0 and bad == 0:
-            return "无数据"
+            return "😐中性（无明确情感）"
         
-        return f"好评{good}条、差评{bad}条"
+        return f"😊好评：{good}<br>😞差评：{bad}"
 
     def _extract_customer_negative(self, sentiment_data: Dict[str, Any]) -> str:
         if not sentiment_data:
             return "无"
         
-        details = sentiment_data.get("details", [])
-        if not isinstance(details, list):
+        details = sentiment_data.get("details", {})
+        if not isinstance(details, dict):
+            return "无"
+        
+        customer_bad = details.get("customer_bad", [])
+        if not isinstance(customer_bad, list) or not customer_bad:
             return "无"
         
         negative_msgs = []
         
-        for msg in details:
-            if isinstance(msg, dict) and msg.get("sender_role") == "客户" and msg.get("sentiment") in ["negative", "very_negative"]:
+        for msg in customer_bad[:3]:
+            if isinstance(msg, dict):
                 content = msg.get("content", "")
                 if content:
                     negative_msgs.append(content[:50])
@@ -754,35 +984,39 @@ class SystemPerformanceTester:
         if not negative_msgs:
             return "无"
         
-        return "<br>".join(negative_msgs[:3]) if negative_msgs else "无"
+        return "<br>".join(negative_msgs)
 
     def _extract_employee_sentiment(self, sentiment_data: Dict[str, Any]) -> str:
         if not sentiment_data:
-            return "-"
+            return "暂无分析"
         
         summary = sentiment_data.get("summary", {})
         employee = summary.get("employee", {})
         
         positive = employee.get("positive", 0)
-        bad = employee.get("bad_attitude", 0)
+        negative = employee.get("bad_attitude", 0)
         
-        if positive == 0 and bad == 0:
-            return "无数据"
+        if positive == 0 and negative == 0:
+            return "😐中性（无明确情感）"
         
-        return f"积极{positive}条、恶劣{bad}条"
+        return f"🌟积极：{positive}<br>😞消极：{negative}"
 
     def _extract_employee_negative(self, sentiment_data: Dict[str, Any]) -> str:
         if not sentiment_data:
             return "无"
         
-        details = sentiment_data.get("details", [])
-        if not isinstance(details, list):
+        details = sentiment_data.get("details", {})
+        if not isinstance(details, dict):
+            return "无"
+        
+        employee_bad = details.get("employee_bad_attitude", [])
+        if not isinstance(employee_bad, list) or not employee_bad:
             return "无"
         
         negative_msgs = []
         
-        for msg in details:
-            if isinstance(msg, dict) and msg.get("sender_role") in ["售后", "员工", "销售"] and msg.get("sentiment") == "bad_attitude":
+        for msg in employee_bad[:3]:
+            if isinstance(msg, dict):
                 content = msg.get("content", "")
                 if content:
                     negative_msgs.append(content[:50])
@@ -790,7 +1024,7 @@ class SystemPerformanceTester:
         if not negative_msgs:
             return "无"
         
-        return "<br>".join(negative_msgs[:3]) if negative_msgs else "无"
+        return "<br>".join(negative_msgs)
 
     def _extract_sensitive_words(self, sensitive_data: Dict[str, Any]) -> str:
         if not sensitive_data:
@@ -838,27 +1072,548 @@ class SystemPerformanceTester:
                 risk_score += 2
         
         if risk_score >= 6:
-            return "高"
+            return "🔴高"
         elif risk_score >= 3:
-            return "中"
+            return "🟡中"
         elif risk_score >= 1:
-            return "低"
+            return "🟢低"
         else:
             return "无"
 
-    def _extract_remarks(self, unanswered: Dict[str, Any]) -> str:
-        if not unanswered:
-            return "-"
+    def _extract_remarks(self, room_data: Dict[str, Any], unanswered: Dict[str, Any], for_html: bool = False) -> str:
+        notes = []
         
-        if unanswered.get("is_missed", False):
-            action = unanswered.get("suggested_action", "")
-            if action:
-                return action[:50] if len(action) > 50 else action
-            return "存在漏回，需跟进"
+        if unanswered and unanswered.get("is_missed") and unanswered.get("suggested_action"):
+            suggested = self._clean_markdown_text(unanswered.get("suggested_action", ""))
+            if for_html:
+                notes.append(f'<div class="remark-item remark-warning"><span class="remark-icon">🔔</span> 漏报建议：{suggested}</div>')
+            else:
+                notes.append(f"🔔 漏报建议：{suggested}")
         
-        return "-"
+        if for_html:
+            return "".join(notes) if notes else '-'
+        else:
+            return '<br>'.join(notes) if notes else '-'
 
-    def run_test(self, analysis_types: Optional[List[str]] = None, save_report: bool = False, generate_doc: bool = False, generate_table: bool = False):
+    def generate_html_table(self, result: Dict[str, Any], output_file: str = "可视化测试结果表格.html"):
+        if "data" not in result:
+            print("✗ 没有分析结果数据")
+            return
+        
+        data = result["data"]
+        results = data.get("results", [])
+        
+        html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>企业微信群聊智能分析测试结果</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }}
+        
+        .container {{
+            max-width: 1800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+        
+        .header h1 {{
+            font-size: 28px;
+            margin-bottom: 10px;
+        }}
+        
+        .header p {{
+            opacity: 0.9;
+            font-size: 14px;
+        }}
+        
+        .overview {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            padding: 30px;
+            background: #f8f9fa;
+        }}
+        
+        .overview-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            text-align: center;
+        }}
+        
+        .overview-card .label {{
+            color: #6c757d;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }}
+        
+        .overview-card .value {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #667eea;
+        }}
+        
+        .table-container {{
+            padding: 30px;
+            overflow-x: auto;
+        }}
+        
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            background: white;
+        }}
+        
+        thead {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        
+        th {{
+            padding: 15px 10px;
+            text-align: left;
+            font-weight: 600;
+            white-space: nowrap;
+            border: none;
+        }}
+        
+        td {{
+            padding: 12px 10px;
+            border-bottom: 1px solid #e9ecef;
+            vertical-align: top;
+        }}
+        
+        tr:hover {{
+            background: #f8f9fa;
+        }}
+        
+        .risk-high {{
+            color: #dc3545;
+            font-weight: bold;
+        }}
+        
+        .risk-medium {{
+            color: #ffc107;
+            font-weight: bold;
+        }}
+        
+        .risk-low {{
+            color: #28a745;
+            font-weight: bold;
+        }}
+        
+        .summary-item {{
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border-left: 3px solid #667eea;
+        }}
+        
+        .summary-label {{
+            font-weight: 600;
+            color: #495057;
+            margin-bottom: 4px;
+            font-size: 13px;
+        }}
+        
+        .summary-content {{
+            line-height: 1.7;
+            color: #333;
+            font-size: 13px;
+            word-break: break-word;
+        }}
+        
+        .remark-item {{
+            margin-bottom: 6px;
+            padding: 4px 8px;
+            background: #e7f5ff;
+            border-radius: 4px;
+        }}
+        
+        .remark-warning {{
+            background: #fff3cd;
+        }}
+        
+        .remark-icon {{
+            font-size: 14px;
+        }}
+        
+        .tag {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin: 2px;
+        }}
+        
+        .tag-success {{
+            background: #d4edda;
+            color: #155724;
+        }}
+        
+        .tag-warning {{
+            background: #fff3cd;
+            color: #856404;
+        }}
+        
+        .tag-danger {{
+            background: #f8d7da;
+            color: #721c24;
+        }}
+        
+        .emoji {{
+            font-size: 16px;
+        }}
+        
+        .footer {{
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            color: #6c757d;
+            font-size: 12px;
+        }}
+        
+        @media (max-width: 768px) {{
+            .overview {{
+                grid-template-columns: repeat(2, 1fr);
+            }}
+            
+            table {{
+                font-size: 11px;
+            }}
+            
+            th, td {{
+                padding: 8px 5px;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>企业微信群聊智能分析测试结果</h1>
+            <p>测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </div>
+        
+        <div class="overview">
+            <div class="overview-card">
+                <div class="label">群聊总数</div>
+                <div class="value">{data.get('total_rooms', 0)}</div>
+            </div>
+            <div class="overview-card">
+                <div class="label">成功分析</div>
+                <div class="value">{data.get('success_count', 0)}</div>
+            </div>
+            <div class="overview-card">
+                <div class="label">失败分析</div>
+                <div class="value">{data.get('failed_count', 0)}</div>
+            </div>
+            <div class="overview-card">
+                <div class="label">成功率</div>
+                <div class="value">{(data.get('success_count', 0) / data.get('total_rooms', 1) * 100) if data.get('total_rooms', 0) > 0 else 0:.1f}%</div>
+            </div>
+        </div>
+        
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>序号</th>
+                        <th>权限群聊名称</th>
+                        <th>客户</th>
+                        <th>售后人员</th>
+                        <th>当日消息总量</th>
+                        <th>售后回复量</th>
+                        <th>核心信息摘要</th>
+                        <th>漏报消息分析</th>
+                        <th>漏报消息证据</th>
+                        <th>高频词统计</th>
+                        <th>客户情感分析</th>
+                        <th>客户差评证据</th>
+                        <th>客户负面内容</th>
+                        <th>售后情感分析</th>
+                        <th>售后负面内容</th>
+                        <th>敏感词触发</th>
+                        <th>风险等级</th>
+                        <th>备注</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+        
+        for i, room_result in enumerate(results, 1):
+            room_id = room_result.get("room_id", "")
+            room_name = room_result.get("room_name", "未知")
+            status = room_result.get("status", "unknown")
+            room_data = room_result.get("data", {})
+            
+            if status == "success" and room_data:
+                msg_count = room_data.get("message_count", 0)
+                msg_total = f"{msg_count}条"
+                
+                employee_reply_count = self._extract_employee_reply_count(room_data)
+                employee_reply = f"{employee_reply_count}条"
+                
+                core_summary = self._extract_core_summary(room_data.get("summary", ""))
+                
+                unanswered_data = room_data.get("unanswered_status", {})
+                unanswered_analysis = self._extract_unanswered_analysis(unanswered_data)
+                missed_evidence = self._extract_missed_message_evidence(unanswered_data)
+                
+                highfreq_words = self._extract_highfreq_words(room_data.get("high_freq_words", {}))
+                
+                sentiment_data = room_data.get("sentiment", {})
+                customer_sentiment = self._extract_customer_sentiment(sentiment_data)
+                customer_bad_evidence = self._extract_customer_bad_review_evidence(sentiment_data)
+                customer_negative = self._extract_customer_negative(sentiment_data)
+                
+                employee_sentiment = self._extract_employee_sentiment(sentiment_data)
+                employee_negative = self._extract_employee_negative(sentiment_data)
+                
+                sensitive_words = self._extract_sensitive_words(room_data.get("sensitive_words", {}))
+                
+                risk_level = self._determine_risk_level(room_data, unanswered_data)
+                
+                remarks = self._extract_remarks(room_data, unanswered_data)
+                
+                customer_names, employee_names = self._extract_participants(room_data, room_id)
+                
+            else:
+                msg_total = "-"
+                employee_reply = "-"
+                core_summary = f"分析失败: {room_result.get('error_message', '未知错误')}"
+                unanswered_analysis = "✅无漏回"
+                missed_evidence = "-"
+                highfreq_words = "-"
+                customer_sentiment = "无数据"
+                customer_bad_evidence = "-"
+                customer_negative = "无"
+                employee_sentiment = "无数据"
+                employee_negative = "无"
+                sensitive_words = "无"
+                risk_level = "🔴高"
+                remarks = "需人工核查"
+                customer_names = "-"
+                employee_names = "-"
+            
+            risk_class = ""
+            if "🔴" in risk_level:
+                risk_class = "risk-high"
+            elif "🟡" in risk_level:
+                risk_class = "risk-medium"
+            elif "🟢" in risk_level:
+                risk_class = "risk-low"
+            
+            html_content += f"""
+                    <tr>
+                        <td>{i}</td>
+                        <td><strong>{room_name}</strong></td>
+                        <td>{customer_names}</td>
+                        <td>{employee_names}</td>
+                        <td>{msg_total}</td>
+                        <td>{employee_reply}</td>
+                        <td class="summary-content">{core_summary}</td>
+                        <td>{unanswered_analysis}</td>
+                        <td class="summary-content">{missed_evidence}</td>
+                        <td>{highfreq_words}</td>
+                        <td>{customer_sentiment}</td>
+                        <td class="summary-content">{customer_bad_evidence}</td>
+                        <td>{customer_negative}</td>
+                        <td>{employee_sentiment}</td>
+                        <td>{employee_negative}</td>
+                        <td>{sensitive_words}</td>
+                        <td class="{risk_class}">{risk_level}</td>
+                        <td>{remarks}</td>
+                    </tr>
+"""
+        
+        html_content += """
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="footer">
+            <p>企业微信群聊智能分析系统 | 自动生成报告</p>
+            <p>如有疑问请联系技术支持</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        print(f"✓ HTML可视化表格已保存到: {output_file}")
+
+    def generate_excel_table(self, result: Dict[str, Any], output_file: str = "可视化测试结果表格.xlsx"):
+        if not OPENPYXL_AVAILABLE:
+            print("⚠️ openpyxl未安装，无法生成Excel表格")
+            print("  请运行: pip install openpyxl")
+            return
+
+        if "data" not in result:
+            print("✗ 没有分析结果数据")
+            return
+
+        data = result["data"]
+        results = data.get("results", [])
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "分析结果"
+
+        headers = [
+            "序号", "权限群聊名称", "客户", "售后人员", "当日消息总量",
+            "售后回复量", "核心信息摘要", "漏报消息分析", "漏报消息证据",
+            "高频词统计", "客户情感分析", "客户差评证据", "客户负面内容",
+            "售后情感分析", "售后负面内容", "敏感词触发", "风险等级", "备注"
+        ]
+
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="667eea", end_color="667eea", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        for i, room_result in enumerate(results, 1):
+            room_id = room_result.get("room_id", "")
+            room_name = room_result.get("room_name", "未知")
+            status = room_result.get("status", "unknown")
+            room_data = room_result.get("data", {})
+
+            if status == "success" and room_data:
+                msg_count = room_data.get("message_count", 0)
+                msg_total = f"{msg_count}条"
+
+                employee_reply_count = self._extract_employee_reply_count(room_data)
+                employee_reply = f"{employee_reply_count}条"
+
+                core_summary = self._extract_core_summary(room_data.get("summary", ""))
+                core_summary = core_summary.replace('<br>', '\n')
+
+                unanswered_data = room_data.get("unanswered_status", {})
+                unanswered_analysis = self._extract_unanswered_analysis(unanswered_data)
+                unanswered_analysis = unanswered_analysis.replace('<br>', '\n')
+
+                missed_evidence = self._extract_missed_message_evidence(unanswered_data)
+                missed_evidence = missed_evidence.replace('<br>', '\n')
+
+                highfreq_words = self._extract_highfreq_words(room_data.get("high_freq_words", {}))
+                highfreq_words = highfreq_words.replace('<br>', '\n')
+
+                sentiment_data = room_data.get("sentiment", {})
+                customer_sentiment = self._extract_customer_sentiment(sentiment_data)
+                customer_sentiment = customer_sentiment.replace('<br>', '\n')
+
+                customer_bad_evidence = self._extract_customer_bad_review_evidence(sentiment_data)
+                customer_bad_evidence = customer_bad_evidence.replace('<br>', '\n')
+
+                customer_negative = self._extract_customer_negative(sentiment_data)
+                customer_negative = customer_negative.replace('<br>', '\n')
+
+                employee_sentiment = self._extract_employee_sentiment(sentiment_data)
+                employee_sentiment = employee_sentiment.replace('<br>', '\n')
+
+                employee_negative = self._extract_employee_negative(sentiment_data)
+                employee_negative = employee_negative.replace('<br>', '\n')
+
+                sensitive_words = self._extract_sensitive_words(room_data.get("sensitive_words", {}))
+                sensitive_words = sensitive_words.replace('<br>', '\n')
+
+                risk_level = self._determine_risk_level(room_data, unanswered_data)
+
+                remarks = self._extract_remarks(room_data, unanswered_data)
+                remarks = remarks.replace('<br>', '\n')
+
+                customer_names, employee_names = self._extract_participants(room_data, room_id)
+
+            else:
+                msg_total = "-"
+                employee_reply = "-"
+                core_summary = f"分析失败: {room_result.get('error_message', '未知错误')}"
+                unanswered_analysis = "✅无漏回"
+                missed_evidence = "-"
+                highfreq_words = "-"
+                customer_sentiment = "暂无分析"
+                customer_bad_evidence = "-"
+                customer_negative = "无"
+                employee_sentiment = "暂无分析"
+                employee_negative = "无"
+                sensitive_words = "无"
+                risk_level = "🔴高"
+                remarks = "需人工核查"
+                customer_names = "-"
+                employee_names = "-"
+
+            row_data = [
+                i, room_name, customer_names, employee_names, msg_total,
+                employee_reply, core_summary, unanswered_analysis, missed_evidence,
+                highfreq_words, customer_sentiment, customer_bad_evidence, customer_negative,
+                employee_sentiment, employee_negative, sensitive_words, risk_level, remarks
+            ]
+
+            for col, value in enumerate(row_data, 1):
+                cell = ws.cell(row=i + 1, column=col, value=value)
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = thin_border
+
+        for col in range(1, len(headers) + 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 15
+
+        ws.column_dimensions['A'].width = 6
+        ws.column_dimensions['B'].width = 35
+        ws.column_dimensions['C'].width = 20
+        ws.column_dimensions['D'].width = 20
+        ws.column_dimensions['G'].width = 40
+        ws.column_dimensions['H'].width = 25
+        ws.column_dimensions['I'].width = 35
+
+        try:
+            wb.save(output_file)
+            print(f"✓ Excel可视化表格已保存到: {output_file}")
+        except Exception as e:
+            print(f"✗ 保存Excel文件失败: {e}")
+
+    def run_test(self, analysis_types: Optional[List[str]] = None, save_report: bool = False, generate_doc: bool = False, generate_table: bool = False, generate_html: bool = False, generate_excel: bool = False):
         print("\n" + "="*80)
         print("企业微信群聊分析服务 - 系统性能完整测试")
         print("="*80)
@@ -881,15 +1636,21 @@ class SystemPerformanceTester:
 
         result = self.batch_analyze(rooms, analysis_types)
         self.print_performance_report(result)
-        
+
         if save_report:
             self.save_report_to_file(result)
-        
+
         if generate_doc:
             self.generate_markdown_report(result)
-        
+
         if generate_table:
             self.generate_visualization_table(result)
+
+        if generate_html:
+            self.generate_html_table(result)
+
+        if generate_excel:
+            self.generate_excel_table(result)
 
     def close(self):
         self.http_client.close()
@@ -942,7 +1703,17 @@ def main():
     parser.add_argument(
         "--generate-table",
         action="store_true",
-        help="生成可视化表格",
+        help="生成Markdown可视化表格",
+    )
+    parser.add_argument(
+        "--generate-html",
+        action="store_true",
+        help="生成HTML可视化表格（推荐）",
+    )
+    parser.add_argument(
+        "--generate-excel",
+        action="store_true",
+        help="生成Excel可视化表格",
     )
 
     args = parser.parse_args()
@@ -955,7 +1726,14 @@ def main():
     )
 
     try:
-        tester.run_test(analysis_types=args.types, save_report=args.save_report, generate_doc=args.generate_doc, generate_table=args.generate_table)
+        tester.run_test(
+            analysis_types=args.types,
+            save_report=args.save_report,
+            generate_doc=args.generate_doc,
+            generate_table=args.generate_table,
+            generate_html=args.generate_html,
+            generate_excel=args.generate_excel,
+        )
     finally:
         tester.close()
 

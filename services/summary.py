@@ -16,24 +16,85 @@ class SummaryGenerator:
     def generate(self, messages: List[NormalizedMessage]) -> Optional[str]:
         if not messages:
             return None
-        
+
         text_messages = [m for m in messages if m.text_content and m.msgtype == "text"]
-        
+
         if not text_messages:
-            return None
-        
+            logger.warning(f"没有文本消息，使用全部消息生成摘要")
+            text_messages = [m for m in messages if m.text_content]
+            if not text_messages:
+                return None
+
         sampled = self._sample_messages(text_messages)
         
         formatted_text = self._format_messages(sampled)
         
         try:
             summary = self._llm_generate(formatted_text)
-            if summary and len(summary) > self.max_length:
-                summary = summary[:self.max_length]
+            if summary:
+                summary = self._ensure_valid_json(summary)
             return summary
         except Exception as e:
             logger.error(f"生成摘要失败: {e}")
             return None
+    
+    def _ensure_valid_json(self, text: str) -> str:
+        try:
+            import json
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+        
+        try:
+            text = text.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            elif text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+        
+        fixed = self._try_complete_json(text)
+        try:
+            json.loads(fixed)
+            return fixed
+        except json.JSONDecodeError:
+            pass
+        
+        logger.warning(f"无法修复截断的JSON，返回原始文本")
+        return text
+    
+    def _try_complete_json(self, text: str) -> str:
+        in_string = False
+        escape_next = False
+        brace_depth = 0
+
+        for i, c in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+            if c == '\\' and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if c == '{':
+                    brace_depth += 1
+                elif c == '}':
+                    brace_depth -= 1
+                    if brace_depth == 0:
+                        return text[:i+1]
+
+        return text
     
     def _sample_messages(self, messages: List[NormalizedMessage]) -> List[NormalizedMessage]:
         if len(messages) <= self.max_messages:
@@ -92,41 +153,38 @@ class SummaryGenerator:
     def _llm_generate(self, formatted_text: str) -> Optional[str]:
         prompt = f"""你是一个资深的企业客户成功经理（CSM）。请根据以下企业微信售后/客户群聊记录，为公司领导层生成一份逻辑清晰、高度精炼的业务摘要。
 
-要求：
-1. 聚焦客观发生的业务事实，不要进行情绪或态度的分析。
-2. 语言必须精炼、专业，直接切入核心。
-3. 严格按照以下给定的结构输出，如果某一项在聊天记录中没有涉及，请直接写"无"。
+    要求：
+    1. 聚焦客观发生的业务事实，不要进行情绪或态度的分析。
+    2. 语言必须精炼、专业，直接切入核心。
+    3. 如果某一项在聊天记录中没有涉及，请返回空数组 [] 或填 ["无"]。
+    4. 严禁自行编造或预估任何时间信息，只提取聊天记录中明确提到的时间节点。
 
----输出格式模板开始---
+    请严格输出 JSON 格式，不要包含任何 Markdown 标记。请注意，demands、actions 和 todos 字段必须是 JSON 字符串数组（Array of Strings）。
+    {{
+    "overview": "用1-2句话高度概括今日群聊的核心议题或突发状况",
+    "demands": [
+        "客户提出的核心问题1",
+        "客户提出的核心问题2"
+    ],
+    "actions": [
+        "我方员工的响应动作1",
+        "我方员工的响应动作2"
+    ],
+    "todos": [
+        "[待办]：事项1及责任人",
+        "[待办]：事项2及责任人"
+    ]
+    }}
 
-**【核心概述】**
-（用1-2句话高度概括今日群聊的核心议题或突发状况）
-
-**【客户核心诉求】**
-- （客户提出的核心问题、需求或咨询内容）
-- （...）
-
-**【处理进展与决策】**
-- （我方员工的响应动作、提供的解决方案或达成的共识）
-- （...）
-
-**【待办与跟进】**
-- [待办]：详细说明需要跟进的事项（如能从记录中识别出责任人，请标出）。
-
-**【风险/商机预警】**
-（仅当客户表现出明确的流失倾向、严重投诉，或提及增购、续费、新业务需求时填写。若没有，请填"无"）
-
----输出格式模板结束---
-
-群聊记录：
-{formatted_text}
-
-请严格按模板格式输出摘要："""
+    群聊记录：
+    {formatted_text}
+    """
 
         response = self.llm_client.chat(
             prompt,
             model=settings.LLM_MODEL_SUMMARY,
             temperature=0.3,
+            max_tokens=4000,
         )
-        
+
         return response.strip() if response else None

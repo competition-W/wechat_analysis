@@ -81,11 +81,22 @@ class UnansweredResult(BaseModel):
     suggested_action: Optional[str] = None
 
 
+class MemberInfo(BaseModel):
+    userid: str
+    name: str = ""
+    group_nickname: str = ""
+    type: int = 1
+    job: str = ""
+    position: str = ""
+
+
 class ResponseData(BaseModel):
     room_id: str
     room_name: Optional[str] = None
     analysis_time: str = Field(default_factory=lambda: datetime.now().isoformat())
     message_count: int = 0
+    employee_reply_count: int = 0
+    members: List[MemberInfo] = Field(default_factory=list)
     sentiment: Optional[SentimentResult] = None
     sensitive_words: Optional[SensitiveResult] = None
     summary: Optional[str] = None

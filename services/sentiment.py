@@ -43,9 +43,12 @@ class SentimentAnalyzer:
             if not msg.text_content or msg.msgtype != "text":
                 continue
             text_messages.append(msg)
-        
+
         if not text_messages:
-            return result
+            logger.warning(f"没有文本消息，使用全部消息进行情感分析")
+            text_messages = [m for m in messages if m.text_content]
+            if not text_messages:
+                return result
         
         rule_results = {}
         llm_needed = []
@@ -96,7 +99,7 @@ class SentimentAnalyzer:
                     result.summary.customer.bad_reviews += 1
                     result.details.customer_bad.append(detail_item)
             
-            elif msg.sender_role in ["员工", "售后", "销售"]:
+            elif msg.sender_role in ["员工", "售后", "销售", "未知"]:
                 if sentiment == "positive":
                     result.summary.employee.positive += 1
                     result.details.employee_positive.append(detail_item)
@@ -116,7 +119,7 @@ class SentimentAnalyzer:
                 if word in text:
                     return "good_review", 0.7
         
-        elif sender_role in ["员工", "售后", "销售"]:
+        elif sender_role in ["员工", "售后", "销售", "未知"]:
             for word in self.employee_bad_words:
                 if word in text:
                     return "bad_attitude", 0.8
@@ -172,15 +175,23 @@ class SentimentAnalyzer:
 
 分类规则：
 1. 若角色为【客户】：
-   - 必须分类为 "good_review"（好评：赞扬、感谢、满意） 或 "bad_review"（差评：抱怨、愤怒、催促、不满）。
+   - "good_review"（好评）：包含明确的赞扬、感谢、对交付结果满意（如“谢谢”、“图做得很好”、“辛苦了”）。
+   - "bad_review"（差评）：必须包含**明确的批评、强烈的不满、情绪化的抱怨或针对服务质量的指责**（如“速度太慢了”、“数据完全没法用”、“你们怎么搞的”、“我要退款”）。
+
 2. 若角色为【售后/员工】：
-   - 必须分类为 "positive"（积极：耐心解答、热情、主动推进） 或 "bad_attitude"（恶劣态度：推诿、不耐烦、敷衍、指责客户）。
-3. 如果消息是毫无情感波动的纯客观陈述，请标记为 "neutral"（中性）。
+   - "positive"（积极）：耐心解答、热情服务、主动推进项目进度。
+   - "bad_attitude"（恶劣态度）：推诿扯皮、极度不耐烦、敷衍了事、指责或阴阳怪气客户。
+
+3. "neutral"（中性）的判定标准（**极其重要**）：
+   - 纯客观的陈述。
+   - **正常的技术探讨与提问**（如“为什么这个指标这么高？”、“这里不需要过滤吗？”）。
+   - **对分析流程、数据细节的确认与质询**（如“你们没有去杂吗？”、“这个结果和预期不符”）。
+   - 只要客户是在客观描述数据特征或提出技术疑问，且没有夹杂明显的人身攻击或严重的情绪宣泄，**一律标记为 "neutral"**，绝对不能判定为差评。
 
 请输出JSON数组，格式如下：
 [
   {{"index": 0, "sentiment": "bad_review", "confidence": 0.95}},
-  {{"index": 1, "sentiment": "positive", "confidence": 0.90}}
+  {{"index": 1, "sentiment": "neutral", "confidence": 0.90}}
 ]
 只输出JSON数组，不要包含任何额外解释。"""
 
@@ -218,7 +229,7 @@ class SentimentAnalyzer:
                         if msg.sender_role == "客户":
                             if sentiment not in ["good_review", "bad_review", "neutral"]:
                                 sentiment = "neutral"
-                        elif msg.sender_role in ["员工", "售后", "销售"]:
+                        elif msg.sender_role in ["员工", "售后", "销售", "未知"]:
                             if sentiment not in ["positive", "bad_attitude", "neutral"]:
                                 sentiment = "neutral"
                         

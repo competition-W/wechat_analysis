@@ -45,6 +45,7 @@ class MessageItem(BaseModel):
 class AnalyzeRequest(BaseModel):
     room_id: str = Field(..., description="群聊唯一标识")
     room_name: Optional[str] = Field(default=None, description="群名称")
+    members: Optional[str] = Field(default=None, description="群成员信息，JSON字符串数组格式")
     analysis_type: Optional[List[AnalysisType]] = Field(
         default=None,
         description="需启用的分析类型，默认全部"
@@ -60,6 +61,7 @@ class AnalyzeRequest(BaseModel):
 class RoomData(BaseModel):
     room_id: str = Field(..., description="群聊唯一标识")
     room_name: Optional[str] = Field(default=None, description="群名称")
+    members: Optional[str] = Field(default=None, description="群成员信息，JSON字符串数组格式，与messages[].members相同")
     messages: List[MessageItem] = Field(..., description="该群的消息数组")
 
 

@@ -31,7 +31,7 @@ CLOSING_PATTERN = re.compile(
     r'^(好的|好滴|好的呢|收到|谢谢|感谢|辛苦|辛苦了|麻烦了|知道了|ok|OK|1|👍|\[抱拳\]|\[玫瑰\])[~～！!。]*$'
 )
 
-EMPLOYEE_ROLES = ['售后', '员工', '销售']
+EMPLOYEE_ROLES = ['售后', '员工', '销售', '未知']
 
 
 class UnansweredAnalyzer:

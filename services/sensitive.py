@@ -30,11 +30,18 @@ class SensitiveWordDetector:
     def detect(self, messages: List[NormalizedMessage]) -> dict:
         word_hits = defaultdict(list)
         total_hits = 0
-        
+
+        text_messages = []
         for msg in messages:
             if not msg.text_content or msg.msgtype != "text":
                 continue
-            
+            text_messages.append(msg)
+
+        if not text_messages:
+            logger.warning(f"没有文本消息，使用全部消息进行敏感词检测")
+            text_messages = [m for m in messages if m.text_content]
+
+        for msg in text_messages:
             found_words = self._find_words(msg.text_content)
             
             for word in found_words:

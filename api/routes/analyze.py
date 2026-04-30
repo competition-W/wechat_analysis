@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 from datetime import datetime
 import asyncio
+import json
 import time
 from typing import List, Optional
 
@@ -19,6 +20,7 @@ from models.response import (
     RoomAnalysisResult,
     UnansweredResult,
     UnansweredDetail,
+    MemberInfo,
 )
 from services import (
     Preprocessor,
@@ -38,11 +40,6 @@ summary_generator = SummaryGenerator()
 highfreq_analyzer = HighFreqAnalyzer()
 unanswered_analyzer = UnansweredAnalyzer()
 
-SUMMARY_SHORT_CIRCUIT_THRESHOLD = 5
-HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD = 3
-HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD = 50
-DEFAULT_SUMMARY_FOR_SHORT = "群内互动较少，暂无核心议题。"
-
 
 @router.post("/chat/analyze", response_model=AnalyzeResponse)
 async def analyze_chat(request: AnalyzeRequest):
@@ -52,6 +49,74 @@ async def analyze_chat(request: AnalyzeRequest):
         messages_dict = [msg.model_dump(by_alias=True) for msg in request.messages]
         normalized = await asyncio.to_thread(preprocessor.process, messages_dict)
         
+        members_list = []
+        seen_userids = set()
+        
+        if request.members:
+            members_raw = request.members
+            if isinstance(members_raw, str):
+                try:
+                    req_members = json.loads(members_raw)
+                    if isinstance(req_members, list):
+                        for m in req_members:
+                            if isinstance(m, dict):
+                                userid = m.get("userid", "")
+                                if userid and userid not in seen_userids:
+                                    seen_userids.add(userid)
+                                    members_list.append(MemberInfo(
+                                        userid=userid,
+                                        name=m.get("name", ""),
+                                        group_nickname=m.get("group_nickname", ""),
+                                        type=m.get("type", 1),
+                                        job=m.get("job", ""),
+                                        position=m.get("position", ""),
+                                    ))
+                except:
+                    pass
+            elif isinstance(members_raw, list):
+                for m in members_raw:
+                    if isinstance(m, dict):
+                        userid = m.get("userid", "")
+                        if userid and userid not in seen_userids:
+                            seen_userids.add(userid)
+                            members_list.append(MemberInfo(
+                                userid=userid,
+                                name=m.get("name", ""),
+                                group_nickname=m.get("group_nickname", ""),
+                                type=m.get("type", 1),
+                                job=m.get("job", ""),
+                                position=m.get("position", ""),
+                            ))
+        
+        for msg in request.messages:
+            msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else {}
+            members_raw = msg_dict.get("members", [])
+            
+            members_data = []
+            if members_raw:
+                if isinstance(members_raw, str):
+                    try:
+                        members_data = json.loads(members_raw)
+                    except:
+                        members_data = []
+                elif isinstance(members_raw, list):
+                    members_data = members_raw
+            
+            if members_data and isinstance(members_data, list):
+                for m in members_data:
+                    if isinstance(m, dict):
+                        userid = m.get("userid", "")
+                        if userid and userid not in seen_userids:
+                            seen_userids.add(userid)
+                            members_list.append(MemberInfo(
+                                userid=userid,
+                                name=m.get("name", ""),
+                                group_nickname=m.get("group_nickname", ""),
+                                type=m.get("type", 1),
+                                job=m.get("job", ""),
+                                position=m.get("position", ""),
+                            ))
+        
         if not normalized:
             return AnalyzeResponse(
                 code=0,
@@ -60,11 +125,13 @@ async def analyze_chat(request: AnalyzeRequest):
                     room_id=request.room_id,
                     room_name=request.room_name,
                     message_count=0,
+                    members=members_list,
                 )
             )
         
         analysis_types = request.get_analysis_types()
         msg_count = len(normalized)
+        employee_reply_count = sum(1 for m in normalized if m.sender_role in ["员工", "售后", "销售"])
         total_chars = sum(len(m.text_content or "") for m in normalized)
         
         async def run_sentiment():
@@ -91,9 +158,6 @@ async def analyze_chat(request: AnalyzeRequest):
         
         async def run_summary():
             if AnalysisType.SUMMARY in analysis_types:
-                if msg_count < SUMMARY_SHORT_CIRCUIT_THRESHOLD:
-                    logger.info(f"消息数 {msg_count} < {SUMMARY_SHORT_CIRCUIT_THRESHOLD}，摘要短路返回默认值")
-                    return DEFAULT_SUMMARY_FOR_SHORT
                 try:
                     return await asyncio.to_thread(summary_generator.generate, normalized)
                 except Exception as e:
@@ -103,12 +167,6 @@ async def analyze_chat(request: AnalyzeRequest):
         
         async def run_highfreq():
             if AnalysisType.HIGHFREQ in analysis_types:
-                if msg_count < HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD:
-                    logger.info(f"消息数 {msg_count} < {HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD}，高频词短路返回空列表")
-                    return HighFreqResult(words=[])
-                if total_chars < HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD:
-                    logger.info(f"总字数 {total_chars} < {HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD}，高频词短路返回空列表")
-                    return HighFreqResult(words=[])
                 try:
                     words = await asyncio.to_thread(highfreq_analyzer.analyze, normalized)
                     return HighFreqResult(
@@ -150,6 +208,8 @@ async def analyze_chat(request: AnalyzeRequest):
                 room_name=request.room_name,
                 analysis_time=datetime.now().isoformat(),
                 message_count=len(normalized),
+                employee_reply_count=employee_reply_count,
+                members=members_list,
                 sentiment=sentiment_result,
                 sensitive_words=sensitive_result,
                 summary=summary_result,
@@ -169,8 +229,22 @@ async def health_check():
 
 
 @router.post("/chat/batch-analyze", response_model=BatchAnalyzeResponse)
-async def batch_analyze_chat(request: BatchAnalyzeRequest):
-    logger.info(f"收到批量分析请求: rooms={len(request.rooms)}, max_concurrent={request.max_concurrent}")
+async def batch_analyze_chat(request: BatchAnalyzeRequest, raw_request: Request):
+    body = await raw_request.body()
+    total_messages = sum(len(room.messages) for room in request.rooms)
+    analysis_types = request.get_analysis_types()
+    logger.info(f"收到批量分析请求: rooms={len(request.rooms)}, max_concurrent={request.max_concurrent}, total_messages={total_messages}, analysis_types={[a.value for a in analysis_types]}")
+    logger.info(f"原始请求body前500字符: {body[:500]}")
+
+    for i, room in enumerate(request.rooms[:3]):
+        sample_msg = room.messages[0] if room.messages else None
+        if sample_msg:
+            msg_dict = sample_msg.model_dump()
+            first_from = msg_dict.get('from') or msg_dict.get('from_')
+            first_content = msg_dict.get('content', '')
+            first_msgtype = msg_dict.get('msgtype', '空')
+            first_members = msg_dict.get('members', '')
+            logger.info(f"请求样例[{i}]: room_id={room.room_id}, room_name={room.room_name}, messages_count={len(room.messages)}, first_msg_from={first_from}, first_msg_content={first_content[:50] if first_content else '空'}, first_msg_msgtype={first_msgtype}, first_msg_members类型={type(first_members).__name__}")
     
     start_time = time.time()
     analysis_types = request.get_analysis_types()
@@ -195,6 +269,7 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
                     )
                 
                 msg_count = len(normalized)
+                employee_reply_count = sum(1 for m in normalized if m.sender_role in ["员工", "售后", "销售"])
                 total_chars = sum(len(m.text_content or "") for m in normalized)
                 
                 async def run_sentiment():
@@ -221,8 +296,6 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
                 
                 async def run_summary():
                     if AnalysisType.SUMMARY in analysis_types:
-                        if msg_count < SUMMARY_SHORT_CIRCUIT_THRESHOLD:
-                            return DEFAULT_SUMMARY_FOR_SHORT
                         try:
                             return await asyncio.to_thread(summary_generator.generate, normalized)
                         except Exception as e:
@@ -232,10 +305,6 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
                 
                 async def run_highfreq():
                     if AnalysisType.HIGHFREQ in analysis_types:
-                        if msg_count < HIGHFREQ_SHORT_CIRCUIT_MSG_THRESHOLD:
-                            return HighFreqResult(words=[])
-                        if total_chars < HIGHFREQ_SHORT_CIRCUIT_CHARS_THRESHOLD:
-                            return HighFreqResult(words=[])
                         try:
                             words = await asyncio.to_thread(highfreq_analyzer.analyze, normalized)
                             return HighFreqResult(
@@ -268,6 +337,76 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
                     run_highfreq(),
                     run_unanswered(),
                 )
+
+                logger.info(f"群 {room.room_id} 分析结果检查: sentiment={'有' if sentiment_result else '空'}, sensitive={'有' if sensitive_result else '空'}, summary={'有' if summary_result else '空'}, highfreq={'有' if highfreq_result else '空'}, unanswered={'有' if unanswered_result else '空'}")
+                
+                members_list = []
+                seen_userids = set()
+                
+                if room.members:
+                    members_raw = room.members
+                    if isinstance(members_raw, str):
+                        try:
+                            room_members = json.loads(members_raw)
+                            if isinstance(room_members, list):
+                                for m in room_members:
+                                    if isinstance(m, dict):
+                                        userid = m.get("userid", "")
+                                        if userid and userid not in seen_userids:
+                                            seen_userids.add(userid)
+                                            members_list.append(MemberInfo(
+                                                userid=userid,
+                                                name=m.get("name", ""),
+                                                group_nickname=m.get("group_nickname", ""),
+                                                type=m.get("type", 1),
+                                                job=m.get("job", ""),
+                                                position=m.get("position", ""),
+                                            ))
+                        except:
+                            pass
+                    elif isinstance(members_raw, list):
+                        for m in members_raw:
+                            if isinstance(m, dict):
+                                userid = m.get("userid", "")
+                                if userid and userid not in seen_userids:
+                                    seen_userids.add(userid)
+                                    members_list.append(MemberInfo(
+                                        userid=userid,
+                                        name=m.get("name", ""),
+                                        group_nickname=m.get("group_nickname", ""),
+                                        type=m.get("type", 1),
+                                        job=m.get("job", ""),
+                                        position=m.get("position", ""),
+                                    ))
+                
+                for msg in room.messages:
+                    msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else {}
+                    members_raw = msg_dict.get("members", [])
+                    
+                    members_data = []
+                    if members_raw:
+                        if isinstance(members_raw, str):
+                            try:
+                                members_data = json.loads(members_raw)
+                            except:
+                                members_data = []
+                        elif isinstance(members_raw, list):
+                            members_data = members_raw
+                    
+                    if members_data and isinstance(members_data, list):
+                        for m in members_data:
+                            if isinstance(m, dict):
+                                userid = m.get("userid", "")
+                                if userid and userid not in seen_userids:
+                                    seen_userids.add(userid)
+                                    members_list.append(MemberInfo(
+                                        userid=userid,
+                                        name=m.get("name", ""),
+                                        group_nickname=m.get("group_nickname", ""),
+                                        type=m.get("type", 1),
+                                        job=m.get("job", ""),
+                                        position=m.get("position", ""),
+                                    ))
                 
                 return RoomAnalysisResult(
                     room_id=room.room_id,
@@ -278,6 +417,8 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
                         room_name=room.room_name,
                         analysis_time=datetime.now().isoformat(),
                         message_count=len(normalized),
+                        employee_reply_count=employee_reply_count,
+                        members=members_list,
                         sentiment=sentiment_result,
                         sensitive_words=sensitive_result,
                         summary=summary_result,
@@ -303,16 +444,21 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest):
     failed_count = len(results) - success_count
     
     logger.info(f"批量分析完成: total={len(results)}, success={success_count}, failed={failed_count}, elapsed={elapsed:.2f}s")
-    
+
+    response_data = BatchResponseData(
+        total_rooms=len(results),
+        success_count=success_count,
+        failed_count=failed_count,
+        analysis_time=datetime.now().isoformat(),
+        elapsed_seconds=round(elapsed, 2),
+        results=list(results),
+    )
+
+    response_json = response_data.model_dump_json()
+    logger.info(f"返回数据大小: {len(response_json)} 字符")
+
     return BatchAnalyzeResponse(
         code=0,
         message="success",
-        data=BatchResponseData(
-            total_rooms=len(results),
-            success_count=success_count,
-            failed_count=failed_count,
-            analysis_time=datetime.now().isoformat(),
-            elapsed_seconds=round(elapsed, 2),
-            results=list(results),
-        )
+        data=response_data,
     )

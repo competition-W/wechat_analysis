@@ -1,0 +1,41 @@
+services:
+  wechat-analysis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wechat-analysis
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.production
+    volumes:
+      - app-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - app-network
+
+volumes:
+  app-logs:
+
+networks:
+  app-network:
+    driver: bridge

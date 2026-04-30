@@ -76,10 +76,13 @@ class HighFreqAnalyzer:
     
     def analyze(self, messages: List[NormalizedMessage]) -> List[dict]:
         text_messages = [m for m in messages if m.text_content and m.msgtype == "text"]
-        
+
         if not text_messages:
-            return []
-        
+            logger.warning(f"没有文本消息，使用全部消息进行高频词分析")
+            text_messages = [m for m in messages if m.text_content]
+            if not text_messages:
+                return []
+
         chat_text = self._format_messages(text_messages)
         
         try:
