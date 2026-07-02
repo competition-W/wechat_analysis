@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     CUSTOMER_BAD_WORDS: str = Field(default="", description="客户差评词库(逗号分隔)")
     EMPLOYEE_POS_WORDS: str = Field(default="", description="员工积极词库(逗号分隔)")
     EMPLOYEE_BAD_WORDS: str = Field(default="", description="员工恶劣态度词库(逗号分隔)")
+    EMPLOYEE_POLITE_WORDS: str = Field(default="", description="员工礼貌用语白名单(逗号分隔)，命中后直接标记为积极态度")
     
     SERVICE_PORT: int = Field(default=8000, description="服务端口")
     SERVICE_HOST: str = Field(default="0.0.0.0", description="服务主机")
@@ -58,6 +59,10 @@ class Settings(BaseSettings):
     @property
     def employee_bad_words_list(self) -> List[str]:
         return [w.strip() for w in self.EMPLOYEE_BAD_WORDS.split(",") if w.strip()]
+    
+    @property
+    def employee_polite_words_list(self) -> List[str]:
+        return [w.strip() for w in self.EMPLOYEE_POLITE_WORDS.split(",") if w.strip()]
     
     class Config:
         env_file = ".env"
