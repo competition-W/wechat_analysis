@@ -1,4 +1,6 @@
+from pathlib import Path
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import sys
@@ -40,6 +42,14 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def index():
+    indexPath = Path(__file__).parent / "static" / "index.html"
+    if indexPath.exists():
+        return indexPath.read_text(encoding="utf-8")
+    return HTMLResponse(content="<h1>Dashboard not found</h1>", status_code=404)
 
 
 @app.on_event("startup")
