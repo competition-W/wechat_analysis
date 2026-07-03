@@ -48,7 +48,7 @@ app.include_router(router)
 async def index():
     indexPath = Path(__file__).parent / "static" / "index.html"
     if indexPath.exists():
-        return indexPath.read_text(encoding="utf-8")
+        return HTMLResponse(content=indexPath.read_text(encoding="utf-8"), media_type="text/html; charset=utf-8")
     return HTMLResponse(content="<h1>Dashboard not found</h1>", status_code=404)
 
 
