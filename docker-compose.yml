@@ -1,4 +1,4 @@
-services:
+﻿services:
   wechat-analysis:
     build:
       context: .
@@ -11,6 +11,8 @@ services:
       - .env.production
     volumes:
       - app-logs:/app/logs
+      - app-reports:/app/reports
+      - app-archive:/app/archive
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 30s
@@ -35,6 +37,8 @@ services:
 
 volumes:
   app-logs:
+  app-reports:
+  app-archive:
 
 networks:
   app-network:

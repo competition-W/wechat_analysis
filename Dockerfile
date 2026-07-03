@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS builder
+﻿FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
@@ -31,7 +31,7 @@ COPY config/ config/
 COPY utils/ utils/
 COPY data/ data/
 
-RUN mkdir -p logs && chown -R appuser:appuser /app
+RUN mkdir -p logs archive reports && chown -R appuser:appuser /app
 
 USER appuser
 
