@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+﻿from pydantic_settings import BaseSettings
 from pydantic import Field
 from typing import List
 from functools import lru_cache
@@ -40,6 +40,28 @@ class Settings(BaseSettings):
     )
     JAVA_DATA_SOURCE_TIMEOUT: int = Field(default=120, description="Java接口超时时间(秒)")
     
+
+    # ========== LIMS API 配置 (新增) ==========
+    LIMS_API_URL: str = Field(
+        default="http://110.1.1.96:8080/unionLims/",
+        description="LIMS API 基础地址"
+    )
+    LIMS_BASE_DATA_PATH: str = Field(
+        default="/base_data/",
+        description="LIMS base_data 接口路径"
+    )
+    LIMS_API_TIMEOUT: int = Field(default=30, description="LIMS API 超时时间(秒)")
+
+    PROJECT_CODE_PATTERN: str = Field(
+        default=r"LC-P\d+",
+        description="从群名称提取项目编号的正则表达式"
+    )
+
+    # ========== 报告生成配置 (新增) ==========
+    REPORT_OUTPUT_DIR: str = Field(default="./reports", description="报告输出目录")
+    REPORT_TITLE: str = Field(default="群聊数据统计分析报告", description="报告标题")
+
+    ARCHIVE_DIR: str = Field(default="../../archive", description="数据归档目录")
     @property
     def sensitive_words_list(self) -> List[str]:
         return [w.strip() for w in self.SENSITIVE_WORDS.split(",") if w.strip()]
