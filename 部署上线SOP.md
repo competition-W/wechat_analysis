@@ -390,3 +390,62 @@ docker pull 110.1.1.43:5000/wechat-analysis:latest && docker compose up -d
 # 完全重建
 docker compose down && docker compose up -d --build
 ```
+
+## 10. 报告生成服务扩展（2026-07-03 新增）
+
+### 10.1 新增功能概览
+
+在原有分析服务基础上，新增群聊+LIMS 数据统计分析与可视化报告系统。
+
+#### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| services/data_collector.py | 数据采集：qxChat + LIMS API 调用，派生字段计算 |
+| services/report_aggregator.py | M00-M11 统计聚合 |
+| services/qxchat_analyzer.py | M12-M17 qxChat 数据分析 |
+| services/report_generator.py | HTML 报告生成（ECharts） |
+| services/_report_sections.py | M12-M17 JS 图表代码 |
+| api/routes/report.py | 报告 API 路由 |
+
+#### 新增配置项 (.env)
+
+LIMS_API_URL=http://110.1.1.96:8080/unionLims/
+LIMS_BASE_DATA_PATH=/base_data/
+LIMS_API_TIMEOUT=30
+PROJECT_CODE_PATTERN=LC-P\d+
+REPORT_OUTPUT_DIR=./reports
+REPORT_TITLE=群聊数据统计分析报告
+
+### 10.2 新增 API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| /api/v1/report/generate | POST | 触发完整报告生成 |
+| /api/v1/report/view/{filename} | GET | 查看已生成的报告 HTML |
+| /api/v1/report/list | GET | 列出所有已生成的报告文件 |
+
+### 10.3 数据依赖验证
+
+报告服务依赖两个内网 API，部署前须确认连通性：
+
+curl http://192.168.0.129:8081/qxChat/
+
+curl -X POST http://110.1.1.96:8080/unionLims/base_data/ -H "Content-Type: application/json" -d '[{"projectCode": "测试"}]'
+
+### 10.4 生成报告
+
+cd /opt/wechat-analysis && docker compose up -d
+
+curl -X POST http://localhost:8000/api/v1/report/generate
+
+curl http://localhost:8000/api/v1/report/list
+
+### 10.5 故障排查
+
+| 问题 | 排查步骤 |
+|------|----------|
+| 报告生成为空 | 检查 qxChat 和 LIMS API 是否可达，项目号是否匹配 |
+| finalAfterSaler 均为空 | 检查 LIMS 中 afterSaler 与 members 精确匹配 |
+| 图表不显示 | 确认服务器可访问 cdn.jsdelivr.net，或改为内网镜像 |
+| LIMS API 响应慢 | 调整 LIMS_API_TIMEOUT（默认 30 秒） |
