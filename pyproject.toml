@@ -5,6 +5,7 @@ description = "企业微信客户群聊智能分析服务"
 requires-python = ">=3.11"
 
 dependencies = [
+    "pymysql>=1.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.34.0",
     "pydantic>=2.5.0",

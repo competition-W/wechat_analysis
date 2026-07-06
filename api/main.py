@@ -1,5 +1,8 @@
 from pathlib import Path
+import time
+import uuid
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
@@ -42,6 +45,34 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    started = time.perf_counter()
+    logger.info(
+        "request.start id={} method={} path={} query={}",
+        request_id, request.method, request.url.path, request.url.query or "-",
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.exception(
+            "request.error id={} method={} path={} elapsed_ms={:.1f}",
+            request_id, request.method, request.url.path, elapsed_ms,
+        )
+        raise
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.1f}"
+    log = logger.warning if elapsed_ms >= 5000 else logger.info
+    log(
+        "request.end id={} method={} path={} status={} elapsed_ms={:.1f}",
+        request_id, request.method, request.url.path, response.status_code, elapsed_ms,
+    )
+    return response
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
