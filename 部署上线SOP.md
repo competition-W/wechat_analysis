@@ -446,6 +446,6 @@ curl http://localhost:8000/api/v1/report/list
 | 问题 | 排查步骤 |
 |------|----------|
 | 报告生成为空 | 检查 qxChat 和 LIMS API 是否可达，项目号是否匹配 |
-| finalAfterSaler 均为空 | 检查 LIMS 中 afterSaler 与 members 精确匹配 |
+| 售后人员为空 | 检查 LIMS base_data 接口是否返回 afterSaler 字段 |
 | 图表不显示 | 确认服务器可访问 cdn.jsdelivr.net，或改为内网镜像 |
 | LIMS API 响应慢 | 调整 LIMS_API_TIMEOUT（默认 30 秒） |

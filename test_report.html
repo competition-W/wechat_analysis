@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>群聊数据统计分析报告</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #f0f2f5; color: #333; min-height: 100vh;
+}
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+/* Header */
+.header {
+    background: linear-gradient(135deg, #1a73e8 0%, #0d47a1 100%);
+    color: #fff; padding: 30px; border-radius: 12px; margin-bottom: 24px;
+}
+.header h1 { font-size: 26px; margin-bottom: 6px; }
+.header p { opacity: 0.85; font-size: 14px; }
+
+/* TOC */
+.toc {
+    background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 24px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+.toc h3 { margin-bottom: 12px; font-size: 16px; color: #1a73e8; }
+.toc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+.toc a {
+    display: block; padding: 8px 12px; background: #f6f8fa; border-radius: 6px;
+    color: #333; text-decoration: none; font-size: 13px; transition: all 0.2s;
+}
+.toc a:hover { background: #e3f2fd; color: #1a73e8; }
+
+/* Summary Cards */
+.summary-cards {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 16px; margin-bottom: 24px;
+}
+.card {
+    background: #fff; border-radius: 10px; padding: 20px; text-align: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08); transition: transform 0.2s;
+}
+.card:hover { transform: translateY(-2px); }
+.card .value { font-size: 28px; font-weight: 700; color: #1a73e8; }
+.card .label { font-size: 13px; color: #666; margin-top: 6px; }
+
+/* Module Section */
+.module {
+    background: #fff; border-radius: 10px; padding: 24px; margin-bottom: 20px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+.module h2 { font-size: 18px; color: #1a73e8; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 2px solid #e8eaf6; }
+.module .badge {
+    display: inline-block; background: #e3f2fd; color: #1a73e8;
+    padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 600;
+}
+
+/* Chart container */
+.chart-box { width: 100%; height: 400px; }
+.chart-box-half { width: 100%; height: 350px; }
+
+/* Tables */
+table.report-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.report-table th {
+    background: #f5f7fa; color: #333; font-weight: 600; padding: 10px 12px;
+    text-align: left; border-bottom: 2px solid #e8eaed;
+}
+table.report-table td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; }
+table.report-table tr:hover { background: #f8f9ff; }
+table.report-table .rank-1 { color: #f5222d; font-weight: 700; }
+table.report-table .rank-2 { color: #fa8c16; font-weight: 700; }
+table.report-table .rank-3 { color: #1890ff; font-weight: 700; }
+
+/* Hierarchy indentation */
+.hierarchy-ul { list-style: none; padding-left: 20px; }
+.hierarchy-li { padding: 4px 0; position: relative; }
+.hierarchy-li::before { content: "│"; position: absolute; left: -16px; color: #ccc; }
+.key-account-node { color: #f5222d; font-weight: 600; }
+
+/* Responsive */
+@media (max-width: 768px) {
+    .summary-cards { grid-template-columns: repeat(2, 1fr); }
+    .toc-grid { grid-template-columns: repeat(2, 1fr); }
+    .chart-box { height: 300px; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<!-- Header (M00) -->
+<div class="header">
+    <h1>群聊数据统计分析报告</h1>
+    <p>
+        <span class="period-badge"></span>
+        统计时间段: - ~ -
+        | 数据总量: 5 条 LIMS 记录, 3 个群
+    </p>
+</div>
+
+<!-- TOC (M02) -->
+<div class="toc">
+    <h3>目录导航</h3>
+    <div class="toc-grid">
+        <a href="#m03">摘要指标卡</a>
+        <a href="#m04">售后人员分布</a>
+        <a href="#m05">群活跃时长分布</a>
+        <a href="#m06">产品大类层级</a>
+        <a href="#m07">大客户层级</a>
+        <a href="#m08">销售区域分布</a>
+        <a href="#m09">区域 × 销售员</a>
+        <a href="#m10">区域 × 产品</a>
+        <a href="#m11">区域 × 售后员</a>
+    </div>
+</div>
+
+<!-- M03 Summary Cards -->
+<div class="module" id="m03">
+    <h2>摘要指标卡 <span class="badge">M03</span></h2>
+    <div class="summary-cards" id="summary-cards">
+        <div class="card"><div class="value">3</div><div class="label">销售区域数</div></div>
+        <div class="card"><div class="value">3</div><div class="label">售后员数</div></div>
+        <div class="card"><div class="value">3</div><div class="label">产品大类数</div></div>
+        <div class="card"><div class="value">0.0%</div><div class="label">短活跃群占比</div></div>
+        <div class="card"><div class="value">3</div><div class="label">大客户单位数</div></div>
+        <div class="card"><div class="value">3</div><div class="label">总群数</div></div>
+    </div>
+</div>
+
+<!-- M04 -->
+<div class="module" id="m04">
+    <h2>售后人员分布 <span class="badge">M04</span></h2>
+    <div class="chart-box" id="chart-m04"></div>
+</div>
+
+<!-- M05 -->
+<div class="module" id="m05">
+    <h2>群活跃时长分布 <span class="badge">M05</span></h2>
+    <div class="chart-box" id="chart-m05"></div>
+    <table class="report-table" style="margin-top:16px">
+        <thead><tr><th>分档</th><th>群数</th><th>占比</th></tr></thead>
+        <tbody>
+<tr><td><=7天</td><td>0</td><td>0.0%</td></tr><tr><td>8-30天</td><td>0</td><td>0.0%</td></tr><tr><td>1-3月</td><td>1</td><td>33.3%</td></tr><tr><td>3-6月</td><td>1</td><td>33.3%</td></tr><tr><td>6-12月</td><td>1</td><td>33.3%</td></tr><tr><td>>12个月</td><td>0</td><td>0.0%</td></tr></tbody></table></div>
+<!-- M06 -->
+<div class="module" id="m06">
+    <h2>产品大类层级 <span class="badge">M06</span></h2>
+    <div class="chart-box" id="chart-m06"></div>
+    <div id="product-hierarchy-view" style="margin-top:16px"></div>
+</div>
+
+<!-- M07 -->
+<div class="module" id="m07">
+    <h2>大客户层级 <span class="badge">M07</span></h2>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px"><div style="background:#fff8e1;border-radius:8px;padding:12px;border:1px solid #ffe082"><div style="font-weight:700;color:#e65100;margin-bottom:8px">[K001]</div><div style="padding:4px 0;font-size:13px"><span style="color:#333">客户1</span> <span style="color:#999">→ 售后: 张三</span></div></div><div style="background:#fff8e1;border-radius:8px;padding:12px;border:1px solid #ffe082"><div style="font-weight:700;color:#e65100;margin-bottom:8px">[K002]</div><div style="padding:4px 0;font-size:13px"><span style="color:#333">客户5</span> <span style="color:#999">→ 售后: 张三</span></div></div><div style="background:#fff8e1;border-radius:8px;padding:12px;border:1px solid #ffe082"><div style="font-weight:700;color:#e65100;margin-bottom:8px">[K003]</div><div style="padding:4px 0;font-size:13px"><span style="color:#333">客户4</span> <span style="color:#999">→ 售后: 李四</span></div></div></div></div>
+<!-- M08 -->
+<div class="module" id="m08">
+    <h2>销售区域分布 <span class="badge">M08</span> <span class="badge" style="background:#fff3e0;color:#e65100">Top5 覆盖率: 100.0%</span></h2>
+    <div class="chart-box" id="chart-m08"></div>
+    <table class="report-table" style="margin-top:16px">
+        <thead><tr><th>排名</th><th>销售区域</th><th>群聊数</th><th>占比</th></tr></thead>
+        <tbody>
+<tr><td class='rank-1'>1</td><td>华东</td><td>2</td><td>40.0%</td></tr><tr><td class='rank-2'>2</td><td>华北</td><td>2</td><td>40.0%</td></tr><tr><td class='rank-3'>3</td><td>华南</td><td>1</td><td>20.0%</td></tr></tbody></table></div>
+<!-- M09 -->
+<div class="module" id="m09">
+    <h2>销售区域 × 销售员 <span class="badge">M09</span></h2>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px"><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华东</div><div style="padding:2px 0;font-size:13px"><span class="rank-1">Top1</span> 张三 <span style="color:#999">(1)</span></div><div style="padding:2px 0;font-size:13px"><span class="rank-2">Top2</span> 李四 <span style="color:#999">(1)</span></div></div><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华北</div><div style="padding:2px 0;font-size:13px"><span class="rank-1">Top1</span> 张三 <span style="color:#999">(1)</span></div><div style="padding:2px 0;font-size:13px"><span class="rank-2">Top2</span> 王五 <span style="color:#999">(1)</span></div></div><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华南</div><div style="padding:2px 0;font-size:13px"><span class="rank-1">Top1</span> 张三 <span style="color:#999">(1)</span></div></div></div></div>
+<!-- M10 -->
+<div class="module" id="m10">
+    <h2>销售区域 × 产品大类 <span class="badge">M10</span></h2>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:16px"><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华东</div><div style="padding:2px 0;font-size:13px">RNA测序: <strong>2</strong></div></div><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华北</div><div style="padding:2px 0;font-size:13px">微生物组: <strong>1</strong></div><div style="padding:2px 0;font-size:13px">蛋白组学: <strong>1</strong></div></div><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华南</div><div style="padding:2px 0;font-size:13px">蛋白组学: <strong>1</strong></div></div></div></div>
+<!-- M11 -->
+<div class="module" id="m11">
+    <h2>销售区域 × 售后人员 <span class="badge">M11</span></h2>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px"><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华东</div><div style="padding:2px 0;font-size:13px"><span class="rank-1">Top1</span> 张三 <span style="color:#999">(1)</span></div><div style="padding:2px 0;font-size:13px"><span class="rank-2">Top2</span> 李四 <span style="color:#999">(1)</span></div></div><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华北</div><div style="padding:2px 0;font-size:13px"><span class="rank-1">Top1</span> 张三 <span style="color:#999">(1)</span></div><div style="padding:2px 0;font-size:13px"><span class="rank-2">Top2</span> 王五 <span style="color:#999">(1)</span></div></div><div style="background:#f5f7fa;border-radius:8px;padding:12px"><div style="font-weight:700;margin-bottom:8px;color:#1a73e8">华南</div><div style="padding:2px 0;font-size:13px"><span class="rank-1">Top1</span> 张三 <span style="color:#999">(1)</span></div></div></div></div><!-- M12 -->
+<div class="module" id="m12">
+    <h2>群消息量趋势 <span class="badge">M12</span></h2>
+    <p style="color:#666;font-size:13px;margin-bottom:12px">
+        消息总量: 0 | 日均: 0 | 天数: 0
+    </p>
+    <div class="chart-box" id="chart-m12"></div>
+</div><!-- M13 -->
+<div class="module" id="m13">
+    <h2>消息时段分布 <span class="badge">M13</span></h2>
+    <p style="color:#666;font-size:13px;margin-bottom:12px">
+        峰值时段: 无数据 | 消息总量: 0
+    </p>
+    <div class="chart-box-half" id="chart-m13-heatmap"></div>
+    <div class="chart-box-half" id="chart-m13-hourly" style="margin-top:20px"></div>
+</div><!-- M14 -->
+<div class="module" id="m14">
+    <h2>客户消息情感分析 <span class="badge">M14</span></h2>
+    <div class="summary-cards" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr))">
+        <div class="card"><div class="value">0</div><div class="label">客户好评</div></div>
+        <div class="card"><div class="value">0</div><div class="label">客户差评</div></div>
+        <div class="card"><div class="value">0</div><div class="label">员工积极</div></div>
+        <div class="card"><div class="value">0</div><div class="label">员工恶劣</div></div>
+        <div class="card"><div class="value">0%</div><div class="label">好评率</div></div>
+    </div>
+    <div class="chart-box-half" id="chart-m14"></div>
+</div><!-- M15 -->
+<div class="module" id="m15">
+    <h2>高频关键词 <span class="badge">M15</span></h2>
+    <p style="color:#666;font-size:13px;margin-bottom:12px">
+        共发现 0 个唯一词汇，高频词 TOP 20 如下
+    </p>
+    <div class="chart-box" id="chart-m15"></div>
+</div><!-- M16 -->
+<div class="module" id="m16">
+    <h2>漏回消息分析 <span class="badge">M16</span></h2>
+    <div class="summary-cards" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr))">
+        <div class="card"><div class="value">0</div><div class="label">漏回消息数</div></div>
+        <div class="card"><div class="value">0%</div><div class="label">漏回率</div></div>
+        <div class="card"><div class="value">0</div><div class="label">漏回群数</div></div>
+        <div class="card"><div class="value">0</div><div class="label">高风险群</div></div>
+    </div>
+    <div class="chart-box-half" id="chart-m16"></div>
+</div><!-- M17 -->
+<div class="module" id="m17">
+    <h2>员工响应时效分析 <span class="badge">M17</span></h2>
+    <div class="summary-cards" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr))">
+        <div class="card"><div class="value">0</div><div class="label">总响应数</div></div>
+        <div class="card"><div class="value">0s</div><div class="label">平均响应时长</div></div>
+        <div class="card"><div class="value">0s</div><div class="label">中位响应时长</div></div>
+        <div class="card"><div class="value">0s</div><div class="label">最慢响应</div></div>
+    </div>
+    <div class="chart-box-half" id="chart-m17"></div>
+</div><!-- M17b -->
+<div class="module" id="m17b">
+    <h2>消息类型分布 <span class="badge">M17b</span></h2>
+    <div class="chart-box" id="chart-m17b"></div>
+</div><script>
+var reportData = {"report_title": "群聊数据统计分析报告", "time_range": {"start": "2026-01-01", "end": "2026-07-15"}, "total_groups": 3, "total_lims_records": 5, "summary": {"sales_region_count": 3, "after_sales_count": 3, "product_category_count": 3, "short_active_group_ratio": 0.0, "key_account_unit_count": 3, "total_groups": 3, "total_lims_records": 5}, "after_sales_distribution": [{"name": "张三", "count": 3}, {"name": "李四", "count": 1}, {"name": "王五", "count": 1}], "active_duration": [{"bucket": "<=7天", "count": 0, "ratio": 0.0}, {"bucket": "8-30天", "count": 0, "ratio": 0.0}, {"bucket": "1-3月", "count": 1, "ratio": 33.3}, {"bucket": "3-6月", "count": 1, "ratio": 33.3}, {"bucket": "6-12月", "count": 1, "ratio": 33.3}, {"bucket": ">12个月", "count": 0, "ratio": 0.0}], "product_hierarchy": [{"name": "RNA测序", "children": [{"name": "转录组", "children": [{"name": "mRNA", "value": 1}]}]}, {"name": "微生物组", "children": [{"name": "16S", "children": [{"name": "OTU", "value": 1}]}]}, {"name": "蛋白组学", "children": [{"name": "蛋白质谱", "children": [{"name": "DIA", "value": 1}]}]}], "key_customer_hierarchy": [{"key_account": "K001", "customers": [{"customer_name": "客户1", "after_sales": ["张三"]}]}, {"key_account": "K002", "customers": [{"customer_name": "客户5", "after_sales": ["张三"]}]}, {"key_account": "K003", "customers": [{"customer_name": "客户4", "after_sales": ["李四"]}]}], "sales_region_distribution": [{"region": "华东", "count": 2, "ratio": 40.0}, {"region": "华北", "count": 2, "ratio": 40.0}, {"region": "华南", "count": 1, "ratio": 20.0}], "top5_coverage": 100.0, "region_salesperson": {"华东": [{"name": "张三", "count": 1}, {"name": "李四", "count": 1}], "华南": [{"name": "张三", "count": 1}], "华北": [{"name": "张三", "count": 1}, {"name": "王五", "count": 1}]}, "region_product": {"华东": {"RNA测序": 2}, "华南": {"蛋白组学": 1}, "华北": {"微生物组": 1, "蛋白组学": 1}}, "region_after_sales": {"华东": [{"name": "张三", "count": 1}, {"name": "李四", "count": 1}], "华南": [{"name": "张三", "count": 1}], "华北": [{"name": "张三", "count": 1}, {"name": "王五", "count": 1}]}, "qxchat": {"m12_message_trend": {"total_messages": 0, "avg_daily": 0, "days_covered": 0, "trend": []}, "m13_time_distribution": {"total_messages": 0, "peak_hour": -1, "peak_hour_label": "无数据", "hourly_distribution": [{"hour": 0, "count": 0, "ratio": 0}, {"hour": 1, "count": 0, "ratio": 0}, {"hour": 2, "count": 0, "ratio": 0}, {"hour": 3, "count": 0, "ratio": 0}, {"hour": 4, "count": 0, "ratio": 0}, {"hour": 5, "count": 0, "ratio": 0}, {"hour": 6, "count": 0, "ratio": 0}, {"hour": 7, "count": 0, "ratio": 0}, {"hour": 8, "count": 0, "ratio": 0}, {"hour": 9, "count": 0, "ratio": 0}, {"hour": 10, "count": 0, "ratio": 0}, {"hour": 11, "count": 0, "ratio": 0}, {"hour": 12, "count": 0, "ratio": 0}, {"hour": 13, "count": 0, "ratio": 0}, {"hour": 14, "count": 0, "ratio": 0}, {"hour": 15, "count": 0, "ratio": 0}, {"hour": 16, "count": 0, "ratio": 0}, {"hour": 17, "count": 0, "ratio": 0}, {"hour": 18, "count": 0, "ratio": 0}, {"hour": 19, "count": 0, "ratio": 0}, {"hour": 20, "count": 0, "ratio": 0}, {"hour": 21, "count": 0, "ratio": 0}, {"hour": 22, "count": 0, "ratio": 0}, {"hour": 23, "count": 0, "ratio": 0}], "weekday_heatmap": {"周一": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "周二": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "周三": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "周四": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "周五": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "周六": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "周日": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, "weekday_names": ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]}, "m14_sentiment": {"total_analyzed": 0, "customer_good": 0, "customer_bad": 0, "employee_positive": 0, "employee_bad": 0, "neutral": 0, "good_ratio": 0, "bad_ratio": 0, "categories": ["客户好评", "客户差评", "员工积极", "员工恶劣", "中性"], "values": [0, 0, 0, 0, 0]}, "m15_highfreq": {"total_unique_words": 0, "total_word_occurrences": 0, "top_words": []}, "m16_unanswered": {"total_missed": 0, "total_rooms_with_missed": 0, "missed_rate": 0, "risk_levels": {"high": 0, "medium": 0, "low": 3}, "missed_details": []}, "m17_response_time": {"overall": {"avg": 0, "min": 0, "max": 0, "median": 0, "count": 0}, "employee_ranking": [], "distribution": [{"bucket": "<5分钟", "count": 0, "ratio": 0}, {"bucket": "5-15分钟", "count": 0, "ratio": 0}, {"bucket": "15-30分钟", "count": 0, "ratio": 0}, {"bucket": "30-60分钟", "count": 0, "ratio": 0}, {"bucket": "1-4小时", "count": 0, "ratio": 0}, {"bucket": "4-24小时", "count": 0, "ratio": 0}], "bucket_labels": ["<5分钟", "5-15分钟", "15-30分钟", "30-60分钟", "1-4小时", "4-24小时"], "bucket_values": [0, 0, 0, 0, 0, 0]}, "m17b_msg_type_distribution": {"total": 0, "distribution": []}}};
+
+function initChart(el, option) { var c = echarts.init(document.getElementById(el)); c.setOption(option); }
+
+// M04 - AfterSales Distribution
+initChart('chart-m04', {
+    title: { text: '售后人员群聊数排名', left: 'center', textStyle: {fontSize:14} },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: ["张三", "李四", "王五"], axisLabel: { rotate: 45, fontSize: 11 } },
+    yAxis: { type: 'value', name: '群聊数' },
+    series: [{ type: 'bar', data: [3, 1, 1],
+        itemStyle: { color: function(p) { var c=['#f5222d','#fa8c16','#1890ff']; return c[p.dataIndex]||'#5470c6'; } }
+    }]
+});
+
+// M05 - Active Duration
+initChart('chart-m05', {
+    title: { text: '群活跃时长分布', left: 'center', textStyle: {fontSize:14} },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: ["<=7天", "8-30天", "1-3月", "3-6月", "6-12月", ">12个月"] },
+    yAxis: { type: 'value', name: '群数' },
+    series: [{ type: 'bar', data: [0, 0, 1, 1, 1, 0], itemStyle: { color: '#5470c6' } }]
+});
+
+// M06 - Product Hierarchy
+var m06Data = [{"name": "RNA测序", "children": [{"name": "转录组", "children": [{"name": "mRNA", "value": 1}]}]}, {"name": "微生物组", "children": [{"name": "16S", "children": [{"name": "OTU", "value": 1}]}]}, {"name": "蛋白组学", "children": [{"name": "蛋白质谱", "children": [{"name": "DIA", "value": 1}]}]}];
+if (m06Data.length > 0) {
+    initChart('chart-m06', {
+        title: { text: '产品大类层级', left: 'center', textStyle: {fontSize:14} },
+        tooltip: { trigger: 'item' },
+        series: [{
+            type: 'sunburst', data: m06Data,
+            radius: ['15%', '90%'], label: { rotate: 0, fontSize: 11 },
+            emphasis: { focus: 'ancestor' }
+        }]
+    });
+}
+
+// M08 - Sales Region
+var m08Names = ["华东", "华北", "华南"];
+var m08Counts = [2, 2, 1];
+initChart('chart-m08', {
+    title: { text: '销售区域群聊数分布', left: 'center', textStyle: {fontSize:14} },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: m08Names, axisLabel: { rotate: 45, fontSize: 11 } },
+    yAxis: { type: 'value', name: '群聊数' },
+    series: [{ type: 'bar', data: m08Counts }]
+});
+
+
+    
+// M12: Message Trend
+var m12Data = (reportData.qxchat && reportData.qxchat.m12_message_trend && reportData.qxchat.m12_message_trend.trend) || [];
+if (m12Data.length > 0) {
+    initChart('chart-m12', {
+        title: {text:'按日消息量趋势', left:'center', textStyle:{fontSize:14}},
+        tooltip: {trigger:'axis'},
+        legend: {data:['总量','客户','员工'], bottom:0},
+        xAxis: {type:'category', data: m12Data.map(function(d) { return d.date; }), axisLabel:{rotate:45,fontSize:10}},
+        yAxis: {type:'value'},
+        series: [
+            {name:'总量', type:'line', data:m12Data.map(function(d) { return d.total; }), smooth:true},
+            {name:'客户', type:'line', data:m12Data.map(function(d) { return d.customer; }), smooth:true},
+            {name:'员工', type:'line', data:m12Data.map(function(d) { return d.employee; }), smooth:true}
+        ]
+    });
+}
+
+
+// M13: Time Distribution
+var m13Hours = [];
+for (var h = 0; h < 24; h++) { m13Hours.push(h + ':00'); }
+var wdNames = ['周一','周二','周三','周四','周五','周六','周日'];
+var m13HeatData = [];
+for (var w = 0; w < 7; w++) {
+    for (var h = 0; h < 24; h++) {
+        var val = (reportData.qxchat && reportData.qxchat.m13_time_distribution && 
+                   reportData.qxchat.m13_time_distribution.weekday_heatmap) ?
+                  (reportData.qxchat.m13_time_distribution.weekday_heatmap[wdNames[w]] || [])[h] || 0 : 0;
+        m13HeatData.push([h, w, val]);
+    }
+}
+initChart('chart-m13-heatmap', {
+    title: {text:'消息活跃时段热力图', left:'center', textStyle:{fontSize:14}},
+    tooltip: {position:'top', formatter: function(p) { 
+        return p.data[1] + ' ' + p.data[0] + ':00<br/>消息数: ' + p.data[2]; 
+    }},
+    xAxis: {type:'category', data:m13Hours, splitArea:{show:true}},
+    yAxis: {type:'category', data:['周一','周二','周三','周四','周五','周六','周日'], splitArea:{show:true}},
+    visualMap: {min:0, max:10, calculable:true, orient:'horizontal', left:'center', bottom:0},
+    series: [{type:'heatmap', data:m13HeatData, label:{show:false}, emphasis:{itemStyle:{shadowBlur:10}}}]
+});
+// Hourly bar chart
+var m13HourlyData = [];
+for (var h = 0; h < 24; h++) {
+    var cnt = (reportData.qxchat && reportData.qxchat.m13_time_distribution && 
+               reportData.qxchat.m13_time_distribution.hourly_distribution) ?
+              (reportData.qxchat.m13_time_distribution.hourly_distribution[h] || {}).count || 0 : 0;
+    m13HourlyData.push(cnt);
+}
+initChart('chart-m13-hourly', {
+    title: {text:'各时段消息数量', left:'center', textStyle:{fontSize:14}},
+    tooltip: {trigger:'axis'},
+    xAxis: {type:'category', data:m13Hours, axisLabel:{rotate:45,fontSize:10}},
+    yAxis: {type:'value'},
+    series: [{type:'bar', data:m13HourlyData, itemStyle:{color:'#5470c6'}}]
+});
+
+
+// M14: Sentiment
+var m14Cats = (reportData.qxchat && reportData.qxchat.m14_sentiment && 
+    reportData.qxchat.m14_sentiment.categories) || [];
+var m14Vals = (reportData.qxchat && reportData.qxchat.m14_sentiment && 
+    reportData.qxchat.m14_sentiment.values) || [];
+var m14Data = [];
+for (var i = 0; i < m14Cats.length; i++) {
+    m14Data.push({name: m14Cats[i], value: m14Vals[i] || 0});
+}
+initChart('chart-m14', {
+    title: {text:'情感分析分布', left:'center', textStyle:{fontSize:14}},
+    tooltip: {trigger:'item', formatter:'{b}: {c} ({d}%)'},
+    series: [{type:'pie', radius:['30%','60%'], data:m14Data,
+        label:{formatter:'{b}: {c}', fontSize:12},
+        emphasis:{itemStyle:{shadowBlur:10,shadowOffsetX:0,shadowColor:'rgba(0,0,0,0.5)'}}
+    }]
+});
+
+
+// M15: High Frequency Words
+var m15Words = (reportData.qxchat && reportData.qxchat.m15_highfreq && 
+    reportData.qxchat.m15_highfreq.top_words) || [];
+var m15Names = m15Words.map(function(d) { return d.word; });
+var m15Counts = m15Words.map(function(d) { return d.count; });
+initChart('chart-m15', {
+    title: {text:'高频关键词 TOP 20', left:'center', textStyle:{fontSize:14}},
+    tooltip: {trigger:'axis'},
+    xAxis: {type:'category', data:m15Names, axisLabel:{rotate:45,fontSize:10}},
+    yAxis: {type:'value'},
+    series: [{type:'bar', data:m15Counts, itemStyle:{color:'#5470c6'}}]
+});
+
+
+// M16: Unanswered
+var m16Risk = (reportData.qxchat && reportData.qxchat.m16_unanswered && 
+    reportData.qxchat.m16_unanswered.risk_levels) || {};
+initChart('chart-m16', {
+    title: {text:'漏回风险等级分布', left:'center', textStyle:{fontSize:14}},
+    tooltip: {trigger:'item'},
+    series: [{type:'pie', data:[
+        {name:'高风险', value:m16Risk.high || 0, itemStyle:{color:'#f5222d'}},
+        {name:'中风险', value:m16Risk.medium || 0, itemStyle:{color:'#fa8c16'}},
+        {name:'低风险', value:m16Risk.low || 0, itemStyle:{color:'#52c41a'}}
+    ]}]
+});
+
+
+// M17: Response Time
+var m17Labels = (reportData.qxchat && reportData.qxchat.m17_response_time && 
+    reportData.qxchat.m17_response_time.bucket_labels) || [];
+var m17Values = (reportData.qxchat && reportData.qxchat.m17_response_time && 
+    reportData.qxchat.m17_response_time.bucket_values) || [];
+initChart('chart-m17', {
+    title: {text:'响应时长分布', left:'center', textStyle:{fontSize:14}},
+    tooltip: {trigger:'axis'},
+    xAxis: {type:'category', data:m17Labels, axisLabel:{rotate:30,fontSize:10}},
+    yAxis: {type:'value'},
+    series: [{type:'bar', data:m17Values, itemStyle:{color:'#73c0de'}}]
+});
+
+
+// M17b: Message Type
+var m17bDist = (reportData.qxchat && reportData.qxchat.m17b_msg_type_distribution && 
+    reportData.qxchat.m17b_msg_type_distribution.distribution) || [];
+var m17bData = m17bDist.map(function(d) { return {name:d.type, value:d.count}; });
+initChart('chart-m17b', {
+    title: {text:'消息类型分布', left:'center', textStyle:{fontSize:14}},
+    tooltip: {trigger:'item', formatter:'{b}: {c} ({d}%)'},
+    series: [{type:'pie', radius:['30%','60%'], data:m17bData,
+        label:{formatter:'{b}: {c}', fontSize:12},
+        emphasis:{itemStyle:{shadowBlur:10}}
+    }]
+});
+
+window.addEventListener('resize', function() {
+    ['chart-m04','chart-m05','chart-m06','chart-m08','chart-m12','chart-m13-heatmap','chart-m13-hourly','chart-m14','chart-m15','chart-m16','chart-m17','chart-m17b'].forEach(function(id) {
+        var c = echarts.getInstanceByDom(document.getElementById(id));
+        if (c) c.resize();
+    });
+});
+</script>
+
+</div>
+</body>
+</html>

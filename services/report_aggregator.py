@@ -136,7 +136,7 @@ def aggregate_report(
 
     # ==================== M03 摘要指标卡 ====================
     org_names = set()
-    final_after_salers = set()
+    after_salers = set()
     prod_cats = set()
     duration_buckets: Dict[str, int] = defaultdict(int)
     key_account_units = set()
@@ -144,8 +144,8 @@ def aggregate_report(
     for d in lims_dicts:
         if d.get("orgName"):
             org_names.add(d["orgName"])
-        if d.get("finalAfterSaler"):
-            final_after_salers.add(d["finalAfterSaler"])
+        if d.get("afterSaler"):
+            after_salers.add(d["afterSaler"])
         if d.get("productBigSortOne"):
             prod_cats.add(d["productBigSortOne"])
         ka = d.get("keyAccount") or ""
@@ -170,7 +170,7 @@ def aggregate_report(
 
     summary = {
         "sales_region_count": len(org_names),
-        "after_sales_count": len(final_after_salers),
+        "after_sales_count": len(after_salers),
         "product_category_count": len(prod_cats),
         "short_active_group_ratio": short_active_ratio,
         "key_account_unit_count": len(key_account_units),
@@ -178,10 +178,10 @@ def aggregate_report(
         "total_lims_records": len(lims_dicts),
     }
 
-    # ==================== M04 最终售后员分布 ====================
+    # ==================== M04 售后人员分布 ====================
     after_sales_counter = Counter()
     for d in lims_dicts:
-        name = d.get("finalAfterSaler") or "无售后"
+        name = d.get("afterSaler") or "无售后"
         after_sales_counter[name] += 1
     after_sales_distribution = [
         {"name": name, "count": count}
@@ -237,7 +237,7 @@ def aggregate_report(
     for d in lims_dicts:
         ka = d.get("keyAccount") or ""
         cn = d.get("customerName") or ""
-        fas = d.get("finalAfterSaler") or ""
+        fas = d.get("afterSaler") or ""
         if ka:
             key_cust_tree[ka][cn].add(fas)
     key_customer_hierarchy = []
@@ -293,11 +293,11 @@ def aggregate_report(
     for region, counter in region_product_raw.items():
         region_product[region] = {name: count for name, count in counter.most_common()}
 
-    # ==================== M11 区域x售后员 ====================
+    # ==================== M11 区域x售后人员 ====================
     region_after_sales_raw: Dict[str, Counter] = defaultdict(Counter)
     for d in lims_dicts:
         region = d.get("orgName") or "未分配"
-        fas = d.get("finalAfterSaler") or "无售后"
+        fas = d.get("afterSaler") or "无售后"
         region_after_sales_raw[region][fas] += 1
     region_after_sales = {}
     for region, counter in region_after_sales_raw.items():

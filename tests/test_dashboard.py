@@ -59,6 +59,30 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertFalse(db_dashboard._dimension_matches(dimension, category="食品"))
 
 
+    def test_lims_api_dimensions_use_raw_after_saler(self):
+        group_name = "Customer LC-P2026001 support"
+        records = {
+            "LC-P2026001": [{
+                "projectCode": "LC-P2026001",
+                "afterSaler": "RawAfter",
+                "finalAfterSaler": "LegacyFinal",
+                "members": "SomeoneElse",
+                "orgName": "RegionA",
+                "productName": "ProductA",
+                "productBigSortOne": "CategoryA",
+            }]
+        }
+        dimensions, quality = db_dashboard._dimensions_from_lims_api(
+            {group_name: ["LC-P2026001"]},
+            records,
+            {"requests": 1, "records": 1, "errors": 0},
+        )
+
+        self.assertEqual(dimensions[group_name]["aftersalers"], ["RawAfter"])
+        self.assertEqual(dimensions[group_name]["tentative_aftersalers"], [])
+        self.assertEqual(quality["groups_with_aftersaler"], 1)
+
+
 class DashboardCacheTests(unittest.TestCase):
     def setUp(self):
         db_dashboard.clear_cache()
