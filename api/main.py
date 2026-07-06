@@ -4,6 +4,7 @@ import uuid
 from fastapi import FastAPI
 from fastapi import Request
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import sys
@@ -45,6 +46,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
 @app.middleware("http")

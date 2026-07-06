@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>群聊数据统计分析平台</title>
+<script src="https://unpkg.com/lucide@latest"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+    font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    background:#f0f2f5; color:#333; min-height:100vh;
+}
+.container { max-width:1280px; margin:0 auto; padding:20px; }
+.header {
+    background:linear-gradient(135deg,#1a73e8 0%,#0d47a1 100%);
+    color:#fff; padding:18px 24px; border-radius:10px;
+    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;
+}
+.header h1 { font-size:18px; font-weight:600; }
+.header p { font-size:12px; opacity:0.8; margin-top:2px; }
+.health-indicator {
+    display:flex; align-items:center; gap:6px;
+    background:rgba(255,255,255,0.15); padding:5px 12px; border-radius:20px; font-size:12px;
+}
+.health-indicator .dot { width:7px; height:7px; border-radius:50%; }
+.dot.ok { background:#4caf50; }
+.dot.err { background:#f44336; }
+.dot.loading { background:#ffa726; animation:pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.tabs { display:flex; gap:0; margin-top:16px; background:#fff; border-radius:10px 10px 0 0; overflow:hidden; }
+.tab {
+    padding:10px 24px; font-size:13px; font-weight:500; cursor:pointer;
+    border-bottom:2px solid transparent; transition:all 0.15s; color:#666;
+    display:flex; align-items:center; gap:6px;
+}
+.tab:hover { color:#1a73e8; background:#f5f7fa; }
+.tab.active { color:#1a73e8; border-bottom-color:#1a73e8; }
+.panel { background:#fff; border-radius:0 0 10px 10px; padding:20px 24px; box-shadow:0 1px 4px rgba(0,0,0,0.06); margin-bottom:16px; }
+.panel-top { border-radius:10px; margin-top:16px; }
+.panel h2 { font-size:14px; font-weight:600; color:#1a73e8; margin-bottom:12px; padding-bottom:8px; border-bottom:2px solid #e8eaf6; }
+.form-row { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
+.form-group { display:flex; flex-direction:column; gap:3px; }
+.form-group label { font-size:11px; font-weight:500; color:#555; }
+.form-group select,.form-group input {
+    padding:6px 10px; border:1px solid #d0d5dd; border-radius:6px;
+    font-size:13px; background:#fff; outline:none; transition:border-color 0.15s;
+}
+.form-group select:focus,.form-group input:focus { border-color:#1a73e8; box-shadow:0 0 0 2px rgba(26,115,232,0.15); }
+.form-group select { min-width:110px; }
+input[type="date"] { min-width:140px; }
+.toggle-group { display:flex; align-items:center; gap:6px; }
+.toggle-group label { font-size:12px; cursor:pointer; user-select:none; }
+.toggle-switch {
+    position:relative; width:34px; height:18px; flex-shrink:0;
+    background:#d0d5dd; border-radius:9px; cursor:pointer; transition:background 0.2s;
+}
+.toggle-switch.active { background:#1a73e8; }
+.toggle-switch::after {
+    content:""; position:absolute; top:2px; left:2px;
+    width:14px; height:14px; background:#fff; border-radius:50%; transition:transform 0.2s;
+}
+.toggle-switch.active::after { transform:translateX(16px); }
+.btn {
+    display:inline-flex; align-items:center; gap:5px; padding:7px 16px;
+    border:none; border-radius:6px; font-size:13px; font-weight:500;
+    cursor:pointer; transition:all 0.15s; white-space:nowrap;
+}
+.btn-primary { background:#1a73e8; color:#fff; }
+.btn-primary:hover { background:#1557b0; }
+.btn-primary:disabled { background:#a0c4f1; cursor:not-allowed; }
+.btn-sm { padding:5px 10px; font-size:12px; }
+.btn-outline { background:transparent; color:#1a73e8; border:1px solid #1a73e8; }
+.btn-outline:hover { background:#e8f0fe; }
+.card-row { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
+.stat-card {
+    background:#f8f9ff; border-radius:8px; padding:14px; text-align:center; border:1px solid #e8eaf6;
+}
+.stat-card .val { font-size:22px; font-weight:700; color:#1a73e8; }
+.stat-card .lbl { font-size:11px; color:#666; margin-top:4px; }
+.table-wrap { overflow-x:auto; }
+table.rt { width:100%; border-collapse:collapse; font-size:13px; }
+table.rt th {
+    background:#f5f7fa; color:#555; font-weight:600; padding:8px 10px;
+    text-align:left; border-bottom:2px solid #e8eaed; white-space:nowrap; font-size:12px;
+}
+table.rt td { padding:7px 10px; border-bottom:1px solid #f0f0f0; }
+table.rt tr:hover { background:#f8f9ff; }
+.fn-cell { max-width:350px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.fn-cell a { color:#1a73e8; text-decoration:none; }
+.fn-cell a:hover { text-decoration:underline; }
+.chart-area { margin-top:12px; }
+.chart-controls { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:14px; }
+.chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.chart-cell {
+    background:#fafbfc; border:1px solid #e8eaed; border-radius:8px; padding:12px;
+    min-height:280px; display:flex; flex-direction:column;
+}
+.chart-cell h3 { font-size:12px; font-weight:600; color:#555; margin-bottom:8px; }
+.chart-cell .chart-img-wrap { flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+.chart-cell .chart-img-wrap img { max-width:100%; max-height:260px; border-radius:4px; }
+.chart-cell .placeholder {
+    color:#bbb; font-size:13px; text-align:center; width:100%;
+    display:flex; flex-direction:column; align-items:center; gap:8px;
+}
+.chart-cell .placeholder svg { opacity:0.3; }
+.progress-wrap { margin-top:10px; }
+.progress-bar { width:100%; height:3px; background:#e0e0e0; border-radius:2px; overflow:hidden; }
+.progress-bar .fill { height:100%; background:#1a73e8; border-radius:2px; width:0%; transition:width 0.5s ease; }
+.toast {
+    position:fixed; bottom:24px; right:24px; padding:10px 18px; border-radius:8px;
+    color:#fff; font-size:13px; font-weight:500; z-index:1000;
+    transform:translateY(80px); opacity:0; transition:all 0.3s ease; max-width:360px;
+}
+.toast.show { transform:translateY(0); opacity:1; }
+.toast.success { background:#34a853; }
+.toast.error { background:#ea4335; }
+.toast.info { background:#1a73e8; }
+.empty-state { text-align:center; padding:30px 0; color:#999; font-size:13px; }
+.spinner { display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,0.3); border-top-color:#fff; border-radius:50%; animation:spin 0.6s linear infinite; }
+.spinner.dark { border-color:#ccc; border-top-color:#1a73e8; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.section-desc { font-size:12px; color:#888; margin-bottom:12px; }
+.hidden { display:none !important; }
+@media (max-width:768px) {
+    .container { padding:12px; }
+    .chart-grid { grid-template-columns:1fr; }
+    .card-row { grid-template-columns:repeat(2,1fr); }
+    .form-row { flex-direction:column; }
+    .form-group select,.form-group input { width:100%; min-width:0; }
+    .tabs { overflow-x:auto; }
+    .tab { flex-shrink:0; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+    <div>
+        <h1>群聊数据统计分析平台</h1>
+        <p>基于 FastAPI + AntV 的数据可视化服务</p>
+    </div>
+    <div class="health-indicator" id="healthBadge">
+        <span class="dot loading" id="healthDot"></span>
+        <span id="healthText">检查中...</span>
+    </div>
+</div>
+<div class="tabs">
+    <div class="tab active" onclick="switchTab('dashboard')"><i data-lucide="bar-chart-3" style="width:14px;height:14px"></i> 数据看板</div>
+    <div class="tab" onclick="switchTab('reports')"><i data-lucide="file-text" style="width:14px;height:14px"></i> 报告管理</div>
+</div>
+<div id="tab-dashboard">
+    <div class="panel panel-top">
+        <h2>生成报告</h2>
+        <div class="form-row">
+            <div class="form-group">
+                <label>报告类型</label>
+                <select id="reportType">
+                    <option value="daily">日报</option>
+                    <option value="weekly" selected>周报</option>
+                    <option value="monthly">月报</option>
+                    <option value="quarterly">季报</option>
+                    <option value="yearly">年报</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>参考日期</label>
+                <input type="date" id="reportDate">
+            </div>
+            <div class="form-group">
+                <label>&nbsp;</label>
+                <div class="toggle-group">
+                    <div class="toggle-switch" id="freshToggle" onclick="this.classList.toggle('active')"></div>
+                    <label onclick="document.getElementById('freshToggle').classList.toggle('active')">重新拉取</label>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>&nbsp;</label>
+                <button class="btn btn-primary" id="genBtn" onclick="generateAndShow()">
+                    <i data-lucide="sparkles" style="width:14px;height:14px"></i> 生成并看板
+                </button>
+            </div>
+        </div>
+        <div class="progress-wrap hidden" id="progressWrap">
+            <div class="progress-bar"><div class="fill" id="progressFill"></div></div>
+        </div>
+    </div>
+    <div id="summaryArea" class="hidden">
+        <div class="card-row" id="summaryCards"></div>
+    </div>
+    <div id="chartArea" class="hidden">
+        <div class="panel">
+            <h2>图表可视化 <span style="font-weight:400;color:#999;font-size:12px">使用 AntV 渲染</span></h2>
+            <div class="chart-controls">
+                <div class="form-group">
+                    <label>数据维度</label>
+                    <select id="chartMetric" onchange="onChartConfigChange()">
+                        <option value="after_sales">售后员分布</option>
+                        <option value="sales_region">销售区域分布</option>
+                        <option value="active_duration">群活跃时长</option>
+                        <option value="sentiment">情感分析</option>
+                        <option value="message_trend">消息量趋势</option>
+                        <option value="highfreq">高频关键词</option>
+                        <option value="unanswered">漏回分析</option>
+                        <option value="response_time">响应时长</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>图表类型</label>
+                    <select id="chartType" onchange="onChartConfigChange()">
+                        <option value="bar">柱状图</option>
+                        <option value="column">条形图</option>
+                        <option value="pie">饼图</option>
+                        <option value="line">折线图</option>
+                        <option value="radar">雷达图</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>&nbsp;</label>
+                    <button class="btn btn-primary btn-sm" onclick="renderCurrentChart()">
+                        <i data-lucide="refresh-cw" style="width:12px;height:12px"></i> 渲染
+                    </button>
+                </div>
+            </div>
+            <div class="chart-grid">
+                <div class="chart-cell" id="chartCell0">
+                    <h3 id="chartTitle0">图表预览</h3>
+                    <div class="chart-img-wrap" id="chartImgWrap0">
+                        <div class="placeholder"><i data-lucide="image" style="width:32px;height:32px"></i>选择维度后点击渲染</div>
+                    </div>
+                </div>
+                <div class="chart-cell" id="chartCell1">
+                    <h3 id="chartTitle1">图表预览</h3>
+                    <div class="chart-img-wrap" id="chartImgWrap1">
+                        <div class="placeholder"><i data-lucide="image" style="width:32px;height:32px"></i>选择维度后点击渲染</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<div id="tab-reports" class="hidden">
+    <div class="panel panel-top">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <h2 style="margin:0;padding:0;border:0;">已生成报告</h2>
+            <button class="btn btn-sm btn-outline" onclick="loadReportList()">
+                <i data-lucide="refresh-cw" style="width:12px;height:12px"></i> 刷新
+            </button>
+        </div>
+        <div class="table-wrap" style="margin-top:12px">
+            <div id="reportTableWrap">
+                <div class="empty-state"><i data-lucide="file-text" style="width:28px;height:28px;margin:0 auto 8px;display:block;opacity:0.4"></i>暂无报告</div>
+            </div>
+        </div>
+    </div>
+</div>
+<div style="text-align:center;padding:12px 0;color:#999;font-size:11px;">群聊数据统计分析平台 v1.0 | 图表由 AntV 提供渲染</div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+lucide.createIcons();
+var reportData = null;
+var currentReportFile = null;
+function showToast(msg, type) {
+    var t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast ' + type + ' show';
+    setTimeout(function(){ t.classList.remove('show'); }, 3500);
+}
+function switchTab(name) {
+    document.querySelectorAll('.tabs .tab').forEach(function(t){ t.classList.remove('active'); });
+    event.currentTarget.classList.add('active');
+    document.getElementById('tab-dashboard').classList.toggle('hidden', name !== 'dashboard');
+    document.getElementById('tab-reports').classList.toggle('hidden', name !== 'reports');
+    if (name === 'reports') loadReportList();
+}
+function checkHealth() {
+    var dot = document.getElementById('healthDot');
+    var txt = document.getElementById('healthText');
+    dot.className = 'dot loading'; txt.textContent = '检查中...';
+    fetch('/api/v1/health').then(function(r){ return r.json(); }).then(function(d){
+        dot.className = 'dot ok';
+        txt.textContent = '正常 ' + (d.timestamp || '').slice(0,10);
+    }).catch(function(){ dot.className = 'dot err'; txt.textContent = '异常'; });
+}
+function loadReportList() {
+    var wrap = document.getElementById('reportTableWrap');
+    wrap.innerHTML = '<div class="empty-state"><div class="spinner dark" style="width:20px;height:20px;margin:0 auto 8px"></div>加载中...</div>';
+    fetch('/api/v1/report/list').then(function(r){ return r.json(); }).then(function(res){
+        if (res.code !== 0 || !res.data || !res.data.files || res.data.files.length === 0) {
+            wrap.innerHTML = '<div class="empty-state"><i data-lucide="file-text" style="width:28px;height:28px;margin:0 auto 8px;display:block;opacity:0.4"></i>暂无报告</div>';
+            lucide.createIcons(); return;
+        }
+        var html = '<table class="rt"><thead><tr><th>文件</th><th>大小</th><th>操作</th></tr></thead><tbody>';
+        res.data.files.forEach(function(f){
+            var sz = f.size > 1048576 ? (f.size/1048576).toFixed(1)+'MB' : f.size > 1024 ? (f.size/1024).toFixed(1)+'KB' : f.size+'B';
+            var vu = '/api/v1/report/view/' + encodeURIComponent(f.filename);
+            html += '<tr><td class="fn-cell"><a href="'+vu+'" target="_blank">'+esc(f.filename)+'</a></td>'
+                + '<td style="color:#666">'+sz+'</td>'
+                + '<td><button class="btn btn-sm btn-primary" onclick="window.open(''+vu+'','_blank')">查看</button> '
+                + '<button class="btn btn-sm btn-outline" onclick="copyUrl(''+vu+'',''+esc(f.filename)+'')">复制</button></td></tr>';
+        });
+        html += '</tbody></table>';
+        wrap.innerHTML = html; lucide.createIcons();
+    }).catch(function(){ wrap.innerHTML = '<div class="empty-state" style="color:#ea4335">加载失败</div>'; });
+}
+function esc(s) { var d = document.createElement('div'); d.appendChild(document.createTextNode(s)); return d.innerHTML; }
+function copyUrl(url, name) {
+    var full = window.location.protocol + '//' + window.location.host + url;
+    navigator.clipboard.writeText(full).then(function(){ showToast('已复制: '+name, 'success'); }).catch(function(){ showToast('复制失败', 'error'); });
+}
+function generateAndShow() {
+    var type = document.getElementById('reportType').value;
+    var date = document.getElementById('reportDate').value;
+    var fresh = document.getElementById('freshToggle').classList.contains('active');
+    var btn = document.getElementById('genBtn');
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> 生成中...';
+    var pw = document.getElementById('progressWrap');
+    var fill = document.getElementById('progressFill');
+    pw.classList.remove('hidden'); fill.style.width = '15%';
+    var params = '?type='+encodeURIComponent(type);
+    if (date) params += '&date='+encodeURIComponent(date);
+    if (fresh) params += '&fresh=true';
+    var iv = setInterval(function(){ var w = parseInt(fill.style.width); if (w < 75) fill.style.width = (w+8)+'%'; }, 2000);
+    fetch('/api/v1/visualize/generate'+params, {method:'POST'})
+        .then(function(r){ return r.json(); }).then(function(res){
+            clearInterval(iv); fill.style.width = '100%';
+            if (res.code === 0 && res.data && res.data.report_data) {
+                reportData = res.data.report_data;
+                currentReportFile = res.data.report_file;
+                showToast('生成成功: '+currentReportFile, 'success');
+                setTimeout(function(){ showDashboard(); }, 500);
+            } else {
+                showToast('生成失败: '+(res.message||'未知'), 'error');
+            }
+        }).catch(function(err){
+            clearInterval(iv); fill.style.width = '100%';
+            showToast('请求失败', 'error');
+        }).finally(function(){
+            btn.disabled = false; btn.innerHTML = '<i data-lucide="sparkles" style="width:14px;height:14px"></i> 生成并看板';
+            setTimeout(function(){ pw.classList.add('hidden'); fill.style.width = '0%'; lucide.createIcons(); }, 1500);
+        });
+}
+function showDashboard() {
+    showSummaryCards();
+    document.getElementById('chartArea').classList.remove('hidden');
+    renderCurrentChart();
+}
+function showSummaryCards() {
+    var area = document.getElementById('summaryArea');
+    area.classList.remove('hidden');
+    var s = reportData.summary || {};
+    var items = [
+        {label:'销售区域', val:s.sales_region_count||0},
+        {label:'售后员', val:s.after_sales_count||0},
+        {label:'产品大类', val:s.product_category_count||0},
+        {label:'总群数', val:s.total_groups||reportData.total_groups||0},
+        {label:'LIMS记录', val:reportData.total_lims_records||0},
+        {label:'大客户', val:s.key_account_unit_count||0},
+    ];
+    document.getElementById('summaryCards').innerHTML = items.map(function(i){
+        return '<div class="stat-card"><div class="val">'+i.val+'</div><div class="lbl">'+i.lbl+'</div></div>';
+    }).join('');
+}
+var chartMetricDefs = {
+    after_sales: {
+        getData: function(d) { return (d.after_sales_distribution||[]).slice(0,15).map(function(x){ return {category:x.name, value:x.count}; }); },
+        label: '售后员分布'
+    },
+    sales_region: {
+        getData: function(d) { return (d.sales_region_distribution||[]).map(function(x){ return {category:x.region, value:x.count}; }); },
+        label: '销售区域分布'
+    },
+    active_duration: {
+        getData: function(d) { return (d.active_duration||[]).map(function(x){ return {category:x.bucket, value:x.count}; }); },
+        label: '群活跃时长分布'
+    },
+    sentiment: {
+        getData: function(d) {
+            var qx = d.qxchat || {}; var m14 = qx.m14_sentiment || {};
+            return [
+                {category:'客户好评', value:m14.customer_good||0},
+                {category:'客户差评', value:m14.customer_bad||0},
+                {category:'员工积极', value:m14.employee_positive||0},
+                {category:'员工恶劣', value:m14.employee_bad||0}
+            ];
+        },
+        label: '情感分析'
+    },
+    message_trend: {
+        getData: function(d) {
+            var qx = d.qxchat || {}; var m12 = qx.m12_message_trend || {};
+            return (m12.trend||[]).map(function(x){ return {time:x.date||x.day, value:x.count||x.value}; });
+        },
+        label: '消息量趋势'
+    },
+    highfreq: {
+        getData: function(d) {
+            var qx = d.qxchat || {}; var m15 = qx.m15_highfreq || {};
+            return (m15.top_words||[]).slice(0,15).map(function(x){ return {category:x.word, value:x.count}; });
+        },
+        label: '高频关键词'
+    },
+    unanswered: {
+        getData: function(d) {
+            var qx = d.qxchat || {}; var m16 = qx.m16_unanswered || {};
+            var r = m16.risk_levels || {};
+            return [{category:'高风险', value:r.high||0},{category:'中风险', value:r.medium||0},{category:'低风险', value:r.low||0}];
+        },
+        label: '漏回风险分析'
+    },
+    response_time: {
+        getData: function(d) {
+            var qx = d.qxchat || {}; var m17 = qx.m17_response_time || {};
+            return (m17.employee_ranking||[]).slice(0,15).map(function(x){ return {category:x.name||x.employee, value:x.avg||x.avg_seconds||0}; });
+        },
+        label: '响应时长排行'
+    }
+};
+function onChartConfigChange() {
+    var metric = document.getElementById('chartMetric').value;
+    var def = chartMetricDefs[metric];
+    document.getElementById('chartTitle0').textContent = def ? def.label : '图表预览';
+    document.getElementById('chartTitle1').textContent = def ? def.label + ' (备选类型)' : '图表预览';
+}
+function renderCurrentChart() {
+    if (!reportData) { showToast('请先生成报告', 'info'); return; }
+    var metric = document.getElementById('chartMetric').value;
+    var chartType = document.getElementById('chartType').value;
+    var altType = chartType === 'pie' ? 'bar' : (chartType === 'line' ? 'column' : 'pie');
+    var def = chartMetricDefs[metric];
+    if (!def) return;
+    var data = def.getData(reportData);
+    if (!data || data.length === 0) { showToast('该维度暂无数据', 'info'); return; }
+    document.getElementById('chartTitle0').textContent = def.label + ' (' + chartType + ')';
+    document.getElementById('chartTitle1').textContent = def.label + ' (' + altType + ')';
+    renderChart('chartImgWrap0', chartType, data, def.label);
+    renderChart('chartImgWrap1', altType, data, def.label);
+}
+function renderChart(wrapId, type, data, title) {
+    var wrap = document.getElementById(wrapId);
+    wrap.innerHTML = '<div class="placeholder"><div class="spinner dark" style="width:20px;height:20px;margin:0 auto 8px"></div>生成中...</div>';
+    fetch('/api/v1/visualize/chart', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({type:type, data:data, title:title, theme:'default', width:600, height:350})
+    }).then(function(r){ return r.json(); }).then(function(res){
+        if (res.code === 0 && res.data && res.data.image_url) {
+            wrap.innerHTML = '<img src="'+res.data.image_url+'" alt="'+(title||'')+'" onerror="this.parentElement.innerHTML='<div class=\\'placeholder\\' style=\\'color:#ea4335\\'>渲染失败</div>'">';
+        } else {
+            wrap.innerHTML = '<div class="placeholder" style="color:#ea4335">图表生成失败</div>';
+        }
+    }).catch(function(){ wrap.innerHTML = '<div class="placeholder" style="color:#ea4335">请求失败</div>'; });
+}
+checkHealth();
+document.getElementById('reportDate').value = new Date().toISOString().slice(0,10);
+</script>
+</body>
+</html>
