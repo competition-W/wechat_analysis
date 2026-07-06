@@ -77,20 +77,6 @@ class SentimentAnalyzer:
         return result
 
     def _rule_based_prefilter(self, text, sender_role):
-        if sender_role == "客户":
-            for w in self.customer_bad_words:
-                if w in text:
-                    return "bad_review", 0.85
-            for w in self.customer_good_words:
-                if w in text:
-                    return "good_review", 0.75
-        elif sender_role in ["员工", "售后", "销售", "未知"]:
-            for w in self.employee_bad_words:
-                if w in text:
-                    return "bad_attitude", 0.85
-            for w in self.employee_polite_words:
-                if w in text:
-                    return "positive", 0.90
         return None
 
     def _parallel_batch_llm_analyze(self, messages):
@@ -174,7 +160,22 @@ class SentimentAnalyzer:
 输入：[4] [售后]小王：好的，我先确认一下，稍后答复您。
 输出：{{"index": 4, "sentiment": "positive", "confidence": 0.93}}
 
-## 输出要求
+## 
+
+### 四、☑ 自反问机制
+在给出每条消息的最终判定前，你必须先反问自己：
+1. 这句话真的是客户的负面评价/投诉吗，还是只是客观陈述一个事实？
+2. 用户说“不行”“还是不行”，是对服务的不满，还是在表示自己“搞不定”“操作不了”？
+3. 用户说“我今晚不行”“我现在不行”，是表达时间安排，还是在给差评？
+4. 如果有任何怀疑，一律判为 “neutral”。宁放过，不误杀。
+
+### 五、常见易误判情形（以下一律判为 neutral）
+- “还是不行” —— 用户在陈述操作结果，不是差评
+- “我今晚不行呛” / “我现在不行” —— 时间安排，与服务无关
+- “账号密码都不行” —— 系统登录问题，非服务差评
+- “试了不行” / “重新试了还是不行” —— 操作结果陈述，非差评
+
+输出要求
 只输出 JSON 数组，不要包含任何额外解释或标记。confidence 取值 0.0-1.0，表示对该判断的确信程度。
 [
   {{"index": 0, "sentiment": "positive", "confidence": 0.95}}

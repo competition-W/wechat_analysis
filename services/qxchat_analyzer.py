@@ -284,7 +284,7 @@ class QxChatAnalyzer:
     def _rule_sentiment(self, messages) -> Tuple[int, int, int, int]:
         """简易规则情感分析（无需 LLM）"""
         customer_good_words = {"谢谢", "感谢", "很好", "满意", "解决了", "辛苦了", "棒", "专业"}
-        customer_bad_words = {"太慢", "不行", "问题", "错误", "投诉", "退款", "差", "垃圾"}
+        customer_bad_words = {"太慢了", "投诉", "退款", "垃圾", "骗人", "差劲"}
         employee_pos_words = {"好的", "收到", "没问题", "请放心", "我来", "帮您", "马上"}
         employee_bad_words = {"不归我管", "自己看", "没空", "没办法", "处理不了", "随便"}
 

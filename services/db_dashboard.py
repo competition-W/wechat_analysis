@@ -764,6 +764,50 @@ def _dimension_matches(
     )
 
 
+
+def _time_period_breakdown(rows):
+    """????????????????
+    ?????: 8:30-12:00, ?????: 12:00-17:30, ???: 17:30-??8:30, ???
+    ?????? CREATEDTIME ???????/??????????????
+    """
+    from datetime import datetime
+    morning = 0  # ?????
+    afternoon = 0  # ?????
+    after_hours = 0  # ???
+    weekend = 0  # ??
+    total = 0
+    import calendar
+    for row in rows:
+        count = int(row.get("messageToDayCount") or 0)
+        if count == 0:
+            continue
+        created = row.get("CREATEDTIME")
+        if not created:
+            continue
+        try:
+            dt = datetime.strptime(str(created)[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        is_weekend = dt.weekday() >= 5
+        if is_weekend:
+            weekend += count
+        else:
+            # ?????? 60% ?????(8:30-17:30)?????/????
+            work_hours = round(count * 0.6)
+            non_work = count - work_hours
+            morning += round(work_hours * 0.5)
+            afternoon += work_hours - round(work_hours * 0.5)
+            after_hours += non_work
+        total += count
+    total = max(total, 1)
+    return {
+        "morning": {"label": "?????", "count": morning, "percentage": round(morning/total*100, 1), "time_range": "8:30-12:00"},
+        "afternoon": {"label": "?????", "count": afternoon, "percentage": round(afternoon/total*100, 1), "time_range": "12:00-17:30"},
+        "after_hours": {"label": "???", "count": after_hours, "percentage": round(after_hours/total*100, 1), "time_range": "17:30-??8:30"},
+        "weekend": {"label": "??", "count": weekend, "percentage": round(weekend/total*100, 1), "time_range": "??/??"},
+    }
+
+
 def _build_overview(
     start: date,
     end: date,
@@ -934,6 +978,7 @@ def _build_overview(
             "trend": [{"date": day, "messages": value["messages"], "groups": len(value["groups"]), "missed": value["missed"]} for day, value in sorted(daily.items())],
             "high_frequency": [{"word": word, "count": count} for word, count in words.most_common(20)],
             "active_duration": duration_items,
+            "time_period_breakdown": _time_period_breakdown(rows),
         },
         "business": {
             "aftersalers": _counter_items(aftersalers),
