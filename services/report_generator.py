@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 报告生成器：将聚合后的报告数据渲染为独立 HTML 页面（ECharts 可视化）。

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 数据采集层：从 qxChat API 拉取群聊消息，从 LIMS API 拉取售后数据，
