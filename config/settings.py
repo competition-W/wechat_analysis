@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     LIMS_API_TIMEOUT: int = Field(default=30, description="LIMS API 超时时间(秒)")
 
     PROJECT_CODE_PATTERN: str = Field(
-        default=r"LC-P\d+",
+    default=r"LC-[A-Z]+\d+",
         description="从群名称提取项目编号的正则表达式"
     )
 

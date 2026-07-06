@@ -21,7 +21,8 @@ class QxChatGroup:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     first_msg_time: Optional[str] = None
     last_msg_time: Optional[str] = None
-    project_code: Optional[str] = None  # 从群名提取的项目号
+    project_code: Optional[str] = None  # 从群名提取的第一个项目号
+    project_codes: Optional[List[str]] = None  # 从群名提取的所有项目号
 
 
 @dataclass
@@ -116,12 +117,19 @@ def _parse_members_field(members_str: str) -> List[str]:
     return [m.strip() for m in members_str.split(",") if m.strip()]
 
 
+def extract_project_codes(room_name: str) -> List[str]:
+    """从群聊名称中提取所有项目编号 LC-XXXX"""
+    if not room_name:
+        return []
+    return re.findall(r"LC-[A-Z]+\d+", room_name)
+
+
 def extract_project_code(room_name: str) -> Optional[str]:
-    """从群聊名称中提取项目编号 LC-PXXXXX"""
+    """从群聊名称中提取第一个项目编号"""
     if not room_name:
         return None
-    match = re.search(r"LC-P\d+", room_name)
-    return match.group(0) if match else None
+    codes = extract_project_codes(room_name)
+    return codes[0] if codes else None
 
 
 class DataCollector:
@@ -184,7 +192,9 @@ class DataCollector:
                     group.last_msg_time = msg_time
 
         for group in groups_dict.values():
-            group.project_code = extract_project_code(group.room_name)
+            all_codes = extract_project_codes(group.room_name)
+            group.project_code = all_codes[0] if all_codes else None
+            group.project_codes = all_codes if all_codes else None
 
         groups = list(groups_dict.values())
         has_project = sum(1 for g in groups if g.project_code)
@@ -226,12 +236,15 @@ class DataCollector:
         merged_groups: List[Dict] = []
 
         for group in groups:
-            pc = group.project_code
-            related_records = lims_map.get(pc, [])
+            pcs = group.project_codes or ([group.project_code] if group.project_code else [])
+            related_records = []
+            for pc in pcs:
+                related_records.extend(lims_map.get(pc, []))
             merged_groups.append({
                 "room_id": group.room_id,
                 "room_name": group.room_name,
-                "project_code": pc,
+                "project_code": group.project_code,
+                "project_codes": group.project_codes,
                 "first_msg_time": group.first_msg_time,
                 "last_msg_time": group.last_msg_time,
                 "message_count": len(group.messages),
@@ -255,28 +268,53 @@ class DataCollector:
     def collect_all(self) -> Tuple[List[Dict], List[LimsRecord]]:
         """执行完整采集流程"""
         groups = self.fetch_qxchat_data()
-        project_codes = sorted(set(g.project_code for g in groups if g.project_code))
+        all_codes_set = set()
+        for g in groups:
+            if g.project_codes:
+                all_codes_set.update(g.project_codes)
+        project_codes = sorted(all_codes_set)
         logger.info(f"共 {len(project_codes)} 个唯一项目号")
 
         lims_map = self.fetch_lims_data(project_codes)
 
         for group in groups:
-            if group.project_code and group.project_code not in lims_map:
-                record = LimsRecord(
-                    project_code=group.project_code,
-                    orgName="", saleName="",
-                    afterSaler="", finalAfterSaler="", salesPerson="",
-                )
-                lims_map[group.project_code] = [record]
+            pcs = group.project_codes or ([group.project_code] if group.project_code else [])
+            for pc in pcs:
+                if pc and pc not in lims_map:
+                    record = LimsRecord(
+                        project_code=pc,
+                        orgName="", saleName="",
+                        afterSaler="", finalAfterSaler="", salesPerson="",
+                    )
+                    lims_map[pc] = [record]
 
         merged_groups, all_records = self.merge_data(groups, lims_map)
         return merged_groups, all_records
 
 
+def test_extract_project_codes():
+    """测试提取多个项目编号"""
+    cases = [
+        ("xx公司-LC-P20230220041-售后", ["LC-P20230220041"]),
+        ("LC-X20230220041-张三", ["LC-X20230220041"]),
+        ("LC-P001-LC-X002", ["LC-P001", "LC-X002"]),
+        ("测试群-12345", []),
+        ("", []),
+        (None, []),
+        ("[LC-P20230505001] 项目群", ["LC-P20230505001"]),
+    ]
+    for name, expected in cases:
+        r = extract_project_codes(name)
+        ok = "OK" if r == expected else "FAIL"
+        print(f"  {ok} codes({name!r}) -> {r!r}")
+
+
 def test_extract_project_code():
+    """测试提取第一个项目编号"""
     cases = [
         ("xx公司-LC-P20230220041-售后", "LC-P20230220041"),
-        ("LC-P20230101001-张三", "LC-P20230101001"),
+        ("LC-X20230220041-张三", "LC-X20230220041"),
+        ("LC-P001-LC-X002", "LC-P001"),
         ("测试群-12345", None),
         ("", None),
         (None, None),
@@ -286,7 +324,6 @@ def test_extract_project_code():
         r = extract_project_code(name)
         ok = "OK" if r == expected else "FAIL"
         print(f"  {ok} extract({name!r}) -> {r!r} (期望 {expected!r})")
-
 
 def test_parse_members():
     cases = [
@@ -319,6 +356,9 @@ def test_final_after_saler():
 
 
 if __name__ == "__main__":
+    print("=== test_extract_project_codes ===")
+    test_extract_project_codes()
+    print()
     print("=== test_extract_project_code ===")
     test_extract_project_code()
     print()
