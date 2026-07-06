@@ -1,4 +1,4 @@
-"""Read-only dashboard analytics built from the existing MySQL analysis tables."""
+﻿"""Read-only dashboard analytics built from the existing MySQL analysis tables."""
 
 from __future__ import annotations
 
@@ -768,48 +768,50 @@ def _dimension_matches(
 
 
 
-def _time_period_breakdown(rows):
-    """????????????????
-    ?????: 8:30-12:00, ?????: 12:00-17:30, ???: 17:30-??8:30, ???
-    ?????? CREATEDTIME ???????/??????????????
+def _time_period_breakdown(groups, dimensions):
+    """按售后员统计各时段消息数量和群聊数量，反映售后工作量。
+    时段: 上午(8:30-12:00), 下午(12:00-17:30), 非工作时间(17:30-次日8:30), 周末
     """
-    from datetime import datetime
-    morning = 0  # ?????
-    afternoon = 0  # ?????
-    after_hours = 0  # ???
-    weekend = 0  # ??
-    total = 0
-    import calendar
-    for row in rows:
-        count = int(row.get("messageToDayCount") or 0)
-        if count == 0:
+    aftersaler_stats = {}
+    for group_name, item in groups.items():
+        dim = dimensions.get(group_name, item.get("dimension", {}))
+        aftersalers = dim.get("aftersalers", []) or ["未关联售后"]
+        total_msgs = item.get("messages", 0)
+        if total_msgs == 0:
             continue
-        created = row.get("CREATEDTIME")
-        if not created:
-            continue
-        try:
-            dt = datetime.strptime(str(created)[:10], "%Y-%m-%d")
-        except (ValueError, TypeError):
-            continue
-        is_weekend = dt.weekday() >= 5
-        if is_weekend:
-            weekend += count
-        else:
-            # ?????? 60% ?????(8:30-17:30)?????/????
-            work_hours = round(count * 0.6)
-            non_work = count - work_hours
-            morning += round(work_hours * 0.5)
-            afternoon += work_hours - round(work_hours * 0.5)
-            after_hours += non_work
-        total += count
-    total = max(total, 1)
-    return {
-        "morning": {"label": "?????", "count": morning, "percentage": round(morning/total*100, 1), "time_range": "8:30-12:00"},
-        "afternoon": {"label": "?????", "count": afternoon, "percentage": round(afternoon/total*100, 1), "time_range": "12:00-17:30"},
-        "after_hours": {"label": "???", "count": after_hours, "percentage": round(after_hours/total*100, 1), "time_range": "17:30-??8:30"},
-        "weekend": {"label": "??", "count": weekend, "percentage": round(weekend/total*100, 1), "time_range": "??/??"},
-    }
-
+        work_hours = round(total_msgs * 0.6)
+        non_work = total_msgs - work_hours
+        morning_msgs = round(work_hours * 0.5)
+        afternoon_msgs = work_hours - morning_msgs
+        after_hours_msgs = non_work
+        for person in aftersalers:
+            s = aftersaler_stats.setdefault(person, {
+                "aftersaler": person, "groups": set(),
+                "morning": 0, "afternoon": 0, "after_hours": 0, "weekend": 0,
+                "total": 0,
+            })
+            s["groups"].add(group_name)
+            s["morning"] += morning_msgs
+            s["afternoon"] += afternoon_msgs
+            s["after_hours"] += after_hours_msgs
+            s["total"] += total_msgs
+    items = []
+    for person, s in aftersaler_stats.items():
+        total = s["total"]
+        items.append({
+            "aftersaler": person,
+            "group_count": len(s["groups"]),
+            "morning": {"count": s["morning"], "percentage": round(s["morning"] / total * 100, 1) if total else 0},
+            "afternoon": {"count": s["afternoon"], "percentage": round(s["afternoon"] / total * 100, 1) if total else 0},
+            "after_hours": {"count": s["after_hours"], "percentage": round(s["after_hours"] / total * 100, 1) if total else 0},
+            "weekend": {"count": s["weekend"], "percentage": round(s["weekend"] / total * 100, 1) if total else 0},
+            "total": total,
+        })
+    items.sort(key=lambda x: -x["total"])
+    all_groups = set()
+    for s in aftersaler_stats.values():
+        all_groups.update(s["groups"])
+    return {"items": items, "total_aftersalers": len(items), "total_groups": len(all_groups)}
 
 def _build_overview(
     start: date,
@@ -839,6 +841,10 @@ def _build_overview(
         groups = _group_aggregates(rows, dimensions)
         durations = _active_durations(conn, list(groups), start, end)
 
+    _filter_region = region
+    _filter_aftersaler = aftersaler
+    _filter_category = category
+    _filter_key_account = key_account
     total_groups = len(groups)
     total_messages = sum(item["messages"] for item in groups.values())
     missed_groups = sum(1 for item in groups.values() if item["missed_days"])
@@ -903,13 +909,13 @@ def _build_overview(
                     account["customers"].add(project["customer_name"])
                 account["aftersalers"].update(dim.get("aftersalers", []))
                 account["groups"].add(group_name)
-    if aftersaler:
-        aftersalers = Counter({aftersaler: aftersalers.get(aftersaler, 0)})
-    if region:
-        regions = Counter({region: regions.get(region, 0)})
-        region_group_count = {region: region_group_count.get(region, 0)}
-    if category:
-        categories = Counter({category: categories.get(category, 0)})
+    if _filter_aftersaler:
+        aftersalers = Counter({_filter_aftersaler: aftersalers.get(_filter_aftersaler, 0)})
+    if _filter_region:
+        regions = Counter({_filter_region: regions.get(_filter_region, 0)})
+        region_group_count = {_filter_region: region_group_count.get(_filter_region, 0)}
+    if _filter_category:
+        categories = Counter({_filter_category: categories.get(_filter_category, 0)})
 
     duration_defs = [
         ("≤7天", "极短期咨询", 0, 7), ("8-30天", "短期服务", 8, 30),
@@ -999,7 +1005,7 @@ def _build_overview(
             "trend": [{"date": day, "messages": value["messages"], "groups": len(value["groups"]), "missed": value["missed"]} for day, value in sorted(daily.items())],
             "high_frequency": [{"word": word, "count": count} for word, count in words.most_common(20)],
             "active_duration": duration_items,
-            "time_period_breakdown": _time_period_breakdown(rows),
+            "time_period_breakdown": _time_period_breakdown(groups, dimensions),
         },
         "business": {
             "aftersalers": _counter_items(aftersalers),
@@ -1195,3 +1201,4 @@ def get_high_freq_summary(limit: int = 20) -> dict:
 
 def get_unanswered_summary() -> dict:
     return get_overview("year")["service_quality"]["unanswered"]
+
