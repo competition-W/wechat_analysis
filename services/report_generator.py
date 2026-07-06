@@ -133,7 +133,7 @@ table.report-table .rank-3 {{ color: #1890ff; font-weight: 700; }}
     <h3>目录导航</h3>
     <div class="toc-grid">
         <a href="#m03">摘要指标卡</a>
-        <a href="#m04">最终售后员分布</a>
+        <a href="#m04">售后人员分布</a>
         <a href="#m05">群活跃时长分布</a>
         <a href="#m06">产品大类层级</a>
         <a href="#m07">大客户层级</a>
@@ -158,7 +158,7 @@ table.report-table .rank-3 {{ color: #1890ff; font-weight: 700; }}
 </div>
 """
 
-    # M04 - finalAfterSaler distribution (bar chart)
+    # M04 - afterSaler distribution (bar chart)
     after_sales = report_data.get("after_sales_distribution", [])
     m04_names = [a["name"] for a in after_sales[:20]]
     m04_counts = [a["count"] for a in after_sales[:20]]
@@ -167,7 +167,7 @@ table.report-table .rank-3 {{ color: #1890ff; font-weight: 700; }}
     html += f"""
 <!-- M04 -->
 <div class="module" id="m04">
-    <h2>最终售后员分布 <span class="badge">M04</span></h2>
+    <h2>售后人员分布 <span class="badge">M04</span></h2>
     <div class="chart-box" id="chart-m04"></div>
 </div>
 """
@@ -296,7 +296,7 @@ table.report-table .rank-3 {{ color: #1890ff; font-weight: 700; }}
     html += f"""
 <!-- M11 -->
 <div class="module" id="m11">
-    <h2>销售区域 × 最终售后员 <span class="badge">M11</span></h2>
+    <h2>销售区域 × 售后人员 <span class="badge">M11</span></h2>
 """
     if m11:
         html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px">'
@@ -440,7 +440,7 @@ function initChart(el, option) {{ var c = echarts.init(document.getElementById(e
 
 // M04 - AfterSales Distribution
 initChart('chart-m04', {{
-    title: {{ text: '最终售后员群聊数排名', left: 'center', textStyle: {{fontSize:14}} }},
+    title: {{ text: '售后人员群聊数排名', left: 'center', textStyle: {{fontSize:14}} }},
     tooltip: {{ trigger: 'axis' }},
     xAxis: {{ type: 'category', data: {_escape_json(m04_names)}, axisLabel: {{ rotate: 45, fontSize: 11 }} }},
     yAxis: {{ type: 'value', name: '群聊数' }},

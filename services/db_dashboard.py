@@ -16,7 +16,7 @@ from loguru import logger
 
 
 CACHE_TTL_SECONDS = 300
-PROJECT_CODE_RE = re.compile(r"LC-[A-Z0-9]+(?:-[A-Z0-9]+)*", re.IGNORECASE)
+PROJECT_CODE_RE = re.compile(r"LC-[A-Z]+\d+\b", re.IGNORECASE)
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_success: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
@@ -144,6 +144,196 @@ def parse_members(value: Any) -> List[str]:
     return [item.strip() for item in re.split(r"[,，、;；\n]", text) if item.strip()]
 
 
+def row_get(row: dict, *names: str, default: Any = "") -> Any:
+    """Case-insensitive row lookup for tables whose column casing is inconsistent."""
+    if not row:
+        return default
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    lowered = {str(key).lower(): value for key, value in row.items()}
+    for name in names:
+        value = lowered.get(name.lower())
+        if value is not None:
+            return value
+    return default
+
+
+def first_nonempty(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def customer_lookup(customers: Dict[Any, dict], *keys: Any) -> dict:
+    for key in keys:
+        if key is None:
+            continue
+        for normalized in (key, str(key), str(key).strip()):
+            if normalized in customers:
+                return customers[normalized]
+    return {}
+
+
+def lims_base_data_url() -> str:
+    from config.settings import settings
+
+    base = settings.LIMS_API_URL.rstrip("/")
+    path = settings.LIMS_BASE_DATA_PATH.strip("/")
+    return f"{base}/{path}/"
+
+
+def _chunked(values: List[str], size: int = 50) -> Iterable[List[str]]:
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def fetch_lims_base_data(project_codes: List[str]) -> Tuple[Dict[str, List[dict]], dict]:
+    """Fetch LIMS project data using POST /unionLims/base_data/ with projectCode body."""
+    if not project_codes:
+        return {}, {"available": True, "requests": 0, "records": 0, "errors": 0}
+
+    import httpx
+    from config.settings import settings
+
+    records_by_code: Dict[str, List[dict]] = defaultdict(list)
+    stats = {"available": False, "requests": 0, "records": 0, "errors": 0}
+    url = lims_base_data_url()
+    timeout = settings.LIMS_API_TIMEOUT
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            for batch in _chunked(project_codes):
+                stats["requests"] += 1
+                try:
+                    response = client.post(
+                        url,
+                        json=[{"projectCode": code} for code in batch],
+                        headers={"Accept": "application/json"},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    if payload.get("status") is False:
+                        stats["errors"] += 1
+                        logger.warning("lims.base_data.status_false message={}", payload.get("message"))
+                        continue
+                    for item in payload.get("data") or []:
+                        code = str(item.get("projectCode") or "").upper()
+                        if code:
+                            records_by_code[code].append(item)
+                            stats["records"] += 1
+                    stats["available"] = True
+                except Exception as exc:
+                    stats["errors"] += 1
+                    logger.warning("lims.base_data.batch_failed size={} error={}", len(batch), exc)
+    except Exception as exc:
+        logger.warning("lims.base_data.unavailable url={} error={}", url, exc)
+    return dict(records_by_code), stats
+
+
+def normalize_lims_api_record(item: dict, code: str) -> dict:
+    members = parse_members(item.get("members"))
+    return {
+        "project_code": item.get("projectCode") or code,
+        "customer_name": item.get("customerName") or "",
+        "key_account": normalize_key_account(item.get("keyAccount"), item.get("customerName") or ""),
+        "region": item.get("orgName") or "",
+        "sales_person": item.get("saleName") or item.get("assignmentUser") or "",
+        "product_name": item.get("productName") or "",
+        "category_l1": item.get("productBigSortOne") or "未分类",
+        "category_l2": item.get("productBigSortTwo") or "",
+        "category_l3": item.get("productBigSortThree") or "",
+        "raw_aftersaler": item.get("afterSaler") or "",
+        "lims_members": members,
+        "group_id": item.get("groupId") or "",
+        "active_day": item.get("activeDay"),
+        "start_time": item.get("startTime") or "",
+        "end_time": item.get("endTime") or "",
+        "dimension_source": "lims_base_data_api",
+    }
+
+
+def _dimensions_from_lims_api(
+    group_codes: Dict[str, List[str]],
+    records_by_code: Dict[str, List[dict]],
+    stats: dict,
+) -> Tuple[Dict[str, dict], dict]:
+    dimensions: Dict[str, dict] = {}
+    aftersaler_group_count = product_project_count = matched_product_count = 0
+    groups_with_lims_link = groups_with_region = groups_with_key_account = 0
+    groups_with_raw_aftersaler = groups_with_lims_members = 0
+
+    for group_name, codes_for_group in group_codes.items():
+        projects = []
+        regions = set()
+        aftersalers = set()
+        raw_aftersalers = set()
+        has_lims_link = has_region = has_key_account = False
+        has_raw_aftersaler = has_lims_members = False
+
+        for code in codes_for_group:
+            for raw in records_by_code.get(code.upper(), []):
+                item = normalize_lims_api_record(raw, code)
+                has_lims_link = True
+                if item["product_name"]:
+                    product_project_count += 1
+                if item["category_l1"] != "未分类":
+                    matched_product_count += 1
+                if item["region"]:
+                    regions.add(item["region"])
+                    has_region = True
+                if item["key_account"]:
+                    has_key_account = True
+                raw_after = item["raw_aftersaler"]
+                if raw_after:
+                    raw_aftersalers.add(raw_after)
+                    aftersalers.add(raw_after)
+                    has_raw_aftersaler = True
+                lims_members = set(item["lims_members"])
+                if lims_members:
+                    has_lims_members = True
+                projects.append(item)
+
+        if aftersalers:
+            aftersaler_group_count += 1
+        groups_with_lims_link += 1 if has_lims_link else 0
+        groups_with_region += 1 if has_region else 0
+        groups_with_key_account += 1 if has_key_account else 0
+        groups_with_raw_aftersaler += 1 if has_raw_aftersaler else 0
+        groups_with_lims_members += 1 if has_lims_members else 0
+        dimensions[group_name] = {
+            "codes": codes_for_group,
+            "projects": projects,
+            "regions": sorted(regions),
+            "aftersalers": sorted(aftersalers),
+            "tentative_aftersalers": [],
+            "raw_aftersalers": sorted(raw_aftersalers),
+            "chat_members": [],
+        }
+
+    requested_codes = sorted({code for codes in group_codes.values() for code in codes})
+    matched_codes = sum(1 for code in requested_codes if records_by_code.get(code.upper()))
+    quality = {
+        "project_codes": len(requested_codes),
+        "matched_project_codes": matched_codes,
+        "product_projects": product_project_count,
+        "matched_products": matched_product_count,
+        "groups_with_aftersaler": aftersaler_group_count,
+        "groups_with_confirmed_aftersaler": aftersaler_group_count,
+        "groups_with_lims_link": groups_with_lims_link,
+        "groups_with_region": groups_with_region,
+        "groups_with_key_account": groups_with_key_account,
+        "groups_with_raw_aftersaler": groups_with_raw_aftersaler,
+        "groups_with_lims_members": groups_with_lims_members,
+        "lims_source": "base_data_api",
+        "lims_api_requests": stats.get("requests", 0),
+        "lims_api_records": stats.get("records", 0),
+        "lims_api_errors": stats.get("errors", 0),
+    }
+    return dimensions, quality
+
+
 def _emotion_total(mapping: Dict[str, int], labels: Iterable[str]) -> int:
     total = 0
     for key, count in mapping.items():
@@ -233,47 +423,69 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
                 for name in group_codes}, {
                     "project_codes": 0, "matched_project_codes": 0,
                     "product_projects": 0, "matched_products": 0,
+                    "groups_with_aftersaler": 0,
                     "groups_with_confirmed_aftersaler": 0,
+                    "groups_with_lims_link": 0,
+                    "groups_with_region": 0,
+                    "groups_with_key_account": 0,
+                    "groups_with_raw_aftersaler": 0,
+                    "groups_with_lims_members": 0,
+                    "lims_source": "none",
                 }
+
+    lims_records_by_code, lims_stats = fetch_lims_base_data(codes)
+    if lims_stats.get("available") and lims_records_by_code:
+        return _dimensions_from_lims_api(group_codes, lims_records_by_code, lims_stats)
+
+    logger.warning(
+        "dashboard.dimension.fallback_to_db requested_codes={} lims_available={} lims_records={} lims_errors={}",
+        len(codes),
+        lims_stats.get("available"),
+        lims_stats.get("records"),
+        lims_stats.get("errors"),
+    )
 
     placeholders = ",".join(["%s"] * len(codes))
     projects = _query(
         conn,
         "dimension.projects",
-        f"""SELECT ID, PROJECTCODE, CUSTOMERID, CUSTOMERNAME, PRODUCTNAME,
-                   CREATEDBYORGNAME, CREATEDBYNAME
-            FROM t_project WHERE PROJECTCODE IN ({placeholders})""",
+        f"SELECT * FROM t_project WHERE PROJECTCODE IN ({placeholders})",
         codes,
     )
     project_by_code: Dict[str, List[dict]] = defaultdict(list)
     for project in projects:
-        project_by_code[str(project.get("PROJECTCODE") or "").upper()].append(project)
+        project_by_code[str(row_get(project, "PROJECTCODE") or "").upper()].append(project)
 
-    customer_ids = sorted({p["CUSTOMERID"] for p in projects if p.get("CUSTOMERID") is not None})
+    customer_ids = sorted({
+        row_get(p, "CUSTOMERID", "CUSTOMERNO")
+        for p in projects
+        if row_get(p, "CUSTOMERID", "CUSTOMERNO", default=None) is not None
+    })
     customers: Dict[Any, dict] = {}
     if customer_ids:
         ph = ",".join(["%s"] * len(customer_ids))
         for item in _query(
             conn,
             "dimension.customers",
-            f"SELECT ID, CUSTOMERNO, CUSTOMERNAME, keyAccount FROM t_customer WHERE ID IN ({ph})",
-            customer_ids,
+            f"SELECT * FROM t_customer WHERE ID IN ({ph}) OR CUSTOMERNO IN ({ph})",
+            customer_ids + customer_ids,
         ):
-            customers[item["ID"]] = item
+            for key in (row_get(item, "ID"), row_get(item, "CUSTOMERNO"), row_get(item, "CUSTOMERID")):
+                if key is not None and str(key).strip():
+                    customers[key] = item
+                    customers[str(key)] = item
 
     income_rows = _query(
         conn,
         "dimension.income",
-        f"""SELECT businesscode, projectproductcode, productname, customername,
-                   keyaccount, orgname, projectsalename, createdByName,
-                   productbigsortone, productbigsorttwo, productbigsortthree
+        f"""SELECT *
             FROM t_income
             WHERE businesscode IN ({placeholders}) OR projectproductcode IN ({placeholders})""",
         codes + codes,
     )
     income_by_code: Dict[str, List[dict]] = defaultdict(list)
     for item in income_rows:
-        possible = [item.get("businesscode"), item.get("projectproductcode")]
+        possible = [row_get(item, "businesscode"), row_get(item, "projectproductcode")]
         for value in possible:
             normalized = str(value or "").upper()
             if normalized in codes:
@@ -281,7 +493,7 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
 
     product_names = sorted({
         value for value in
-        [p.get("PRODUCTNAME") for p in projects] + [item.get("productname") for item in income_rows]
+        [row_get(p, "PRODUCTNAME") for p in projects] + [row_get(item, "productname") for item in income_rows]
         if value
     })
     products: Dict[str, dict] = {}
@@ -312,50 +524,96 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
         latest_member_by_group[row["groupName"]] = parse_members(row.get("member"))
 
     dimensions: Dict[str, dict] = {}
-    confirmed_count = 0
+    aftersaler_group_count = 0
     product_project_count = 0
     matched_product_count = 0
+    groups_with_lims_link = 0
+    groups_with_region = 0
+    groups_with_key_account = 0
+    groups_with_raw_aftersaler = 0
+    groups_with_lims_members = 0
     for group_name, codes_for_group in group_codes.items():
         group_projects = []
-        members = set(latest_member_by_group.get(group_name, []))
+        chat_members = set(latest_member_by_group.get(group_name, []))
         confirmed = set()
         tentative = set()
+        raw_aftersalers = set()
         regions = set()
+        has_lims_link = False
+        has_raw_aftersaler = False
+        has_lims_members = False
+        has_key_account = False
         for code in codes_for_group:
             source_rows = income_by_code.get(code, [])
             if source_rows:
                 fallback_project = (project_by_code.get(code) or [{}])[0]
-                fallback_customer = customers.get(fallback_project.get("CUSTOMERID"), {})
+                fallback_customer = customer_lookup(
+                    customers,
+                    row_get(fallback_project, "CUSTOMERID"),
+                    row_get(fallback_project, "CUSTOMERNO"),
+                )
                 normalized_projects = [{
                     "project_code": code,
-                    "customer_name": item.get("customername") or fallback_project.get("CUSTOMERNAME") or "",
-                    "key_account": normalize_key_account(
-                        item.get("keyaccount"), item.get("customername") or "",
-                        fallback_customer.get("keyAccount") or "",
+                    "customer_name": first_nonempty(
+                        row_get(item, "customername", "CUSTOMERNAME"),
+                        row_get(fallback_project, "CUSTOMERNAME"),
                     ),
-                    "region": item.get("orgname") or "",
-                    "sales_person": item.get("projectsalename") or item.get("createdByName") or "",
-                    "product_name": item.get("productname") or "",
-                    "category_l1": item.get("productbigsortone") or "未分类",
-                    "category_l2": item.get("productbigsorttwo") or "",
-                    "category_l3": item.get("productbigsortthree") or "",
+                    "key_account": normalize_key_account(
+                        row_get(item, "keyaccount", "keyAccount"),
+                        row_get(item, "customername", "CUSTOMERNAME"),
+                        row_get(fallback_customer, "keyAccount", "KEYACCOUNT"),
+                    ),
+                    "region": first_nonempty(
+                        row_get(item, "orgname", "orgName", "ORGNAME"),
+                        row_get(fallback_project, "CREATEDBYORGNAME"),
+                    ),
+                    "sales_person": first_nonempty(
+                        row_get(item, "projectsalename", "projectSaleName"),
+                        row_get(item, "createdByName", "CREATEDBYNAME"),
+                        row_get(fallback_project, "CREATEDBYNAME"),
+                    ),
+                    "product_name": row_get(item, "productname", "PRODUCTNAME"),
+                    "category_l1": row_get(item, "productbigsortone", "productBigSortOne", "PRODUCTBIGSORTONE") or "未分类",
+                    "category_l2": row_get(item, "productbigsorttwo", "productBigSortTwo", "PRODUCTBIGSORTTWO"),
+                    "category_l3": row_get(item, "productbigsortthree", "productBigSortThree", "PRODUCTBIGSORTThree"),
+                    "raw_aftersaler": first_nonempty(
+                        row_get(item, "afterSaler", "aftersaler", "AFTERSALER"),
+                        row_get(fallback_project, "AFTERSALER", "afterSaler"),
+                    ),
+                    "lims_members": parse_members(first_nonempty(
+                        row_get(item, "members", "MEMBERS", "member", "MEMBER"),
+                        row_get(fallback_project, "members", "MEMBERS", "member", "MEMBER", "MEMBERLIST"),
+                    )),
+                    "dimension_source": "t_income",
                 } for item in source_rows]
             else:
                 normalized_projects = []
                 for project in project_by_code.get(code, []):
-                    product_name = project.get("PRODUCTNAME") or ""
+                    product_name = row_get(project, "PRODUCTNAME") or ""
                     product = products.get(product_name, {})
-                    customer = customers.get(project.get("CUSTOMERID"), {})
+                    customer = customer_lookup(
+                        customers,
+                        row_get(project, "CUSTOMERID"),
+                        row_get(project, "CUSTOMERNO"),
+                    )
                     normalized_projects.append({
                         "project_code": code,
-                        "customer_name": project.get("CUSTOMERNAME") or customer.get("CUSTOMERNAME") or "",
-                        "key_account": customer.get("keyAccount") or "",
-                        "region": project.get("CREATEDBYORGNAME") or "",
-                        "sales_person": project.get("CREATEDBYNAME") or "",
+                        "customer_name": first_nonempty(row_get(project, "CUSTOMERNAME"), row_get(customer, "CUSTOMERNAME")),
+                        "key_account": normalize_key_account(
+                            row_get(customer, "keyAccount", "KEYACCOUNT"),
+                            first_nonempty(row_get(project, "CUSTOMERNAME"), row_get(customer, "CUSTOMERNAME")),
+                        ),
+                        "region": row_get(project, "CREATEDBYORGNAME"),
+                        "sales_person": row_get(project, "CREATEDBYNAME"),
                         "product_name": product_name,
-                        "category_l1": product.get("PRODUCTBIGSORTONE") or "未分类",
-                        "category_l2": product.get("PRODUCTBIGSORTTWO") or "",
-                        "category_l3": product.get("PRODUCTBIGSORTThree") or "",
+                        "category_l1": row_get(product, "PRODUCTBIGSORTONE") or "未分类",
+                        "category_l2": row_get(product, "PRODUCTBIGSORTTWO"),
+                        "category_l3": row_get(product, "PRODUCTBIGSORTThree", "PRODUCTBIGSORTTHREE"),
+                        "raw_aftersaler": first_nonempty(
+                            row_get(project, "AFTERSALER", "afterSaler"),
+                        ),
+                        "lims_members": parse_members(row_get(project, "members", "MEMBERS", "member", "MEMBER", "MEMBERLIST")),
+                        "dimension_source": "t_project",
                     })
             seen_project_shapes = set()
             for normalized in normalized_projects:
@@ -366,29 +624,53 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
                 if shape in seen_project_shapes:
                     continue
                 seen_project_shapes.add(shape)
+                has_lims_link = True
                 product_name = normalized["product_name"]
                 if product_name:
                     product_project_count += 1
                 if normalized["category_l1"] != "未分类":
                     matched_product_count += 1
-                after_candidates = candidates.get(product_name, set())
-                matches = {name for name in after_candidates if name in members}
-                confirmed.update(matches)
-                if not matches and len(after_candidates) == 1:
-                    tentative.update(after_candidates)
+                raw_after = normalized.get("raw_aftersaler") or ""
+                lims_members = set(normalized.get("lims_members") or [])
+                if raw_after:
+                    raw_aftersalers.add(raw_after)
+                    confirmed.add(raw_after)
+                    has_raw_aftersaler = True
+                if lims_members:
+                    has_lims_members = True
+                if not raw_after:
+                    after_candidates = candidates.get(product_name, set())
+                    candidate_matches = {name for name in after_candidates if name in lims_members}
+                    if candidate_matches:
+                        tentative.update(candidate_matches)
+                    elif len(after_candidates) == 1:
+                        tentative.update(after_candidates)
                 region = normalized["region"]
                 if region:
                     regions.add(region)
+                if normalized.get("key_account"):
+                    has_key_account = True
                 group_projects.append(normalized)
         if confirmed:
-            confirmed_count += 1
+            aftersaler_group_count += 1
+        if has_lims_link:
+            groups_with_lims_link += 1
+        if regions:
+            groups_with_region += 1
+        if has_key_account:
+            groups_with_key_account += 1
+        if has_raw_aftersaler:
+            groups_with_raw_aftersaler += 1
+        if has_lims_members:
+            groups_with_lims_members += 1
         dimensions[group_name] = {
             "codes": codes_for_group,
             "projects": group_projects,
             "regions": sorted(regions),
             "aftersalers": sorted(confirmed),
             "tentative_aftersalers": sorted(tentative - confirmed),
-            "members": sorted(members),
+            "raw_aftersalers": sorted(raw_aftersalers),
+            "chat_members": sorted(chat_members),
         }
     matched_codes = sum(1 for code in codes if income_by_code.get(code) or project_by_code.get(code))
     quality = {
@@ -396,7 +678,17 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
         "matched_project_codes": matched_codes,
         "product_projects": product_project_count,
         "matched_products": matched_product_count,
-        "groups_with_confirmed_aftersaler": confirmed_count,
+        "groups_with_aftersaler": aftersaler_group_count,
+        "groups_with_confirmed_aftersaler": aftersaler_group_count,
+        "groups_with_lims_link": groups_with_lims_link,
+        "groups_with_region": groups_with_region,
+        "groups_with_key_account": groups_with_key_account,
+        "groups_with_raw_aftersaler": groups_with_raw_aftersaler,
+        "groups_with_lims_members": groups_with_lims_members,
+        "lims_source": "database_fallback",
+        "lims_api_requests": 0,
+        "lims_api_records": 0,
+        "lims_api_errors": 0,
     }
     return dimensions, quality
 
@@ -552,7 +844,7 @@ def _build_overview(
                 seen_pairs.add(pair)
             sales = project.get("sales_person") or "未分配销售"
             region_sales[region][sales] += 1
-            for after in dim.get("aftersalers", []) or ["未确认售后"]:
+            for after in dim.get("aftersalers", []) or ["未关联售后"]:
                 region_after[region][after] += 1
             key = project.get("key_account")
             if key:
@@ -615,7 +907,7 @@ def _build_overview(
     project_codes = quality["project_codes"]
     matched_products = quality["matched_products"]
     product_projects = quality["product_projects"]
-    confirmed_after = quality["groups_with_confirmed_aftersaler"]
+    aftersaler_groups = quality.get("groups_with_aftersaler", quality.get("groups_with_confirmed_aftersaler", 0))
     return {
         "meta": {
             "period": period, "start_date": start.isoformat(), "end_date": end.isoformat(),
@@ -629,6 +921,7 @@ def _build_overview(
             "total_groups": total_groups, "total_messages": total_messages,
             "project_groups": sum(1 for item in groups.values() if item["dimension"].get("codes")),
             "regions": len([name for name in regions if name != "未关联区域"]),
+            "aftersaler_count": len(aftersalers),
             "confirmed_aftersalers": len(aftersalers), "product_categories": len(categories),
             "key_accounts": len(key_accounts),
             "short_active_ratio": _ratio(sum(1 for value in durations.values() if value <= 30), len(durations)),
@@ -662,9 +955,23 @@ def _build_overview(
             "project_match_rate": _ratio(matched_codes, project_codes),
             "product_records": product_projects, "matched_products": matched_products,
             "product_match_rate": _ratio(matched_products, product_projects),
-            "groups_with_confirmed_aftersaler": confirmed_after,
-            "aftersaler_confirmation_rate": _ratio(confirmed_after, total_groups),
-            "note": "分析明细来自数据库保存文本，不是未经处理的原始聊天记录。",
+            "groups_with_aftersaler": aftersaler_groups,
+            "aftersaler_coverage_rate": _ratio(aftersaler_groups, total_groups),
+            "groups_with_confirmed_aftersaler": aftersaler_groups,
+            "aftersaler_confirmation_rate": _ratio(aftersaler_groups, total_groups),
+            "groups_with_lims_link": quality.get("groups_with_lims_link", 0),
+            "lims_link_rate": _ratio(quality.get("groups_with_lims_link", 0), total_groups),
+            "groups_with_region": quality.get("groups_with_region", 0),
+            "region_link_rate": _ratio(quality.get("groups_with_region", 0), total_groups),
+            "groups_with_key_account": quality.get("groups_with_key_account", 0),
+            "key_account_link_rate": _ratio(quality.get("groups_with_key_account", 0), total_groups),
+            "groups_with_raw_aftersaler": quality.get("groups_with_raw_aftersaler", 0),
+            "groups_with_lims_members": quality.get("groups_with_lims_members", 0),
+            "lims_source": quality.get("lims_source", "unknown"),
+            "lims_api_requests": quality.get("lims_api_requests", 0),
+            "lims_api_records": quality.get("lims_api_records", 0),
+            "lims_api_errors": quality.get("lims_api_errors", 0),
+            "note": "LIMS优先来源为 POST /unionLims/base_data/，请求体 [{projectCode: 项目号}]。售后人员取接口 afterSaler 字段，不再使用 finalAfterSaler 或 members 确认逻辑；销售区域取接口 orgName；重点客户取接口 keyAccount。仅当接口不可用或无记录时回退数据库表。",
         },
     }
 
