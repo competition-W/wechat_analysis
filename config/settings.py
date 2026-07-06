@@ -41,7 +41,15 @@ class Settings(BaseSettings):
     JAVA_DATA_SOURCE_TIMEOUT: int = Field(default=120, description="Java接口超时时间(秒)")
     
 
-    # ========== LIMS API 配置 (新增) ==========
+   
+
+    # ========== MySQL Database Config ==========
+    MYSQL_HOST: str = Field(default='110.1.103.12', description='MySQL Host')
+    MYSQL_PORT: int = Field(default=3306, description='MySQL Port')
+    MYSQL_USER: str = Field(default='root', description='MySQL User')
+    MYSQL_PASSWORD: str = Field(default='9RJaJQVz', description='MySQL Password')
+    MYSQL_DATABASE: str = Field(default='test20260305', description='MySQL Database')
+# ========== LIMS API 配置 (新增) ==========
     LIMS_API_URL: str = Field(
         default="http://110.1.1.96:8080/unionLims/",
         description="LIMS API 基础地址"
