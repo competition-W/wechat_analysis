@@ -693,7 +693,7 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
     return dimensions, quality
 
 
-def _active_durations(conn, group_names: List[str]) -> Dict[str, int]:
+def _active_durations(conn, group_names: List[str], start: date, end: date) -> Dict[str, int]:
     if not group_names:
         return {}
     placeholders = ",".join(["%s"] * len(group_names))
@@ -702,8 +702,11 @@ def _active_durations(conn, group_names: List[str]) -> Dict[str, int]:
         "analysis.active_duration",
         f"""SELECT groupName, MIN(DATE(CREATEDTIME)) first_date,
                    MAX(DATE(CREATEDTIME)) last_date
-            FROM qx_analysis_result WHERE groupName IN ({placeholders}) GROUP BY groupName""",
-        group_names,
+            FROM qx_analysis_result
+            WHERE groupName IN ({placeholders})
+              AND CREATEDTIME >= %s AND CREATEDTIME < %s
+            GROUP BY groupName""",
+        group_names + [start.isoformat(), (end + timedelta(days=1)).isoformat()],
     )
     return {
         row["groupName"]: (row["last_date"] - row["first_date"]).days
@@ -834,7 +837,7 @@ def _build_overview(
             rows = [row for row in rows if row["groupName"] in allowed_groups]
             dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
         groups = _group_aggregates(rows, dimensions)
-        durations = _active_durations(conn, list(groups))
+        durations = _active_durations(conn, list(groups), start, end)
 
     total_groups = len(groups)
     total_messages = sum(item["messages"] for item in groups.values())
@@ -844,6 +847,7 @@ def _build_overview(
     words = Counter()
     regions = Counter()
     region_messages = Counter()
+    region_group_count: Dict[str, int] = {}
     aftersalers = Counter()
     tentative_aftersalers = Counter()
     categories = Counter()
@@ -873,6 +877,7 @@ def _build_overview(
         group_regions = set(dim.get("regions", [])) or {"未关联区域"}
         for region in group_regions:
             regions[region] += 1
+            region_group_count[region] = region_group_count.get(region, 0) + 1
             region_messages[region] += item["messages"]
         seen_pairs = set()
         for project in dim.get("projects", []):
@@ -892,11 +897,19 @@ def _build_overview(
                 region_after[region][after] += 1
             key = project.get("key_account")
             if key:
-                account = key_accounts.setdefault(key, {"key_account": key, "projects": set(), "customers": set(), "aftersalers": set()})
+                account = key_accounts.setdefault(key, {"key_account": key, "projects": set(), "customers": set(), "aftersalers": set(), "groups": set()})
                 account["projects"].add(project.get("project_code"))
                 if project.get("customer_name"):
                     account["customers"].add(project["customer_name"])
                 account["aftersalers"].update(dim.get("aftersalers", []))
+                account["groups"].add(group_name)
+    if aftersaler:
+        aftersalers = Counter({aftersaler: aftersalers.get(aftersaler, 0)})
+    if region:
+        regions = Counter({region: regions.get(region, 0)})
+        region_group_count = {region: region_group_count.get(region, 0)}
+    if category:
+        categories = Counter({category: categories.get(category, 0)})
 
     duration_defs = [
         ("≤7天", "极短期咨询", 0, 7), ("8-30天", "短期服务", 8, 30),
@@ -920,13 +933,17 @@ def _build_overview(
     top5_coverage = _ratio(sum(x[1] for x in regions.most_common(5)), total_region_groups)
     account_items = []
     for value in key_accounts.values():
+        customer_names = sorted(value.get("customers", set()))
         account_items.append({
             "key_account": value["key_account"],
+            "customer_name": customer_names[0] if customer_names else "",
+            "customer_names": customer_names[:5],
+            "group_count": len(value.get("groups", set())),
             "project_count": len(value["projects"]),
             "customer_count": len(value["customers"]),
             "aftersalers": sorted(value["aftersalers"]),
         })
-    account_items.sort(key=lambda value: (-value["project_count"], value["key_account"]))
+    account_items.sort(key=lambda value: (-value["group_count"], -value["project_count"], value["key_account"]))
     product_hierarchy = []
     for level1, level2_map in product_tree.items():
         children = []
@@ -952,6 +969,10 @@ def _build_overview(
     matched_products = quality["matched_products"]
     product_projects = quality["product_projects"]
     aftersaler_groups = quality.get("groups_with_aftersaler", quality.get("groups_with_confirmed_aftersaler", 0))
+    cross_sales = [{"region": region, "group_count": region_group_count.get(region, 0), "items": _counter_items(counter)} for region, counter in region_sales.items()]
+    cross_after = [{"region": region, "group_count": region_group_count.get(region, 0), "items": _counter_items(counter)} for region, counter in region_after.items()]
+    cross_product = [{"region": region, "group_count": region_group_count.get(region, 0), "items": _counter_items(counter, "category")} for region, counter in region_product.items()]
+
     return {
         "meta": {
             "period": period, "start_date": start.isoformat(), "end_date": end.isoformat(),
@@ -989,9 +1010,9 @@ def _build_overview(
             "key_accounts": account_items,
         },
         "cross_analysis": {
-            "region_sales": [{"region": region, "items": _counter_items(counter)} for region, counter in sorted(region_sales.items())],
-            "region_after": [{"region": region, "items": _counter_items(counter)} for region, counter in sorted(region_after.items())],
-            "region_product": [{"region": region, "items": _counter_items(counter, "category")} for region, counter in sorted(region_product.items())],
+            "region_sales": sorted(cross_sales, key=lambda x: -x.get("group_count", 0)),
+            "region_after": sorted(cross_after, key=lambda x: -x.get("group_count", 0)),
+            "region_product": sorted(cross_product, key=lambda x: -x.get("group_count", 0)),
         },
         "data_quality": {
             "raw_rows": raw_count, "deduplicated_rows": len(rows),
