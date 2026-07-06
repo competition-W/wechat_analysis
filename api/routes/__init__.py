@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter
+from fastapi import APIRouter
 from .analyze import router as analyze_router
 from .report import router as report_router
 from .visualize import router as visualize_router

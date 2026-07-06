@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 qxChat 数据分析器：对群聊消息执行 M12-M17 各模块分析，

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 报告聚合器：接收已合并的群聊+LIMS数据，计算 M00-M11 各模块统计量。

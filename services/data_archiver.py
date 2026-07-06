@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 数据归档器：将每日的群聊+LIMS 数据持久化到 JSON 文件，

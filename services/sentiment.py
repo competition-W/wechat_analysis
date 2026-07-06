@@ -1,4 +1,4 @@
-﻿import json
+import json
 from typing import List, Optional, Tuple, Dict, Any
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed

@@ -1,4 +1,4 @@
-﻿services:
+services:
   wechat-analysis:
     build:
       context: .

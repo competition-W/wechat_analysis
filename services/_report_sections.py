@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Generate M12-M17 chart JS code using Python dicts + json.dumps()"""
 
