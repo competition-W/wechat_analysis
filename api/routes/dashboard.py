@@ -1,149 +1,162 @@
-from fastapi import APIRouter, Query, HTTPException
-from typing import Optional
-from loguru import logger
 import time
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from loguru import logger
+
+from services import db_dashboard
+
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
 
-def _call(fn, **kw):
+
+def _success(operation: str, fn, *args, **kwargs):
     started = time.perf_counter()
-    logger.info("dashboard.query.start operation={} params={}", fn.__name__, kw or "-")
+    logger.info("dashboard.operation.start operation={}", operation)
     try:
-        data = fn(**kw)
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        data = fn(*args, **kwargs)
         logger.info(
-            "dashboard.query.end operation={} elapsed_ms={:.1f} result_type={}",
-            fn.__name__, elapsed_ms, type(data).__name__,
+            "dashboard.operation.end operation={} elapsed_ms={:.1f}",
+            operation,
+            (time.perf_counter() - started) * 1000,
         )
         return {"code": 0, "message": "success", "data": data}
-    except Exception as e:
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.exception(
-            "dashboard.query.error operation={} elapsed_ms={:.1f} error={}",
-            fn.__name__, elapsed_ms, e,
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as exc:
+        logger.warning("dashboard.operation.invalid operation={} error={}", operation, exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("dashboard.operation.error operation={} error={}", operation, exc)
+        raise HTTPException(status_code=500, detail="dashboard query failed") from exc
 
-# ---- Existing endpoints ----
 
+@router.get("/overview")
+def overview(
+    period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    refresh: bool = Query(False),
+    region: str = Query("", max_length=100),
+    aftersaler: str = Query("", max_length=100),
+    category: str = Query("", max_length=100),
+    key_account: str = Query("", max_length=100),
+):
+    return _success(
+        "overview", db_dashboard.get_overview,
+        period=period, start_date=start_date, end_date=end_date, force_refresh=refresh,
+        region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+    )
+
+
+@router.get("/evidence")
+def evidence(
+    metric: str = Query(..., pattern="^(unanswered|customer_negative|employee_negative|highfreq)$"),
+    period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    keyword: Optional[str] = Query(None, max_length=100),
+    search: Optional[str] = Query(None, max_length=100),
+    region: str = Query("", max_length=100),
+    aftersaler: str = Query("", max_length=100),
+    category: str = Query("", max_length=100),
+    key_account: str = Query("", max_length=100),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    return _success(
+        "evidence", db_dashboard.get_evidence,
+        metric=metric, period=period, start_date=start_date, end_date=end_date,
+        keyword=keyword, search=search, region=region, aftersaler=aftersaler,
+        category=category, key_account=key_account, page=page, page_size=page_size,
+    )
+
+
+@router.post("/cache/clear")
+def clear_cache():
+    db_dashboard.clear_cache()
+    return {"code": 0, "message": "success", "data": {"cleared": True}}
+
+
+# Compatibility endpoints retained for existing integrations.
 @router.get("/summary")
-def get_dashboard_summary(date: Optional[str] = Query(None)):
-    from services.db_dashboard import get_summary
-    return _call(get_summary, date_str=date)
+def summary(date: Optional[str] = Query(None)):
+    return _success("summary", db_dashboard.get_summary, date)
 
-@router.get("/groups")
-def get_groups(date: Optional[str] = None, page: int = 1,
-                     page_size: int = 20, search: Optional[str] = None,
-                     sort_by: str = "messageToDayCount", sort_order: str = "DESC"):
-    from services.db_dashboard import get_groups
-    return _call(get_groups, date_str=date, page=page, page_size=page_size,
-                 search=search, sort_by=sort_by, sort_order=sort_order)
-
-@router.get("/groups/{group_id}")
-def get_group_detail(group_id: int):
-    from services.db_dashboard import get_group_detail
-    data = get_group_detail(group_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="Group not found")
-    return {"code": 0, "message": "success", "data": data}
-
-@router.get("/timeseries")
-def get_timeseries(days: int = Query(30, ge=1, le=365)):
-    from services.db_dashboard import get_timeseries, get_sentiment_timeline
-    ts = get_timeseries(days)
-    st = get_sentiment_timeline(days)
-    return {"code": 0, "message": "success", "data": {"overview": ts, "sentiment": st}}
 
 @router.get("/today")
-def get_today():
-    import datetime
-    return get_dashboard_summary(date=datetime.date.today().isoformat())
+def today():
+    return _success("today", db_dashboard.get_overview, period="today")
 
-# ---- M00-M03 ----
 
 @router.get("/full-summary")
-def get_full_summary():
-    from services.db_dashboard import get_full_summary
-    return _call(get_full_summary)
+def full_summary():
+    return _success("full_summary", db_dashboard.get_full_summary)
 
-# ---- M04-M11 LIMS ----
 
 @router.get("/after-saler-distribution")
 def after_saler_distribution():
-    from services.db_dashboard import get_after_saler_distribution
-    return _call(get_after_saler_distribution)
+    return _success("after_saler_distribution", db_dashboard.get_after_saler_distribution)
+
 
 @router.get("/active-duration")
 def active_duration():
-    """M05: Active duration from qxChat msgtime"""
-    from services.qxchat_helper import compute_active_duration
-    return _call(compute_active_duration)
+    return _success("active_duration", lambda: db_dashboard.get_overview("year")["communication"]["active_duration"])
+
 
 @router.get("/product-categories")
 def product_categories():
-    from services.db_dashboard import get_product_category_hierarchy
-    return _call(get_product_category_hierarchy)
+    return _success("product_categories", db_dashboard.get_product_category_hierarchy)
+
 
 @router.get("/key-accounts")
 def key_accounts():
-    from services.db_dashboard import get_key_account_hierarchy
-    return _call(get_key_account_hierarchy)
+    return _success("key_accounts", db_dashboard.get_key_account_hierarchy)
+
 
 @router.get("/org-distribution")
 def org_distribution():
-    from services.db_dashboard import get_org_distribution
-    return _call(get_org_distribution)
+    return _success("org_distribution", db_dashboard.get_org_distribution)
+
 
 @router.get("/org-salesperson")
 def org_salesperson():
-    from services.db_dashboard import get_org_salesperson
-    return _call(get_org_salesperson)
+    return _success("org_salesperson", lambda: {"items": db_dashboard.get_overview("year")["cross_analysis"]["region_sales"]})
+
 
 @router.get("/org-product-category")
 def org_product_category():
-    from services.db_dashboard import get_org_product_category
-    return _call(get_org_product_category)
+    return _success("org_product_category", lambda: {"items": db_dashboard.get_overview("year")["cross_analysis"]["region_product"]})
+
 
 @router.get("/org-after-saler")
 def org_after_saler():
-    from services.db_dashboard import get_org_after_saler
-    return _call(get_org_after_saler)
+    return _success("org_after_saler", lambda: {"items": db_dashboard.get_overview("year")["cross_analysis"]["region_after"]})
 
-# ---- M12-M16 Chat Analysis ----
 
 @router.get("/message-trend")
-def message_trend(days: int = Query(30, ge=1, le=365)):
-    from services.qxchat_helper import get_time_data
-    data = get_time_data()
-    trend = []
-    if data.get("groups"):
-        total_days = {}
-        for g in data["groups"].values():
-            for d, c in g.get("days", {}).items():
-                total_days[d] = total_days.get(d, 0) + c
-        from datetime import datetime, timedelta
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        trend = [{"date": d, "count": c} for d, c in sorted(total_days.items())
-                 if d >= cutoff]
-    return {"code": 0, "message": "success", "data": {"trend": trend, "total_days": len(trend)}}
+def message_trend():
+    return _success("message_trend", lambda: {"trend": db_dashboard.get_overview("month")["communication"]["trend"]})
+
 
 @router.get("/time-distribution")
-def time_distribution(days: int = Query(30, ge=1, le=365)):
-    """M13: Message time distribution from qxChat msgtime"""
-    from services.qxchat_helper import compute_time_distribution
-    return _call(compute_time_distribution, days=days)
+def time_distribution():
+    return _success(
+        "time_distribution",
+        lambda: {"days": db_dashboard.get_overview("month")["communication"]["trend"], "note": "数据库仅保存每日分析结果，未保存小时粒度。"},
+    )
+
 
 @router.get("/sentiment-summary")
 def sentiment_summary():
-    from services.db_dashboard import get_sentiment_analysis_summary
-    return _call(get_sentiment_analysis_summary)
+    return _success("sentiment_summary", db_dashboard.get_sentiment_analysis_summary)
+
 
 @router.get("/high-freq")
 def high_freq(limit: int = Query(20, ge=5, le=100)):
-    from services.db_dashboard import get_high_freq_summary
-    return _call(get_high_freq_summary, limit=limit)
+    return _success("high_freq", db_dashboard.get_high_freq_summary, limit)
+
 
 @router.get("/unanswered-summary")
 def unanswered_summary():
-    from services.db_dashboard import get_unanswered_summary
-    return _call(get_unanswered_summary)
+    return _success("unanswered_summary", db_dashboard.get_unanswered_summary)

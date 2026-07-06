@@ -1,920 +1,824 @@
-"""
-Database dashboard service - reads analyzed data from MySQL
-Integrates qx_analysis_result (chat analysis) + t_project/t_customer/t_product_main (LIMS data)
-"""
+"""Read-only dashboard analytics built from the existing MySQL analysis tables."""
 
-import re
+from __future__ import annotations
+
+import copy
 import json
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+import re
+import threading
+import time
+from collections import Counter, defaultdict
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
 from loguru import logger
 
-_pymysql = None
-def _get_mysql():
-    global _pymysql
-    if _pymysql is None:
-        import pymysql
-        _pymysql = pymysql
-    return _pymysql
 
-_conn = None
-def get_connection():
-    global _conn
+CACHE_TTL_SECONDS = 300
+PROJECT_CODE_RE = re.compile(r"LC-[A-Z0-9]+(?:-[A-Z0-9]+)*", re.IGNORECASE)
+_cache: Dict[str, Tuple[float, dict]] = {}
+_last_success: Dict[str, dict] = {}
+_cache_lock = threading.Lock()
+
+
+@contextmanager
+def database(operation: str):
+    """Open an isolated connection so concurrent requests never share protocol state."""
+    import pymysql
     from config.settings import settings
+
+    started = time.perf_counter()
+    logger.info("dashboard.db.connect.start operation={}", operation)
+    conn = pymysql.connect(
+        host=settings.MYSQL_HOST,
+        port=settings.MYSQL_PORT,
+        user=settings.MYSQL_USER,
+        password=settings.MYSQL_PASSWORD,
+        database=settings.MYSQL_DATABASE,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=8,
+        read_timeout=30,
+        write_timeout=30,
+        autocommit=True,
+    )
     try:
-        if _conn is None or not _conn.open:
-            pymysql = _get_mysql()
-            _conn = pymysql.connect(
-                host=settings.MYSQL_HOST,
-                port=settings.MYSQL_PORT,
-                user=settings.MYSQL_USER,
-                password=settings.MYSQL_PASSWORD,
-                database=settings.MYSQL_DATABASE,
-                charset="utf8mb4",
-                cursorclass=pymysql.cursors.DictCursor,
-                connect_timeout=10,
-                read_timeout=30,
-            )
-        return _conn
-    except Exception as e:
-        logger.error(f"DB connection failed: {e}")
-        raise
+        yield conn
+    finally:
+        conn.close()
+        logger.info(
+            "dashboard.db.connect.end operation={} elapsed_ms={:.1f}",
+            operation,
+            (time.perf_counter() - started) * 1000,
+        )
 
-def close_connection():
-    global _conn
-    if _conn and _conn.open:
-        _conn.close()
-        _conn = None
 
-def _safe(val, default=""):
-    return val if val is not None else default
+def _query(conn, operation: str, sql: str, params: Iterable[Any] = ()) -> List[dict]:
+    started = time.perf_counter()
+    logger.info("dashboard.db.query.start operation={}", operation)
+    with conn.cursor() as cursor:
+        cursor.execute(sql, tuple(params))
+        rows = list(cursor.fetchall())
+    logger.info(
+        "dashboard.db.query.end operation={} rows={} elapsed_ms={:.1f}",
+        operation,
+        len(rows),
+        (time.perf_counter() - started) * 1000,
+    )
+    return rows
 
-# ===== PARSERS =====
 
-def parse_emotion_field(field_value) -> dict:
-    """Parse customer/sale emotion field"""
-    if not field_value:
-        return {}
-    result = {}
-    try:
-        for part in str(field_value).split(","):
-            part = part.strip()
-            if ":" not in part:
-                continue
-            k, v = part.split(":", 1)
-            result[k.strip().strip(chr(34)+chr(39))] = int(v.strip())
-    except Exception as e:
-        logger.warning(f"parse_emotion_field: {e}")
-    return result
+def clear_cache() -> None:
+    with _cache_lock:
+        _cache.clear()
 
-def parse_send_detail(field_value) -> dict:
-    if not field_value:
-        return {}
-    result = {}
-    try:
-        for part in str(field_value).split(","):
-            p = part.strip()
-            if ":" not in p:
-                continue
-            k, v = p.split(":", 1)
-            result[k.strip()] = int(v.strip())
-    except Exception as e:
-        logger.warning(f"parse_send_detail: {e}")
-    return result
 
-def parse_high_freq(field_value) -> list:
-    if not field_value:
+def extract_project_codes(group_name: str) -> List[str]:
+    if not group_name:
         return []
-    result = []
-    try:
-        for part in str(field_value).split(","):
-            p = part.strip()
-            if ":" not in p:
-                continue
-            k, v = p.split(":", 1)
-            result.append({"word": k.strip(), "count": int(v.strip())})
-    except Exception as e:
-        logger.warning(f"parse_high_freq: {e}")
-    return result
-
-def get_project_codes(name: str) -> list:
-    """Extract LC project codes from group name - supports LC-P, LC-X, etc."""
-    if not name:
-        return []
-    return re.findall(r"LC-[A-Z]+\d+", name)
+    codes = []
+    for match in PROJECT_CODE_RE.findall(group_name.upper()):
+        code = match.rstrip("-")
+        if code not in codes:
+            codes.append(code)
+    return codes
 
 
-# ===== INTERNAL: LIMS DATA LOADING =====
-_lims_cache: dict = {}
+def get_project_codes(group_name: str) -> List[str]:
+    return extract_project_codes(group_name)
 
-def _clear_cache():
-    _lims_cache.clear()
 
-def _load_all_project_codes() -> List[str]:
-    """Extract all unique LC project codes from qx_analysis_result"""
-    if "all_codes" in _lims_cache:
-        return _lims_cache["all_codes"]
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT groupName FROM qx_analysis_result WHERE groupName IS NOT NULL")
-    codes = set()
-    for row in cur.fetchall():
-        for code in get_project_codes(row["groupName"]):
-            codes.add(code)
-    result = sorted(codes)
-    _lims_cache["all_codes"] = result
-    logger.info(f"Extracted {len(result)} unique project codes from qx_analysis_result")
-    return result
-
-def _load_projects_by_codes(codes: List[str]) -> Dict[str, dict]:
-    """Load t_project records matching codes"""
-    if not codes:
+def parse_count_map(value: Any) -> Dict[str, int]:
+    """Parse the database's comma-separated `label: count` fields."""
+    if value is None:
         return {}
-    cache_key = f"projects_{len(codes)}"
-    if cache_key in _lims_cache:
-        return _lims_cache[cache_key]
-    conn = get_connection()
-    cur = conn.cursor()
-    placeholders = ",".join(["%s"] * len(codes))
-    sql = f"SELECT * FROM t_project WHERE PROJECTCODE IN ({placeholders})"
-    cur.execute(sql, codes)
-    result = {}
-    for row in cur.fetchall():
-        code = row.get("PROJECTCODE", "")
-        if code:
-            result[code] = dict(row)
-    _lims_cache[cache_key] = result
-    logger.info(f"Loaded {len(result)} t_project records for {len(codes)} codes")
-    return result
-
-def _load_customers_by_ids(customer_ids: List[str]) -> Dict[str, dict]:
-    """Load t_customer records"""
-    ids = [cid for cid in customer_ids if cid]
-    if not ids:
+    text = str(value).strip()
+    if not text:
         return {}
-    cache_key = f"customers_{len(ids)}"
-    if cache_key in _lims_cache:
-        return _lims_cache[cache_key]
-    conn = get_connection()
-    cur = conn.cursor()
-    placeholders = ",".join(["%s"] * len(ids))
-    sql = f"SELECT * FROM t_customer WHERE CUSTOMERNO IN ({placeholders}) OR CUSTOMERID IN ({placeholders})"
-    cur.execute(sql, ids + ids)
-    result = {}
-    for row in cur.fetchall():
-        cno = row.get("CUSTOMERNO", "") or row.get("CUSTOMERID", "")
-        if cno:
-            result[cno] = dict(row)
-    _lims_cache[cache_key] = result
+    result: Dict[str, int] = {}
+    for part in re.split(r"[,，]", text):
+        part = part.strip()
+        if not part or ":" not in part and "：" not in part:
+            continue
+        key, raw = re.split(r"[:：]", part, maxsplit=1)
+        match = re.search(r"-?\d+", raw)
+        if match:
+            result[key.strip().strip("\"'")] = int(match.group())
     return result
 
-def _load_product_main() -> Dict[str, dict]:
-    """Load all product_main records"""
-    if "products" in _lims_cache:
-        return _lims_cache["products"]
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM t_product_main")
-    result = {}
-    for row in cur.fetchall():
-        code = row.get("PRODUCTCODE", "") or row.get("PRODUCTNAME", "")
-        if code:
-            result[code] = dict(row)
-    _lims_cache["products"] = result
-    logger.info(f"Loaded {len(result)} t_product_main records")
-    return result
 
-def _parse_members_field(members_str) -> List[str]:
-    """Parse members from t_project (JSON array or comma-separated)"""
-    if not members_str:
+def parse_emotion_field(value: Any) -> Dict[str, int]:
+    return parse_count_map(value)
+
+
+def parse_send_detail(value: Any) -> Dict[str, int]:
+    return parse_count_map(value)
+
+
+def parse_high_freq(value: Any) -> List[dict]:
+    return [
+        {"word": word, "count": count}
+        for word, count in parse_count_map(value).items()
+    ]
+
+
+def parse_members(value: Any) -> List[str]:
+    if not value:
         return []
-    s = str(members_str).strip()
+    text = str(value).strip()
     try:
-        parsed = json.loads(s)
+        parsed = json.loads(text)
         if isinstance(parsed, list):
-            return [str(m).strip() for m in parsed if m]
+            names = []
+            for item in parsed:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("group_nickname")
+                else:
+                    name = str(item)
+                if name:
+                    names.append(str(name).strip())
+            return names
     except (json.JSONDecodeError, TypeError):
         pass
-    return [m.strip() for m in s.split(",") if m.strip()]
+    return [item.strip() for item in re.split(r"[,，、;；\n]", text) if item.strip()]
 
-def _compute_derived_fields(project: dict) -> dict:
-    """Compute finalAfterSaler, salesPerson from a t_project record"""
-    after_saler = _safe(project.get("AFTERSALER"))
-    members_raw = (_safe(project.get("members"))
-                   or _safe(project.get("MEMBERLIST"))
-                   or _safe(project.get("MEMBERS")))
-    member_names = _parse_members_field(members_raw)
 
-    if after_saler and after_saler in member_names:
-        final_after_saler = after_saler
+def _emotion_total(mapping: Dict[str, int], labels: Iterable[str]) -> int:
+    total = 0
+    for key, count in mapping.items():
+        if any(label in key for label in labels):
+            total += count
+    return total
+
+
+def normalize_key_account(value: Any, customer_name: str = "", fallback: str = "") -> str:
+    raw = str(value or "").strip()
+    lowered = raw.lower()
+    if lowered in ("", "0", "false", "no", "null", "none", "否", "无"):
+        return str(fallback or "").strip()
+    if lowered in ("1", "true", "yes", "是", "有"):
+        return str(fallback or customer_name or "").strip()
+    return raw
+
+
+def resolve_period(
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    today: Optional[date] = None,
+) -> Tuple[date, date, str]:
+    current = today or date.today()
+    period = (period or "month").lower()
+    if period == "custom":
+        if not start_date or not end_date:
+            raise ValueError("custom period requires start_date and end_date")
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    elif period in ("today", "daily"):
+        start = end = current
+        period = "today"
+    elif period in ("week", "weekly"):
+        start = current - timedelta(days=current.weekday())
+        end = current
+        period = "week"
+    elif period in ("quarter", "quarterly"):
+        month = ((current.month - 1) // 3) * 3 + 1
+        start = date(current.year, month, 1)
+        end = current
+        period = "quarter"
+    elif period in ("year", "yearly"):
+        start = date(current.year, 1, 1)
+        end = current
+        period = "year"
     else:
-        final_after_saler = ""
+        start = date(current.year, current.month, 1)
+        end = current
+        period = "month"
+    if start > end:
+        raise ValueError("start_date must not be later than end_date")
+    if (end - start).days > 730:
+        raise ValueError("date range cannot exceed 731 days")
+    return start, end, period
 
-    sales_person = final_after_saler if final_after_saler else after_saler
-    return {
-        "afterSaler": after_saler,
-        "finalAfterSaler": final_after_saler,
-        "salesPerson": sales_person,
-    }
 
-def _build_group_lims_map() -> Dict[str, dict]:
-    """Build mapping: groupName -> aggregated LIMS data"""
-    if "group_lims" in _lims_cache:
-        return _lims_cache["group_lims"]
+def _latest_rows(conn, start: date, end: date) -> Tuple[List[dict], int]:
+    params = (start.isoformat(), (end + timedelta(days=1)).isoformat())
+    sql = """
+        SELECT a.*
+        FROM qx_analysis_result a
+        JOIN (
+            SELECT groupName, DATE(CREATEDTIME) analysis_date, MAX(id) latest_id
+            FROM qx_analysis_result
+            WHERE CREATEDTIME >= %s AND CREATEDTIME < %s
+            GROUP BY groupName, DATE(CREATEDTIME)
+        ) latest ON latest.latest_id = a.id
+        ORDER BY a.CREATEDTIME
+    """
+    rows = _query(conn, "analysis.latest_daily", sql, params)
+    raw_count = _query(
+        conn,
+        "analysis.raw_count",
+        "SELECT COUNT(*) count FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+        params,
+    )[0]["count"]
+    return rows, int(raw_count or 0)
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT groupName, member FROM qx_analysis_result WHERE groupName IS NOT NULL")
-    group_code_map = {}
-    all_codes = set()
-    for row in cur.fetchall():
-        name = row["groupName"]
-        codes = get_project_codes(name)
-        if codes:
-            group_code_map[name] = {
-                "codes": codes,
-                "member": _safe(row["member"]),
-            }
-            all_codes.update(codes)
 
-    if not all_codes:
-        _lims_cache["group_lims"] = {}
-        return {}
+def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
+    group_codes = {row["groupName"]: extract_project_codes(row.get("groupName", "")) for row in rows}
+    codes = sorted({code for values in group_codes.values() for code in values})
+    if not codes:
+        return {name: {"codes": [], "projects": [], "regions": [], "aftersalers": []}
+                for name in group_codes}, {
+                    "project_codes": 0, "matched_project_codes": 0,
+                    "product_projects": 0, "matched_products": 0,
+                    "groups_with_confirmed_aftersaler": 0,
+                }
 
-    codes_list = sorted(all_codes)
-    projects = _load_projects_by_codes(codes_list)
+    placeholders = ",".join(["%s"] * len(codes))
+    projects = _query(
+        conn,
+        "dimension.projects",
+        f"""SELECT ID, PROJECTCODE, CUSTOMERID, CUSTOMERNAME, PRODUCTNAME,
+                   CREATEDBYORGNAME, CREATEDBYNAME
+            FROM t_project WHERE PROJECTCODE IN ({placeholders})""",
+        codes,
+    )
+    project_by_code: Dict[str, List[dict]] = defaultdict(list)
+    for project in projects:
+        project_by_code[str(project.get("PROJECTCODE") or "").upper()].append(project)
 
-    customer_ids = set()
-    for proj in projects.values():
-        cid = _safe(proj.get("CUSTOMERID")) or _safe(proj.get("CUSTOMERNO"))
-        if cid:
-            customer_ids.add(cid)
-    customers = _load_customers_by_ids(list(customer_ids))
+    customer_ids = sorted({p["CUSTOMERID"] for p in projects if p.get("CUSTOMERID") is not None})
+    customers: Dict[Any, dict] = {}
+    if customer_ids:
+        ph = ",".join(["%s"] * len(customer_ids))
+        for item in _query(
+            conn,
+            "dimension.customers",
+            f"SELECT ID, CUSTOMERNO, CUSTOMERNAME, keyAccount FROM t_customer WHERE ID IN ({ph})",
+            customer_ids,
+        ):
+            customers[item["ID"]] = item
 
-    result = {}
-    for gname, gdata in group_code_map.items():
-        gcodes = gdata["codes"]
+    income_rows = _query(
+        conn,
+        "dimension.income",
+        f"""SELECT businesscode, projectproductcode, productname, customername,
+                   keyaccount, orgname, projectsalename, createdByName,
+                   productbigsortone, productbigsorttwo, productbigsortthree
+            FROM t_income
+            WHERE businesscode IN ({placeholders}) OR projectproductcode IN ({placeholders})""",
+        codes + codes,
+    )
+    income_by_code: Dict[str, List[dict]] = defaultdict(list)
+    for item in income_rows:
+        possible = [item.get("businesscode"), item.get("projectproductcode")]
+        for value in possible:
+            normalized = str(value or "").upper()
+            if normalized in codes:
+                income_by_code[normalized].append(item)
+
+    product_names = sorted({
+        value for value in
+        [p.get("PRODUCTNAME") for p in projects] + [item.get("productname") for item in income_rows]
+        if value
+    })
+    products: Dict[str, dict] = {}
+    candidates: Dict[str, set] = defaultdict(set)
+    if product_names:
+        ph = ",".join(["%s"] * len(product_names))
+        for item in _query(
+            conn,
+            "dimension.products",
+            f"""SELECT PRODUCTNAME, PRODUCTBIGSORTONE, PRODUCTBIGSORTTWO,
+                       PRODUCTBIGSORTThree
+                FROM t_product_main WHERE PRODUCTNAME IN ({ph})""",
+            product_names,
+        ):
+            products.setdefault(item["PRODUCTNAME"], item)
+        for item in _query(
+            conn,
+            "dimension.aftersalers",
+            f"""SELECT DISTINCT PRODUCTNAME, AFTERSALER
+                FROM t_person_product_main
+                WHERE PRODUCTNAME IN ({ph}) AND AFTERSALER IS NOT NULL AND AFTERSALER <> ''""",
+            product_names,
+        ):
+            candidates[item["PRODUCTNAME"]].add(item["AFTERSALER"].strip())
+
+    latest_member_by_group: Dict[str, List[str]] = {}
+    for row in rows:
+        latest_member_by_group[row["groupName"]] = parse_members(row.get("member"))
+
+    dimensions: Dict[str, dict] = {}
+    confirmed_count = 0
+    product_project_count = 0
+    matched_product_count = 0
+    for group_name, codes_for_group in group_codes.items():
         group_projects = []
-        group_orgs = set()
-        group_after_salers = set()
-        group_customers = set()
-
-        for code in gcodes:
-            proj = projects.get(code)
-            if proj:
-                derived = _compute_derived_fields(proj)
-                org_name = _safe(proj.get("CREATEDBYORGNAME"))
-                customer_name = _safe(proj.get("CUSTOMERNAME"))
-
-                group_projects.append({
-                    "code": code,
-                    "orgName": org_name,
-                    "afterSaler": derived["afterSaler"],
-                    "finalAfterSaler": derived["finalAfterSaler"],
-                    "salesPerson": derived["salesPerson"],
-                    "customerName": customer_name,
-                    "productName": _safe(proj.get("PRODUCTNAME")),
-                })
-                if org_name:
-                    group_orgs.add(org_name)
-                fas = derived["finalAfterSaler"]
-                asv = derived["afterSaler"]
-                if fas:
-                    group_after_salers.add(fas)
-                elif asv:
-                    group_after_salers.add(asv)
-                if customer_name:
-                    cid2 = _safe(proj.get("CUSTOMERID")) or _safe(proj.get("CUSTOMERNO"))
-                    if cid2 and cid2 in customers:
-                        ka = _safe(customers[cid2].get("keyAccount"))
-                        if ka:
-                            group_customers.add(f"大客户:{ka}|{customer_name}")
-                    group_customers.add(customer_name)
-
-        result[gname] = {
+        members = set(latest_member_by_group.get(group_name, []))
+        confirmed = set()
+        tentative = set()
+        regions = set()
+        for code in codes_for_group:
+            source_rows = income_by_code.get(code, [])
+            if source_rows:
+                fallback_project = (project_by_code.get(code) or [{}])[0]
+                fallback_customer = customers.get(fallback_project.get("CUSTOMERID"), {})
+                normalized_projects = [{
+                    "project_code": code,
+                    "customer_name": item.get("customername") or fallback_project.get("CUSTOMERNAME") or "",
+                    "key_account": normalize_key_account(
+                        item.get("keyaccount"), item.get("customername") or "",
+                        fallback_customer.get("keyAccount") or "",
+                    ),
+                    "region": item.get("orgname") or "",
+                    "sales_person": item.get("projectsalename") or item.get("createdByName") or "",
+                    "product_name": item.get("productname") or "",
+                    "category_l1": item.get("productbigsortone") or "未分类",
+                    "category_l2": item.get("productbigsorttwo") or "",
+                    "category_l3": item.get("productbigsortthree") or "",
+                } for item in source_rows]
+            else:
+                normalized_projects = []
+                for project in project_by_code.get(code, []):
+                    product_name = project.get("PRODUCTNAME") or ""
+                    product = products.get(product_name, {})
+                    customer = customers.get(project.get("CUSTOMERID"), {})
+                    normalized_projects.append({
+                        "project_code": code,
+                        "customer_name": project.get("CUSTOMERNAME") or customer.get("CUSTOMERNAME") or "",
+                        "key_account": customer.get("keyAccount") or "",
+                        "region": project.get("CREATEDBYORGNAME") or "",
+                        "sales_person": project.get("CREATEDBYNAME") or "",
+                        "product_name": product_name,
+                        "category_l1": product.get("PRODUCTBIGSORTONE") or "未分类",
+                        "category_l2": product.get("PRODUCTBIGSORTTWO") or "",
+                        "category_l3": product.get("PRODUCTBIGSORTThree") or "",
+                    })
+            seen_project_shapes = set()
+            for normalized in normalized_projects:
+                shape = (
+                    normalized["project_code"], normalized["product_name"],
+                    normalized["customer_name"], normalized["region"],
+                )
+                if shape in seen_project_shapes:
+                    continue
+                seen_project_shapes.add(shape)
+                product_name = normalized["product_name"]
+                if product_name:
+                    product_project_count += 1
+                if normalized["category_l1"] != "未分类":
+                    matched_product_count += 1
+                after_candidates = candidates.get(product_name, set())
+                matches = {name for name in after_candidates if name in members}
+                confirmed.update(matches)
+                if not matches and len(after_candidates) == 1:
+                    tentative.update(after_candidates)
+                region = normalized["region"]
+                if region:
+                    regions.add(region)
+                group_projects.append(normalized)
+        if confirmed:
+            confirmed_count += 1
+        dimensions[group_name] = {
+            "codes": codes_for_group,
             "projects": group_projects,
-            "org_names": sorted(group_orgs),
-            "after_salers": sorted(group_after_salers),
-            "customers": sorted(group_customers),
-            "codes": gcodes,
-            "member": gdata["member"],
+            "regions": sorted(regions),
+            "aftersalers": sorted(confirmed),
+            "tentative_aftersalers": sorted(tentative - confirmed),
+            "members": sorted(members),
         }
+    matched_codes = sum(1 for code in codes if income_by_code.get(code) or project_by_code.get(code))
+    quality = {
+        "project_codes": len(codes),
+        "matched_project_codes": matched_codes,
+        "product_projects": product_project_count,
+        "matched_products": matched_product_count,
+        "groups_with_confirmed_aftersaler": confirmed_count,
+    }
+    return dimensions, quality
 
-    _lims_cache["group_lims"] = result
-    logger.info(f"Built LIMS mapping for {len(result)} groups with {len(projects)} projects")
-    return result
 
-
-# ===== EXISTING: qx_analysis_result queries (updated with LIMS data) =====
-
-def get_summary(date_str: str = None) -> dict:
-    """Get basic dashboard summary stats"""
-    conn = get_connection()
-    cur = conn.cursor()
-    where = ""
-    p = []
-    if date_str:
-        where = "WHERE DATE(CREATEDTIME) = %s"
-        p.append(date_str)
-    cur.execute(
-        "SELECT COUNT(*) as n, COALESCE(SUM(messageToDayCount),0) as msgs,"
-        "COALESCE(SUM(saleAfterCount),0) as sa,"
-        "SUM(CASE WHEN isMissedMessage='1' THEN 1 ELSE 0 END) as miss "
-        f"FROM qx_analysis_result {where}", p)
-    s = cur.fetchone()
-    cur.execute(
-        f"SELECT customerEmotionAnalysis, saleEmotionAnalysis "
-        f"FROM qx_analysis_result {where}", p)
-    cg, cb, sp, sn = 0, 0, 0, 0
-    for r in cur.fetchall():
-        ce = parse_emotion_field(r["customerEmotionAnalysis"])
-        cg += ce.get(chr(22994)+chr(35780), 0)
-        cb += ce.get(chr(24046)+chr(35780), 0)
-        se = parse_emotion_field(r["saleEmotionAnalysis"])
-        sp += se.get(chr(31215)+chr(26497)+chr(30340), 0)
-        sn += se.get(chr(24577)+chr(24230)+chr(24694)+chr(21133)+chr(30340), 0)
-    cur.execute(
-        "SELECT COUNT(*) as n FROM qx_analysis_result"
-        " WHERE groupName LIKE %s"
-        + (" AND DATE(CREATEDTIME)=%s" if date_str else ""),
-        ["LC-%"] + ([date_str] if date_str else []))
-    lc_n = cur.fetchone()["n"]
+def _active_durations(conn, group_names: List[str]) -> Dict[str, int]:
+    if not group_names:
+        return {}
+    placeholders = ",".join(["%s"] * len(group_names))
+    rows = _query(
+        conn,
+        "analysis.active_duration",
+        f"""SELECT groupName, MIN(DATE(CREATEDTIME)) first_date,
+                   MAX(DATE(CREATEDTIME)) last_date
+            FROM qx_analysis_result WHERE groupName IN ({placeholders}) GROUP BY groupName""",
+        group_names,
+    )
     return {
-        "total_groups": s["n"],
-        "total_messages": s["msgs"],
-        "total_sale_after": s["sa"],
-        "date_range": date_str or "all",
-        "sentiment": {
-            "customer_good": cg,
-            "customer_bad": cb,
-            "sale_positive": sp,
-            "sale_negative": sn,
-        },
-        "missed_groups": s["miss"],
-        "lc_groups": lc_n,
+        row["groupName"]: (row["last_date"] - row["first_date"]).days
+        for row in rows if row.get("first_date") and row.get("last_date")
     }
 
-def get_groups(date_str=None, page=1, page_size=20, search=None,
-               sort_by="messageToDayCount", sort_order="DESC"):
-    """Get paginated group list with LIMS data"""
-    conn = get_connection()
-    cur = conn.cursor()
-    where = []
-    params = []
-    if date_str:
-        where.append("DATE(a.CREATEDTIME) = %s")
-        params.append(date_str)
-    if search:
-        where.append("a.groupName LIKE %s")
-        params.append(f"%{search}%")
-    ws = ("WHERE " + " AND ".join(where)) if where else ""
-    allowed = {"messageToDayCount", "saleAfterCount", "id", "CREATEDTIME", "groupName"}
-    if sort_by not in allowed:
-        sort_by = "messageToDayCount"
-    if sort_order.upper() not in ("ASC", "DESC"):
-        sort_order = "DESC"
-    cur.execute(f"SELECT COUNT(*) as total FROM qx_analysis_result a {ws}", params)
-    total = cur.fetchone()["total"]
-    offset = (page - 1) * page_size
-    cur.execute(
-        "SELECT a.id, a.groupName, a.member, a.messageToDayCount, "
-        "a.saleAfterCount, a.isMissedMessage, a.customerEmotionAnalysis, "
-        "a.saleEmotionAnalysis, a.highFrequencyWords, a.CREATEDTIME "
-        "FROM qx_analysis_result a " + ws
-        + " ORDER BY a." + sort_by + " " + sort_order + " LIMIT %s OFFSET %s",
-        params + [page_size, offset])
-    gl_map = _build_group_lims_map()
-    items = []
-    for row in cur.fetchall():
-        gname = row["groupName"]
-        lims = gl_map.get(gname, {})
-        items.append({
-            "id": row["id"],
-            "group_name": gname,
-            "member_count": len(row["member"].split(",")) if row["member"] else 0,
-            "members": row["member"],
-            "message_count": row["messageToDayCount"],
-            "sale_after_count": row["saleAfterCount"],
-            "has_missed": row["isMissedMessage"] == "1",
-            "project_codes": get_project_codes(gname),
-            "customer_emotion": parse_emotion_field(row["customerEmotionAnalysis"]),
-            "sale_emotion": parse_emotion_field(row["saleEmotionAnalysis"]),
-            "high_freq_words": parse_high_freq(row["highFrequencyWords"])[:5],
-            "created_time": str(row["CREATEDTIME"]) if row["CREATEDTIME"] else None,
-            "lims": {
-                "org_names": lims.get("org_names", []),
-                "after_salers": lims.get("after_salers", []),
-            },
+
+def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str, dict]:
+    groups: Dict[str, dict] = {}
+    for row in rows:
+        name = row["groupName"]
+        item = groups.setdefault(name, {
+            "group_name": name, "messages": 0, "dates": set(), "missed_days": 0,
+            "customer_good": 0, "customer_bad": 0, "employee_positive": 0,
+            "employee_negative": 0, "high_freq": Counter(), "rows": [],
+            "dimension": dimensions.get(name, {}),
         })
+        item["messages"] += int(row.get("messageToDayCount") or 0)
+        item["dates"].add(str(row.get("CREATEDTIME"))[:10])
+        item["missed_days"] += 1 if str(row.get("isMissedMessage")) == "1" else 0
+        customer = parse_emotion_field(row.get("customerEmotionAnalysis"))
+        employee = parse_emotion_field(row.get("saleEmotionAnalysis"))
+        item["customer_good"] += _emotion_total(customer, ("好评", "正向", "满意"))
+        item["customer_bad"] += _emotion_total(customer, ("差评", "负向", "不满"))
+        item["employee_positive"] += _emotion_total(employee, ("积极", "正向"))
+        item["employee_negative"] += _emotion_total(employee, ("恶劣", "负向", "消极"))
+        for word in parse_high_freq(row.get("highFrequencyWords")):
+            item["high_freq"][word["word"]] += word["count"]
+        item["rows"].append(row)
+    return groups
+
+
+def _ratio(value: int, total: int) -> float:
+    return round(value / total * 100, 1) if total else 0.0
+
+
+def _counter_items(counter: Counter, label: str = "name") -> List[dict]:
+    total = sum(counter.values())
+    return [
+        {label: name, "count": count, "percentage": _ratio(count, total)}
+        for name, count in counter.most_common()
+    ]
+
+
+def _dimension_matches(
+    dimension: dict,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> bool:
+    projects = dimension.get("projects", [])
+    return not (
+        (region and region not in dimension.get("regions", []))
+        or (aftersaler and aftersaler not in dimension.get("aftersalers", []))
+        or (category and not any(project.get("category_l1") == category for project in projects))
+        or (key_account and not any(project.get("key_account") == key_account for project in projects))
+    )
+
+
+def _build_overview(
+    start: date,
+    end: date,
+    period: str,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> dict:
+    with database("dashboard.overview") as conn:
+        rows, raw_count = _latest_rows(conn, start, end)
+        dimensions, quality = _load_dimensions(conn, rows)
+        filter_options = {
+            "regions": sorted({value for dim in dimensions.values() for value in dim.get("regions", [])}),
+            "aftersalers": sorted({value for dim in dimensions.values() for value in dim.get("aftersalers", [])}),
+            "categories": sorted({p.get("category_l1") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("category_l1")}),
+            "key_accounts": sorted({p.get("key_account") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("key_account")}),
+        }
+        allowed_groups = set()
+        for group_name, dim in dimensions.items():
+            if _dimension_matches(dim, region, aftersaler, category, key_account):
+                allowed_groups.add(group_name)
+        if region or aftersaler or category or key_account:
+            rows = [row for row in rows if row["groupName"] in allowed_groups]
+            dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
+        groups = _group_aggregates(rows, dimensions)
+        durations = _active_durations(conn, list(groups))
+
+    total_groups = len(groups)
+    total_messages = sum(item["messages"] for item in groups.values())
+    missed_groups = sum(1 for item in groups.values() if item["missed_days"])
+    daily: Dict[str, dict] = defaultdict(lambda: {"messages": 0, "groups": set(), "missed": 0})
+    customer_good = customer_bad = employee_positive = employee_negative = 0
+    words = Counter()
+    regions = Counter()
+    region_messages = Counter()
+    aftersalers = Counter()
+    tentative_aftersalers = Counter()
+    categories = Counter()
+    product_tree = defaultdict(lambda: defaultdict(Counter))
+    region_sales = defaultdict(Counter)
+    region_after = defaultdict(Counter)
+    region_product = defaultdict(Counter)
+    key_accounts: Dict[str, dict] = {}
+
+    for row in rows:
+        day = str(row.get("CREATEDTIME"))[:10]
+        daily[day]["messages"] += int(row.get("messageToDayCount") or 0)
+        daily[day]["groups"].add(row["groupName"])
+        daily[day]["missed"] += 1 if str(row.get("isMissedMessage")) == "1" else 0
+
+    for group_name, item in groups.items():
+        customer_good += item["customer_good"]
+        customer_bad += item["customer_bad"]
+        employee_positive += item["employee_positive"]
+        employee_negative += item["employee_negative"]
+        words.update(item["high_freq"])
+        dim = item["dimension"]
+        for person in dim.get("aftersalers", []):
+            aftersalers[person] += 1
+        for person in dim.get("tentative_aftersalers", []):
+            tentative_aftersalers[person] += 1
+        group_regions = set(dim.get("regions", [])) or {"未关联区域"}
+        for region in group_regions:
+            regions[region] += 1
+            region_messages[region] += item["messages"]
+        seen_pairs = set()
+        for project in dim.get("projects", []):
+            region = project.get("region") or "未关联区域"
+            category = project.get("category_l1") or "未分类"
+            pair = (project.get("project_code"), region, category)
+            if pair not in seen_pairs:
+                categories[category] += 1
+                region_product[region][category] += 1
+                level2 = project.get("category_l2") or "未细分"
+                level3 = project.get("category_l3") or "未细分"
+                product_tree[category][level2][level3] += 1
+                seen_pairs.add(pair)
+            sales = project.get("sales_person") or "未分配销售"
+            region_sales[region][sales] += 1
+            for after in dim.get("aftersalers", []) or ["未确认售后"]:
+                region_after[region][after] += 1
+            key = project.get("key_account")
+            if key:
+                account = key_accounts.setdefault(key, {"key_account": key, "projects": set(), "customers": set(), "aftersalers": set()})
+                account["projects"].add(project.get("project_code"))
+                if project.get("customer_name"):
+                    account["customers"].add(project["customer_name"])
+                account["aftersalers"].update(dim.get("aftersalers", []))
+
+    duration_defs = [
+        ("≤7天", "极短期咨询", 0, 7), ("8-30天", "短期服务", 8, 30),
+        ("1-3个月", "常规项目周期", 31, 90), ("3-6个月", "中长期项目", 91, 180),
+        ("6-12个月", "长期服务", 181, 365), (">12个月", "超长期合作", 366, 10**9),
+    ]
+    duration_items = []
+    for range_name, label, low, high in duration_defs:
+        count = sum(1 for value in durations.values() if low <= value <= high)
+        duration_items.append({"range": range_name, "label": label, "count": count, "percentage": _ratio(count, len(durations))})
+
+    total_region_groups = sum(regions.values())
+    region_items = []
+    for region, count in regions.most_common():
+        region_items.append({
+            "region": region, "group_count": count,
+            "message_count": region_messages[region],
+            "percentage": _ratio(count, total_region_groups),
+        })
+
+    top5_coverage = _ratio(sum(x[1] for x in regions.most_common(5)), total_region_groups)
+    account_items = []
+    for value in key_accounts.values():
+        account_items.append({
+            "key_account": value["key_account"],
+            "project_count": len(value["projects"]),
+            "customer_count": len(value["customers"]),
+            "aftersalers": sorted(value["aftersalers"]),
+        })
+    account_items.sort(key=lambda value: (-value["project_count"], value["key_account"]))
+    product_hierarchy = []
+    for level1, level2_map in product_tree.items():
+        children = []
+        for level2, level3_counter in level2_map.items():
+            children.append({
+                "name": level2,
+                "count": sum(level3_counter.values()),
+                "children": [
+                    {"name": name, "count": count}
+                    for name, count in level3_counter.most_common()
+                ],
+            })
+        children.sort(key=lambda value: (-value["count"], value["name"]))
+        product_hierarchy.append({
+            "name": level1,
+            "count": sum(value["count"] for value in children),
+            "children": children,
+        })
+    product_hierarchy.sort(key=lambda value: (-value["count"], value["name"]))
+
+    matched_codes = quality["matched_project_codes"]
+    project_codes = quality["project_codes"]
+    matched_products = quality["matched_products"]
+    product_projects = quality["product_projects"]
+    confirmed_after = quality["groups_with_confirmed_aftersaler"]
     return {
+        "meta": {
+            "period": period, "start_date": start.isoformat(), "end_date": end.isoformat(),
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "source_min_date": min((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
+            "source_max_date": max((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
+            "filters": {"region": region, "aftersaler": aftersaler, "category": category, "key_account": key_account},
+            "filter_options": filter_options,
+        },
+        "summary": {
+            "total_groups": total_groups, "total_messages": total_messages,
+            "project_groups": sum(1 for item in groups.values() if item["dimension"].get("codes")),
+            "regions": len([name for name in regions if name != "未关联区域"]),
+            "confirmed_aftersalers": len(aftersalers), "product_categories": len(categories),
+            "key_accounts": len(key_accounts),
+            "short_active_ratio": _ratio(sum(1 for value in durations.values() if value <= 30), len(durations)),
+        },
+        "service_quality": {
+            "unanswered": {"total_groups": total_groups, "missed_groups": missed_groups, "answered_groups": total_groups - missed_groups, "missed_rate": _ratio(missed_groups, total_groups)},
+            "sentiment": {"customer_good": customer_good, "customer_bad": customer_bad, "employee_positive": employee_positive, "employee_negative": employee_negative},
+        },
+        "communication": {
+            "trend": [{"date": day, "messages": value["messages"], "groups": len(value["groups"]), "missed": value["missed"]} for day, value in sorted(daily.items())],
+            "high_frequency": [{"word": word, "count": count} for word, count in words.most_common(20)],
+            "active_duration": duration_items,
+        },
+        "business": {
+            "aftersalers": _counter_items(aftersalers),
+            "tentative_aftersalers": _counter_items(tentative_aftersalers),
+            "regions": region_items, "top5_coverage": top5_coverage,
+            "product_categories": _counter_items(categories, "category"),
+            "product_hierarchy": product_hierarchy,
+            "key_accounts": account_items,
+        },
+        "cross_analysis": {
+            "region_sales": [{"region": region, "items": _counter_items(counter)} for region, counter in sorted(region_sales.items())],
+            "region_after": [{"region": region, "items": _counter_items(counter)} for region, counter in sorted(region_after.items())],
+            "region_product": [{"region": region, "items": _counter_items(counter, "category")} for region, counter in sorted(region_product.items())],
+        },
+        "data_quality": {
+            "raw_rows": raw_count, "deduplicated_rows": len(rows),
+            "duplicate_rows_removed": max(0, raw_count - len(rows)),
+            "project_codes": project_codes, "matched_project_codes": matched_codes,
+            "project_match_rate": _ratio(matched_codes, project_codes),
+            "product_records": product_projects, "matched_products": matched_products,
+            "product_match_rate": _ratio(matched_products, product_projects),
+            "groups_with_confirmed_aftersaler": confirmed_after,
+            "aftersaler_confirmation_rate": _ratio(confirmed_after, total_groups),
+            "note": "分析明细来自数据库保存文本，不是未经处理的原始聊天记录。",
+        },
+    }
+
+
+def get_overview(
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    force_refresh: bool = False,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> dict:
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    key = f"{start}:{end}:{normalized_period}:{region}:{aftersaler}:{category}:{key_account}"
+    now = time.time()
+    with _cache_lock:
+        cached = _cache.get(key)
+        if not force_refresh and cached and now - cached[0] < CACHE_TTL_SECONDS:
+            result = copy.deepcopy(cached[1])
+            result["meta"]["cache"] = "hit"
+            return result
+    try:
+        result = _build_overview(
+            start, end, normalized_period,
+            region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+        )
+        result["meta"]["cache"] = "miss"
+        result["meta"]["stale"] = False
+        with _cache_lock:
+            _cache[key] = (now, copy.deepcopy(result))
+            _last_success[key] = copy.deepcopy(result)
+        return result
+    except Exception as exc:
+        logger.exception("dashboard.overview.error key={} error={}", key, exc)
+        with _cache_lock:
+            stale = _last_success.get(key)
+        if stale:
+            result = copy.deepcopy(stale)
+            result["meta"]["stale"] = True
+            result["meta"]["stale_reason"] = type(exc).__name__
+            return result
+        raise
+
+
+def get_evidence(
+    metric: str,
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    keyword: Optional[str] = None,
+    search: Optional[str] = None,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict:
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    with database("dashboard.evidence") as conn:
+        rows, _ = _latest_rows(conn, start, end)
+        dimensions, _ = _load_dimensions(conn, rows)
+    items = []
+    metric = metric.lower()
+    for row in reversed(rows):
+        group_name = row.get("groupName") or ""
+        dim = dimensions.get(group_name, {})
+        if not _dimension_matches(dim, region, aftersaler, category, key_account):
+            continue
+        content = ""
+        matched = False
+        if metric == "unanswered":
+            matched = str(row.get("isMissedMessage")) == "1"
+            content = row.get("missedMessageList") or ""
+        elif metric == "customer_negative":
+            mapping = parse_emotion_field(row.get("customerEmotionAnalysis"))
+            matched = _emotion_total(mapping, ("差评", "负向", "不满")) > 0 or bool(row.get("customerNegativeEmotionInfo"))
+            content = row.get("customerNegativeEmotionInfo") or ""
+        elif metric == "employee_negative":
+            mapping = parse_emotion_field(row.get("saleEmotionAnalysis"))
+            matched = _emotion_total(mapping, ("恶劣", "负向", "消极")) > 0 or bool(row.get("saleNegativeEmotionInfo"))
+            content = row.get("saleNegativeEmotionInfo") or ""
+        elif metric == "highfreq":
+            words = parse_high_freq(row.get("highFrequencyWords"))
+            matched = bool(words) and (not keyword or any(keyword.lower() in value["word"].lower() for value in words))
+            content = row.get("highFrequencyWords") or ""
+        else:
+            raise ValueError("unsupported evidence metric")
+        if not matched:
+            continue
+        if search and search.lower() not in (group_name + " " + str(content) + " " + str(row.get("member") or "")).lower():
+            continue
+        items.append({
+            "id": row.get("id"), "group_name": group_name,
+            "analysis_date": str(row.get("CREATEDTIME"))[:10],
+            "members": parse_members(row.get("member")),
+            "content": content, "core_summary": row.get("coreInfoSummary") or "",
+            "project_codes": dim.get("codes", []), "projects": dim.get("projects", []),
+            "aftersalers": dim.get("aftersalers", []),
+        })
+    total = len(items)
+    start_index = (page - 1) * page_size
+    return {
+        "metric": metric, "period": normalized_period,
+        "start_date": start.isoformat(), "end_date": end.isoformat(),
         "total": total, "page": page, "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size),
-        "items": items,
+        "items": items[start_index:start_index + page_size],
     }
 
-def get_group_detail(group_id: int) -> Optional[dict]:
-    """Get full analysis detail for a single group"""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM qx_analysis_result WHERE id = %s", (group_id,))
-    row = cur.fetchone()
-    if not row:
-        return None
-    missed_list = []
-    if row["missedMessageList"]:
-        missed_list = [m.strip() for m in row["missedMessageList"].split(",") if m.strip()]
-    gname = row["groupName"]
-    lims = _build_group_lims_map().get(gname, {})
-    return {
-        "id": row["id"],
-        "group_name": gname,
-        "member": row["member"],
-        "member_count": len(row["member"].split(",")) if row["member"] else 0,
-        "message_count": row["messageToDayCount"],
-        "sale_after_count": row["saleAfterCount"],
-        "send_detail": parse_send_detail(row["sendMessageDetail"]),
-        "core_summary": row["coreInfoSummary"],
-        "customer_emotion": parse_emotion_field(row["customerEmotionAnalysis"]),
-        "customer_negative_info": row["customerNegativeEmotionInfo"],
-        "sale_emotion": parse_emotion_field(row["saleEmotionAnalysis"]),
-        "sale_negative_info": row["saleNegativeEmotionInfo"],
-        "high_freq_words": parse_high_freq(row["highFrequencyWords"]),
-        "sensitive_words": row["sensitiveWords"],
-        "has_missed": row["isMissedMessage"] == "1",
-        "missed_list": missed_list,
-        "project_codes": get_project_codes(gname),
-        "created_time": str(row["CREATEDTIME"]) if row["CREATEDTIME"] else None,
-        "lims": {
-            "projects": lims.get("projects", []),
-            "org_names": lims.get("org_names", []),
-            "after_salers": lims.get("after_salers", []),
-            "customers": lims.get("customers", []),
-        },
-    }
 
-def get_timeseries(days: int = 30) -> list:
-    """Get time series data for charts"""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT DATE(CREATEDTIME) as date,"
-        "COUNT(*) as group_count,"
-        "COALESCE(SUM(messageToDayCount), 0) as message_count,"
-        "COALESCE(SUM(saleAfterCount), 0) as sale_after_count,"
-        "SUM(CASE WHEN isMissedMessage = '1' THEN 1 ELSE 0 END) as missed_count "
-        "FROM qx_analysis_result "
-        "WHERE CREATEDTIME >= DATE_SUB(NOW(), INTERVAL %s DAY) "
-        "GROUP BY DATE(CREATEDTIME) ORDER BY DATE(CREATEDTIME)",
-        (days,))
-    result = []
-    for row in cur.fetchall():
-        result.append({
-            "date": str(row["date"]),
-            "group_count": row["group_count"],
-            "message_count": row["message_count"],
-            "sale_after_count": row["sale_after_count"],
-            "missed_count": row["missed_count"],
-        })
-    return result
-
-def get_sentiment_timeline(days: int = 30) -> list:
-    """Get sentiment trend over time"""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT DATE(CREATEDTIME) as date, customerEmotionAnalysis, saleEmotionAnalysis "
-        "FROM qx_analysis_result "
-        "WHERE CREATEDTIME >= DATE_SUB(NOW(), INTERVAL %s DAY) ORDER BY CREATEDTIME",
-        (days,))
-    daily = {}
-    for row in cur.fetchall():
-        d = str(row["date"])
-        if d not in daily:
-            daily[d] = {"cust_good": 0, "cust_bad": 0, "sale_pos": 0, "sale_neg": 0}
-        ce = parse_emotion_field(row["customerEmotionAnalysis"])
-        daily[d]["cust_good"] += ce.get(chr(22994)+chr(35780), 0)
-        daily[d]["cust_bad"] += ce.get(chr(24046)+chr(35780), 0)
-        se = parse_emotion_field(row["saleEmotionAnalysis"])
-        daily[d]["sale_pos"] += se.get(chr(31215)+chr(26497)+chr(30340), 0)
-        daily[d]["sale_neg"] += se.get(chr(24577)+chr(24230)+chr(24694)+chr(21133)+chr(30340), 0)
-    return [{"date": d, **daily[d]} for d in sorted(daily.keys())]
-
-
-# ===== M00-M03: Comprehensive Summary with LIMS =====
+# Compatibility helpers for existing callers.
+def get_summary(date_str: Optional[str] = None) -> dict:
+    data = get_overview("custom", date_str, date_str) if date_str else get_overview("year")
+    return {**data["summary"], "date_range": f"{data['meta']['start_date']} ~ {data['meta']['end_date']}", "missed_groups": data["service_quality"]["unanswered"]["missed_groups"]}
 
 
 def get_full_summary() -> dict:
-    """Comprehensive summary with LIMS-derived fields (M00/M03)"""
-    basic = get_summary()
-    gl_map = _build_group_lims_map()
-
-    all_orgs = set()
-    all_after_salers = set()
-    all_customers_ka = set()
-    all_customers_names = set()
-    total_groups_with_lims = 0
-    all_codes = set()
-    for gname, lims in gl_map.items():
-        all_orgs.update(lims.get("org_names", []))
-        all_after_salers.update(lims.get("after_salers", []))
-        all_codes.update(lims.get("codes", []))
-        for c in lims.get("customers", []):
-            if c.startswith("大客户:"):
-                all_customers_ka.add(c)
-            else:
-                all_customers_names.add(c)
-        if lims.get("projects"):
-            total_groups_with_lims += 1
-
-    codes_list = sorted(all_codes)
-    product_category_count = 0
-    if codes_list:
-        projects = _load_projects_by_codes(codes_list)
-        cat1 = set()
-        for proj in projects.values():
-            ps1 = proj.get("PRODUCTBIGSORTONE") or proj.get("productBigSortOne") or ""
-            if ps1:
-                cat1.add(ps1)
-        if not cat1:
-            products = _load_product_main()
-            for proj in projects.values():
-                pname = proj.get("PRODUCTNAME", "")
-                if pname and pname in products:
-                    prod = products[pname]
-                    ps1 = prod.get("PRODUCTBIGSORTONE", "")
-                    if ps1:
-                        cat1.add(ps1)
-        product_category_count = len(cat1)
-
-    short_active_ratio = 0
-    try:
-        from services.qxchat_helper import compute_active_duration
-        ad = compute_active_duration()
-        short_active = 0
-        total_active = 0
-        for b in ad.get("buckets", []):
-            r = b.get("range", "")
-            if r in ("≤7天", "8-30天"):
-                short_active += b.get("count", 0)
-            total_active += b.get("count", 0)
-        short_active_ratio = round(short_active / total_active * 100, 1) if total_active > 0 else 0
-    except Exception:
-        pass
-
-    date_range = basic.get("date_range", "all")
-    try:
-        from services.qxchat_helper import get_time_data
-        td = get_time_data()
-        groups = td.get("groups", {})
-        if groups:
-            first_times = [g["first_time"][:10] for g in groups.values() if g.get("first_time")]
-            last_times = [g["last_time"][:10] for g in groups.values() if g.get("last_time")]
-            if first_times and last_times:
-                date_range = "{} ~ {}".format(min(first_times), max(last_times))
-    except Exception:
-        pass
-
-    return {
-        **basic,
-        "org_count": len(all_orgs),
-        "after_saler_count": len(all_after_salers),
-        "key_account_count": len(all_customers_ka),
-        "customer_count": len(all_customers_names),
-        "groups_with_lims": total_groups_with_lims,
-        "product_category_count": product_category_count,
-        "short_active_ratio": short_active_ratio,
-        "date_range": date_range,
-    }
-
-# ===== M04: Distribution =====
+    return get_summary()
 
 
 def get_after_saler_distribution() -> dict:
-    """M04: Distribution of finalAfterSaler counts"""
-    gl_map = _build_group_lims_map()
-    counter = {}
-    for gname, lims in gl_map.items():
-        for a in lims.get("after_salers", []):
-            counter[a] = counter.get(a, 0) + 1
-    total = sum(counter.values()) or 1
-    items = sorted(
-        [{"name": k, "count": v, "percentage": round(v / total * 100, 1)}
-         for k, v in counter.items()],
-        key=lambda x: -x["count"],
-    )
-    no_sale = len(gl_map) - sum(len(v.get("after_salers", [])) for v in gl_map.values())
-    if no_sale > 0:
-        items.append({"name": "无售后", "count": no_sale,
-                      "percentage": round(no_sale / max(len(gl_map), 1) * 100, 1)})
-    return {"items": items, "total_groups": len(gl_map),
-            "total_with_after_saler": sum(counter.values())}
-
-# ===== M05: Active Duration =====
-
-
-def get_active_duration_distribution() -> dict:
-    """M05: Group active duration - placeholder"""
-    buckets = [
-        {"range": "≤7天", "label": "极短期咨询", "count": 0, "percentage": 0},
-        {"range": "8-30天", "label": "短期服务", "count": 0, "percentage": 0},
-        {"range": "1-3个月", "label": "常规项目周期", "count": 0, "percentage": 0},
-        {"range": "3-6个月", "label": "中长期项目", "count": 0, "percentage": 0},
-        {"range": "6-12个月", "label": "长期服务", "count": 0, "percentage": 0},
-        {"range": ">12个月", "label": "超长期合作", "count": 0, "percentage": 0},
-    ]
-    return {
-        "buckets": buckets,
-        "note": "需要原始消息时间戳",
-        "total_groups": 0,
-    }
-
-
-# ===== M06: Product Category =====
+    data = get_overview("year")
+    return {"items": data["business"]["aftersalers"], "total_groups": data["summary"]["total_groups"]}
 
 
 def get_product_category_hierarchy() -> dict:
-    """M06: Product category hierarchy (3 levels: big-sort-one/two/three)"""
-    gl_map = _build_group_lims_map()
-    all_codes = set()
-    for gname, lims in gl_map.items():
-        all_codes.update(lims.get("codes", []))
-    codes_list = sorted(all_codes)
-    if not codes_list:
-        return {"categories": [], "note": "无项目编码可关联产品分类"}
-    projects = _load_projects_by_codes(codes_list)
-
-    def _get_field(proj, *field_names):
-        for fn in field_names:
-            val = proj.get(fn) or ""
-            if val:
-                return val
-        return ""
-
-    def _get_from_product(proj, field_name):
-        products = _load_product_main()
-        pname = proj.get("PRODUCTNAME", "")
-        if pname and pname in products:
-            return products[pname].get(field_name, "") or ""
-        return ""
-
-    hierarchy = {}
-    total_projects = 0
-    for proj in projects.values():
-        l1 = _get_field(proj, "PRODUCTBIGSORTONE", "productBigSortOne")
-        if not l1:
-            l1 = _get_from_product(proj, "PRODUCTBIGSORTONE")
-        l2 = _get_field(proj, "PRODUCTBIGSORTTWO", "productBigSortTwo")
-        if not l2:
-            l2 = _get_from_product(proj, "PRODUCTBIGSORTTWO")
-        l3 = _get_field(proj, "PRODUCTBIGSORTTHREE", "productBigSortThree")
-        if not l3:
-            l3 = _get_from_product(proj, "PRODUCTBIGSORTTHREE")
-
-        if not l1:
-            l1 = "未分类"
-        if not l2:
-            l2 = "其他"
-        if not l3:
-            l3 = "其他"
-
-        total_projects += 1
-        if l1 not in hierarchy:
-            hierarchy[l1] = {"level2": {}, "count": 0}
-        hierarchy[l1]["count"] += 1
-        if l2 not in hierarchy[l1]["level2"]:
-            hierarchy[l1]["level2"][l2] = {"level3": {}, "count": 0}
-        hierarchy[l1]["level2"][l2]["count"] += 1
-        hierarchy[l1]["level2"][l2]["level3"][l3] = hierarchy[l1]["level2"][l2]["level3"].get(l3, 0) + 1
-
-    total = sum(v["count"] for v in hierarchy.values()) or 1
-    categories = []
-    for l1_name in sorted(hierarchy.keys(), key=lambda k: -hierarchy[k]["count"]):
-        l1_data = hierarchy[l1_name]
-        l2_list = []
-        for l2_name in sorted(l1_data["level2"].keys(), key=lambda k: -l1_data["level2"][k]["count"]):
-            l2_data = l1_data["level2"][l2_name]
-            l3_list = [{"level3": l3_name, "count": l3_count}
-                       for l3_name, l3_count in sorted(l2_data["level3"].items(), key=lambda x: -x[1])]
-            l2_list.append({
-                "level2": l2_name,
-                "count": l2_data["count"],
-                "percentage": round(l2_data["count"] / total * 100, 1),
-                "children": l3_list,
-            })
-        categories.append({
-            "level1": l1_name,
-            "count": l1_data["count"],
-            "percentage": round(l1_data["count"] / total * 100, 1),
-            "children": l2_list,
-        })
-
-    return {"categories": categories, "total_projects": total_projects}
-
-# ===== M07: Key Account Hierarchy =====
+    data = get_overview("year")
+    return {
+        "categories": data["business"]["product_hierarchy"],
+        "total_projects": data["data_quality"]["product_records"],
+    }
 
 
 def get_key_account_hierarchy() -> dict:
-    """M07: keyAccount -> customerName -> finalAfterSaler"""
-    gl_map = _build_group_lims_map()
-    all_codes = set()
-    for gname, lims in gl_map.items():
-        all_codes.update(lims.get("codes", []))
-    projects = _load_projects_by_codes(sorted(all_codes))
-    customer_ids = set()
-    for proj in projects.values():
-        cid = proj.get("CUSTOMERID") or proj.get("CUSTOMERNO") or ""
-        if cid:
-            customer_ids.add(cid)
-    customers = _load_customers_by_ids(list(customer_ids))
-    kas = {}
-    for proj in projects.values():
-        ka = ""
-        cname = proj.get("CUSTOMERNAME", "")
-        cid = proj.get("CUSTOMERID") or proj.get("CUSTOMERNO") or ""
-        if cid and cid in customers:
-            ka = customers[cid].get("keyAccount", "") or ""
-        derived = _compute_derived_fields(proj)
-        fas = derived["finalAfterSaler"] or derived["afterSaler"] or "无售后"
-        if ka:
-            if ka not in kas:
-                kas[ka] = {"customers": {}, "total_projects": 0}
-            kas[ka]["total_projects"] += 1
-            cname = cname or "未知客户"
-            if cname not in kas[ka]["customers"]:
-                kas[ka]["customers"][cname] = set()
-            kas[ka]["customers"][cname].add(fas)
-    hierarchy = []
-    for ka_name in sorted(kas.keys()):
-        ka = kas[ka_name]
-        clist = [{"customer_name": c, "after_salers": sorted(ka["customers"][c])}
-                 for c in sorted(ka["customers"].keys())]
-        hierarchy.append({"key_account": ka_name, "customers": clist,
-                          "total_projects": ka["total_projects"]})
-    return {"hierarchy": hierarchy, "total_key_accounts": len(hierarchy)}
-
-# ===== M08: Org Distribution =====
+    data = get_overview("year")
+    return {"hierarchy": data["business"]["key_accounts"], "total_key_accounts": data["summary"]["key_accounts"]}
 
 
 def get_org_distribution() -> dict:
-    """M08: orgName (sales region) distribution"""
-    gl_map = _build_group_lims_map()
-    counter = {}
-    for gname, lims in gl_map.items():
-        for org in lims.get("org_names", []):
-            counter[org] = counter.get(org, 0) + 1
-    total = sum(counter.values()) or 1
-    items = sorted(
-        [{"region": k, "count": v, "percentage": round(v / total * 100, 1)}
-         for k, v in counter.items()],
-        key=lambda x: -x["count"],
-    )
-    top5 = sum(item["count"] for item in items[:5])
-    return {"items": items, "total_regions": len(counter),
-            "total_groups_with_org": total,
-            "top5_coverage": round(top5 / total * 100, 1) if total else 0}
-
-# ===== M09: Org x SalesPerson =====
-
-
-def get_org_salesperson() -> dict:
-    """M09: orgName x salesPerson, top3 per org"""
-    gl_map = _build_group_lims_map()
-    cross = {}
-    for gname, lims in gl_map.items():
-        for proj in lims.get("projects", []):
-            org = proj.get("orgName", "未知区域")
-            sp = proj.get("salesPerson") or proj.get("afterSaler") or "无销售员"
-            if org not in cross:
-                cross[org] = {}
-            cross[org][sp] = cross[org].get(sp, 0) + 1
-    items = []
-    for org in sorted(cross.keys()):
-        persons = sorted(
-            [{"name": p, "count": c} for p, c in cross[org].items()],
-            key=lambda x: -x["count"],
-        )
-        items.append({"org_name": org, "total_groups": sum(p["count"] for p in persons),
-                      "top3": persons[:3]})
-    return {"items": items, "total_orgs": len(cross)}
-
-# ===== M10: Org x ProductCategory =====
-
-
-def get_org_product_category() -> dict:
-    """M10: orgName x productBigSortOne cross"""
-    gl_map = _build_group_lims_map()
-    all_codes = set()
-    for gname, lims in gl_map.items():
-        all_codes.update(lims.get("codes", []))
-    projects = _load_projects_by_codes(sorted(all_codes))
-    cross = {}
-    for proj in projects.values():
-        org = proj.get("CREATEDBYORGNAME") or "未知区域"
-        ps1 = proj.get("PRODUCTBIGSORTONE") or proj.get("productBigSortOne") or "未分类"
-        if org not in cross:
-            cross[org] = {}
-        cross[org][ps1] = cross[org].get(ps1, 0) + 1
-    items = []
-    for org in sorted(cross.keys()):
-        cats = sorted([{"category": c, "count": n} for c, n in cross[org].items()],
-                      key=lambda x: -x["count"])
-        items.append({"org_name": org, "total_groups": sum(c["count"] for c in cats),
-                      "categories": cats})
-    return {"items": items, "total_orgs": len(cross)}
-
-# ===== M11: Org x AfterSaler =====
-
-
-def get_org_after_saler() -> dict:
-    """M11: orgName x finalAfterSaler, top3 per org"""
-    gl_map = _build_group_lims_map()
-    cross = {}
-    for gname, lims in gl_map.items():
-        orgs = lims.get("org_names", ["未知区域"])
-        for org in orgs:
-            if org not in cross:
-                cross[org] = {}
-            as_set = lims.get("after_salers", [])
-            if as_set:
-                for a in as_set:
-                    cross[org][a] = cross[org].get(a, 0) + 1
-            else:
-                cross[org]["无售后"] = cross[org].get("无售后", 0) + 1
-    items = []
-    for org in sorted(cross.keys()):
-        persons = sorted([{"name": p, "count": c} for p, c in cross[org].items()],
-                         key=lambda x: -x["count"])
-        items.append({"org_name": org, "total_groups": sum(p["count"] for p in persons),
-                      "top3": persons[:3]})
-    return {"items": items, "total_orgs": len(cross)}
-
-
-# ===== M12: Message Trend =====
-
-
-def get_message_trend(days: int = 30) -> dict:
-    """M12: Message volume trend"""
-    return {"trend": get_timeseries(days), "total_days": days}
-
-# ===== M13: Time Distribution =====
-
-
-def get_time_distribution(days: int = 30) -> dict:
-    """M13: Message time distribution"""
-    return {"note": "需要原始消息时间戳，当前数据库不可用"}
-
-# ===== M14: Sentiment Summary =====
+    data = get_overview("year")
+    return {"items": data["business"]["regions"], "total_regions": data["summary"]["regions"], "top5_coverage": data["business"]["top5_coverage"]}
 
 
 def get_sentiment_analysis_summary() -> dict:
-    """M14: Sentiment analysis summary"""
-    st = get_sentiment_timeline(365)
-    total_cg = sum(d["cust_good"] for d in st) if st else 0
-    total_cb = sum(d["cust_bad"] for d in st) if st else 0
-    total_sp = sum(d["sale_pos"] for d in st) if st else 0
-    total_sn = sum(d["sale_neg"] for d in st) if st else 0
-    return {
-        "customer_good": total_cg,
-        "customer_bad": total_cb,
-        "sale_positive": total_sp,
-        "sale_negative": total_sn,
-        "timeline": st,
-    }
-
-# ===== M15: High Frequency Words =====
+    return get_overview("year")["service_quality"]["sentiment"]
 
 
 def get_high_freq_summary(limit: int = 20) -> dict:
-    """M15: High frequency words across all groups"""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT highFrequencyWords FROM qx_analysis_result WHERE highFrequencyWords IS NOT NULL")
-    wc = {}
-    for row in cur.fetchall():
-        for w in parse_high_freq(row["highFrequencyWords"]):
-            wc[w["word"]] = wc.get(w["word"], 0) + w["count"]
-    top = sorted([{"word": k, "count": v} for k, v in wc.items()], key=lambda x: -x["count"])[:limit]
-    return {"top_words": top, "total_unique_words": len(wc)}
-
-# ===== M16: Unanswered Summary =====
+    values = get_overview("year")["communication"]["high_frequency"][:limit]
+    return {"top_words": values, "total_unique_words": len(values)}
 
 
 def get_unanswered_summary() -> dict:
-    """M16: Unanswered/missed message summary"""
-    conn = get_connection()
-    cur = conn.cursor()
-    q = "SELECT COUNT(*) as total,"
-    q += " SUM(CASE WHEN isMissedMessage='1' THEN 1 ELSE 0 END) as missed,"
-    q += " SUM(CASE WHEN isMissedMessage='0' THEN 1 ELSE 0 END) as answered"
-    q += " FROM qx_analysis_result"
-    cur.execute(q)
-    row = cur.fetchone()
-    t = row["total"] or 1
-    m = row["missed"] or 0
-    return {
-        "total_groups": t,
-        "missed_groups": m,
-        "answered_groups": row["answered"] or 0,
-        "missed_rate": round(m / t * 100, 1),
-        "risk_levels": {"high": m, "low": row["answered"] or 0},
-    }
+    return get_overview("year")["service_quality"]["unanswered"]
