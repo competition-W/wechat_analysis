@@ -1199,6 +1199,159 @@ def get_high_freq_summary(limit: int = 20) -> dict:
     return {"top_words": values, "total_unique_words": len(values)}
 
 
+
+
+def get_verification_stats(
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict:
+    """?????????????????????????????"""
+    from datetime import date, datetime, timedelta
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    end_str = (end + timedelta(days=1)).isoformat()
+    start_str = start.isoformat()
+
+    with database("dashboard.verify") as conn:
+        # V1: ?????qx_analysis_result ???????????
+        raw_count = _query(conn, "verify.raw_count",
+            "SELECT COUNT(*) c FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["c"]
+
+        # V2: ?????? (groupName, ??) ?????? dedup ???
+        dedup_count = _query(conn, "verify.dedup",
+            "SELECT COUNT(*) c FROM (SELECT DISTINCT groupName, DATE(CREATEDTIME) d FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s) t",
+            (start_str, end_str))[0]["c"]
+
+        # V3: ??????????????
+        unique_groups_raw = _query(conn, "verify.unique_groups",
+            "SELECT COUNT(DISTINCT groupName) c FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["c"]
+
+        # V4: ????
+        msg_total = _query(conn, "verify.msg_total",
+            "SELECT COALESCE(SUM(messageToDayCount),0) s FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["s"]
+
+        # V5: ?????????? isMissedMessage=1 ???
+        missed_groups = _query(conn, "verify.missed",
+            "SELECT COUNT(DISTINCT groupName) c FROM qx_analysis_result WHERE isMissedMessage=1 AND CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["c"]
+
+        # V6: ?????????? - ?????????????
+        all_groups = _query(conn, "verify.project_codes",
+            "SELECT DISTINCT groupName FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))
+
+        # V7: 通过 Python 提取项目号后验证区域和售后关联
+        all_codes = set()
+        code_to_group = {}
+        _pv_re = __import__("re").compile(r"LC-[A-Z]+\\d+")
+        for g in all_groups:
+            gname = g.get("groupName") or ""
+            codes = _pv_re.findall(gname)
+            for code in codes:
+                all_codes.add(code)
+                code_to_group.setdefault(code, []).append(gname)
+        linked_region_groups = 0
+        linked_after_groups = 0
+        if all_codes:
+            ph = ",".join(["%s"] * len(all_codes))
+            codes_list = list(all_codes)
+            proj_rows = _query(conn, "verify.project_lookup",
+                "SELECT PROJECTCODE, CREATEDBYORGNAME, AFTERSALER FROM t_project WHERE PROJECTCODE IN (" + ph + ")", codes_list)
+            region_set, after_set = set(), set()
+            for row in proj_rows:
+                code = str(row.get("PROJECTCODE") or "").upper()
+                if str(row.get("CREATEDBYORGNAME") or "").strip():
+                    for gn in code_to_group.get(code, []):
+                        region_set.add(gn)
+                if str(row.get("AFTERSALER") or "").strip():
+                    for gn in code_to_group.get(code, []):
+                        after_set.add(gn)
+            inc_rows = _query(conn, "verify.income_lookup",
+                "SELECT projectCode, afterSaler FROM t_income WHERE projectCode IN (" + ph + ")", codes_list)
+            for row in inc_rows:
+                code = str(row.get("projectCode") or "").upper()
+                if str(row.get("afterSaler") or "").strip():
+                    for gn in code_to_group.get(code, []):
+                        after_set.add(gn)
+            linked_region_groups = len(region_set)
+            linked_after_groups = len(after_set)
+
+        # V8: (已有 V7 中计算)
+
+        # V9: ???? ? ?????????????
+        group_project_samples = []
+        import re
+        project_re = re.compile(r"LC-[A-Z]+\d+")
+        for g in all_groups[:200]:
+            codes = project_re.findall(g["groupName"] or "")
+            group_project_samples.append({
+                "group_name": g["groupName"],
+                "extracted_codes": codes,
+                "has_codes": len(codes) > 0,
+            })
+
+        codes_linked = sum(1 for g in group_project_samples if g["has_codes"])
+        total_samples = len(group_project_samples)
+        code_match_rate = round(codes_linked / total_samples * 100, 1) if total_samples else 0
+
+        # V10: t_project ??
+        t_project_total = _query(conn, "verify.t_project",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%'")[0]["c"]
+        t_project_with_org = _query(conn, "verify.t_project_org",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND CREATEDBYORGNAME IS NOT NULL AND CREATEDBYORGNAME != ''")[0]["c"]
+        t_project_with_after = _query(conn, "verify.t_project_after",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND AFTERSALER IS NOT NULL AND AFTERSALER != ''")[0]["c"]
+        t_project_with_key = _query(conn, "verify.t_project_key",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND KEYACCOUNT IS NOT NULL AND KEYACCOUNT != '' AND KEYACCOUNT != '0'")[0]["c"]
+
+        # V11: t_income ??
+        t_income_total = _query(conn, "verify.t_income",
+            "SELECT COUNT(DISTINCT projectCode) c FROM t_income WHERE projectCode LIKE 'LC-%%'")[0]["c"]
+        t_income_with_org = _query(conn, "verify.t_income_org",
+            "SELECT COUNT(DISTINCT projectCode) c FROM t_income WHERE projectCode LIKE 'LC-%%' AND orgName IS NOT NULL AND orgName != ''")[0]["c"]
+        t_income_with_after = _query(conn, "verify.t_income_after",
+            "SELECT COUNT(DISTINCT projectCode) c FROM t_income WHERE projectCode LIKE 'LC-%%' AND afterSaler IS NOT NULL AND afterSaler != ''")[0]["c"]
+
+        # V12: t_customer ??????
+        t_customer_key = _query(conn, "verify.t_customer_key",
+            "SELECT COUNT(*) c FROM t_customer WHERE KEYACCOUNT IS NOT NULL AND KEYACCOUNT != '' AND KEYACCOUNT != '0' AND KEYACCOUNT != 'false' AND KEYACCOUNT != '?'")[0]["c"]
+
+    return {
+        "period": {"start": start_str[:10], "end": end.isoformat(), "normalized": normalized_period},
+        "qx_analysis_result": {
+            "????": raw_count,
+            "????(????)": dedup_count,
+            "?????": unique_groups_raw,
+            "????": msg_total,
+            "????": missed_groups,
+            "????????": {"????": codes_linked, "???": total_samples, "???": code_match_rate},
+        },
+        "t_project_region_coverage": {
+            "????": t_project_total,
+            "???": t_project_with_org,
+            "?????": round(t_project_with_org / t_project_total * 100, 1) if t_project_total else 0,
+            "???": t_project_with_after,
+            "?????": round(t_project_with_after / t_project_total * 100, 1) if t_project_total else 0,
+            "?????": t_project_with_key,
+        },
+        "t_income_coverage": {
+            "????": t_income_total,
+            "???(orgName)": t_income_with_org,
+            "?????": round(t_income_with_org / t_income_total * 100, 1) if t_income_total else 0,
+            "???(afterSaler)": t_income_with_after,
+            "?????": round(t_income_with_after / t_income_total * 100, 1) if t_income_total else 0,
+        },
+        "t_customer": {
+            "?????": t_customer_key,
+        },
+        "group_samples": group_project_samples[:30],
+        "note": "?????? _build_overview ???????????????? SQL ??????????????",
+    }
+
+
 def get_unanswered_summary() -> dict:
     return get_overview("year")["service_quality"]["unanswered"]
 

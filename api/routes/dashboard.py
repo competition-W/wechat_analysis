@@ -157,6 +157,15 @@ def high_freq(limit: int = Query(20, ge=5, le=100)):
     return _success("high_freq", db_dashboard.get_high_freq_summary, limit)
 
 
+@router.get("/verify")
+def verify(
+    period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+):
+    return _success("verify", db_dashboard.get_verification_stats, period=period, start_date=start_date, end_date=end_date)
+
+
 @router.get("/export")
 def export_data(
     period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
