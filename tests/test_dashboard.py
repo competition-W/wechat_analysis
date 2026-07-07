@@ -13,6 +13,12 @@ class DashboardParsingTests(unittest.TestCase):
             ["LC-P2026001", "LC-X99"],
         )
 
+    def test_extracts_project_code_followed_by_chinese_text(self):
+        self.assertEqual(
+            db_dashboard.extract_project_codes("LC-C202604130083项目综合群"),
+            ["LC-C202604130083"],
+        )
+
     def test_parses_count_fields(self):
         self.assertEqual(
             db_dashboard.parse_count_map("好评: 3, 差评：2"),
@@ -95,6 +101,22 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(dimensions["Customer LC-P2026001 support"]["dimension_source"], "lims_unavailable")
         self.assertEqual(quality["matched_project_codes"], 0)
         self.assertEqual(quality["lims_source"], "base_data_api_unavailable")
+
+    def test_project_code_diagnostics_lists_missing_groups_and_unmatched_codes(self):
+        diagnostics = db_dashboard._project_code_diagnostics(
+            ["No project group", "Alpha LC-P2026001", "Beta LC-P404"],
+            {
+                "No project group": {"codes": []},
+                "Alpha LC-P2026001": {"codes": ["LC-P2026001"]},
+                "Beta LC-P404": {"codes": ["LC-P404"]},
+            },
+            {"LC-P2026001": [{"projectCode": "LC-P2026001"}]},
+        )
+
+        self.assertEqual(diagnostics["groups_without_project_code"], ["No project group"])
+        self.assertEqual(diagnostics["unmatched_codes"], ["LC-P404"])
+        self.assertEqual(diagnostics["code_to_groups"]["LC-P404"], ["Beta LC-P404"])
+        self.assertEqual(diagnostics["groups_without_lims_link"], ["Beta LC-P404"])
 
 
 class DashboardCacheTests(unittest.TestCase):
