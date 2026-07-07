@@ -1140,7 +1140,7 @@ def get_evidence(
             continue
         items.append({
             "id": row.get("id"), "group_name": group_name,
-            "analysis_date": str(row.get("CREATEDTIME"))[:10],
+            "analysis_date": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
             "members": parse_members(row.get("member")),
             "content": content, "core_summary": row.get("coreInfoSummary") or "",
             "project_codes": dim.get("codes", []), "projects": dim.get("projects", []),
@@ -1377,6 +1377,7 @@ def get_export_csv(
     meta = data["meta"]
 
     output = io.StringIO()
+    output.write("\ufeff")  # BOM for Excel
     w = csv.writer(output)
     w.writerow(["===== ?????? ====="])
     w.writerow(["????", meta["period"], "????", meta["start_date"], "????", meta["end_date"]])
