@@ -82,6 +82,20 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(dimensions[group_name]["tentative_aftersalers"], [])
         self.assertEqual(quality["groups_with_aftersaler"], 1)
 
+    def test_lims_unavailable_does_not_use_business_table_fallback(self):
+        rows = [{"groupName": "Customer LC-P2026001 support", "member": ""}]
+        with patch.object(
+            db_dashboard,
+            "fetch_lims_base_data",
+            return_value=({}, {"available": False, "requests": 1, "records": 0, "errors": 1}),
+        ):
+            dimensions, quality = db_dashboard._load_dimensions(None, rows)
+
+        self.assertEqual(dimensions["Customer LC-P2026001 support"]["projects"], [])
+        self.assertEqual(dimensions["Customer LC-P2026001 support"]["dimension_source"], "lims_unavailable")
+        self.assertEqual(quality["matched_project_codes"], 0)
+        self.assertEqual(quality["lims_source"], "base_data_api_unavailable")
+
 
 class DashboardCacheTests(unittest.TestCase):
     def setUp(self):
