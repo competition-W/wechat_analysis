@@ -157,6 +157,28 @@ def high_freq(limit: int = Query(20, ge=5, le=100)):
     return _success("high_freq", db_dashboard.get_high_freq_summary, limit)
 
 
+@router.get("/export")
+def export_data(
+    period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    region: str = Query("", max_length=100),
+    aftersaler: str = Query("", max_length=100),
+    category: str = Query("", max_length=100),
+    key_account: str = Query("", max_length=100),
+):
+    from fastapi.responses import PlainTextResponse
+    csv_content = db_dashboard.get_export_csv(
+        period=period, start_date=start_date, end_date=end_date,
+        region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+    )
+    filename = f"dashboard_export_{period}_{start_date or ''}_{end_date or ''}.csv"
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @router.get("/unanswered-summary")
 def unanswered_summary():
     return _success("unanswered_summary", db_dashboard.get_unanswered_summary)
