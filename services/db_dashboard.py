@@ -1305,7 +1305,6 @@ def get_verification_stats(
         t_project_with_after = _query(conn, "verify.t_project_after",
             "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND AFTERSALER IS NOT NULL AND AFTERSALER != ''")[0]["c"]
         t_project_with_key = _query(conn, "verify.t_project_key",
-            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND KEYACCOUNT IS NOT NULL AND KEYACCOUNT != '' AND KEYACCOUNT != '0'")[0]["c"]
 
         # V11: t_income ??
         t_income_total = _query(conn, "verify.t_income",
@@ -1335,7 +1334,7 @@ def get_verification_stats(
             "?????": round(t_project_with_org / t_project_total * 100, 1) if t_project_total else 0,
             "???": t_project_with_after,
             "?????": round(t_project_with_after / t_project_total * 100, 1) if t_project_total else 0,
-            "?????": t_project_with_key,
+        # 有重点客户: KEYACCOUNT only in t_customer, removed from t_project
         },
         "t_income_coverage": {
             "????": t_income_total,
