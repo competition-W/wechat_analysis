@@ -16,7 +16,7 @@ from loguru import logger
 
 
 CACHE_TTL_SECONDS = 300
-PROJECT_CODE_RE = re.compile(r"LC-[A-Z]+\d+\b", re.IGNORECASE)
+PROJECT_CODE_RE = re.compile(r"LC-[A-Z]+\d+(?![A-Z0-9])", re.IGNORECASE)
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_success: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
@@ -356,9 +356,18 @@ def _dimensions_from_lims_api(
 
     requested_codes = sorted({code for codes in group_codes.values() for code in codes})
     matched_codes = sum(1 for code in requested_codes if records_by_code.get(code.upper()))
+    groups_without_project_code = sum(1 for codes in group_codes.values() if not codes)
+    matched_code_set = {code.upper() for code in requested_codes if records_by_code.get(code.upper())}
     quality = {
         "project_codes": len(requested_codes),
         "matched_project_codes": matched_codes,
+        "unmatched_project_codes": len(requested_codes) - matched_codes,
+        "groups_with_project_code": len(group_codes) - groups_without_project_code,
+        "groups_without_project_code": groups_without_project_code,
+        "groups_without_lims_link": sum(
+            1 for codes in group_codes.values()
+            if codes and not any(code.upper() in matched_code_set for code in codes)
+        ),
         "product_projects": product_project_count,
         "matched_products": matched_product_count,
         "groups_with_aftersaler": aftersaler_group_count,
@@ -461,9 +470,14 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
     group_codes = {row["groupName"]: extract_project_codes(row.get("groupName", "")) for row in rows}
     codes = sorted({code for values in group_codes.values() for code in values})
     if not codes:
+        groups_without_project_code = len(group_codes)
         return {name: {"codes": [], "projects": [], "regions": [], "aftersalers": []}
                 for name in group_codes}, {
                     "project_codes": 0, "matched_project_codes": 0,
+                    "unmatched_project_codes": 0,
+                    "groups_with_project_code": 0,
+                    "groups_without_project_code": groups_without_project_code,
+                    "groups_without_lims_link": 0,
                     "product_projects": 0, "matched_products": 0,
                     "groups_with_aftersaler": 0,
                     "groups_with_confirmed_aftersaler": 0,
@@ -502,6 +516,10 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
     quality = {
         "project_codes": len(codes),
         "matched_project_codes": 0,
+        "unmatched_project_codes": len(codes),
+        "groups_with_project_code": sum(1 for codes_for_group in group_codes.values() if codes_for_group),
+        "groups_without_project_code": sum(1 for codes_for_group in group_codes.values() if not codes_for_group),
+        "groups_without_lims_link": sum(1 for codes_for_group in group_codes.values() if codes_for_group),
         "product_projects": 0,
         "matched_products": 0,
         "groups_with_aftersaler": 0,
@@ -866,6 +884,10 @@ def _build_overview(
             "raw_rows": raw_count, "deduplicated_rows": len(rows),
             "duplicate_rows_removed": max(0, raw_count - len(rows)),
             "project_codes": project_codes, "matched_project_codes": matched_codes,
+            "unmatched_project_codes": quality.get("unmatched_project_codes", max(0, project_codes - matched_codes)),
+            "groups_with_project_code": quality.get("groups_with_project_code", sum(1 for item in groups.values() if item["dimension"].get("codes"))),
+            "groups_without_project_code": quality.get("groups_without_project_code", total_groups - sum(1 for item in groups.values() if item["dimension"].get("codes"))),
+            "groups_without_lims_link": quality.get("groups_without_lims_link", 0),
             "project_match_rate": _ratio(matched_codes, project_codes),
             "product_records": product_projects, "matched_products": matched_products,
             "product_match_rate": _ratio(matched_products, product_projects),
@@ -1082,6 +1104,58 @@ def _extract_msg_times(missed_list_json: Any) -> list:
     return [item["msgtime"] for item in _extract_missed_messages(missed_list_json) if item.get("msgtime")]
 
 
+def _project_code_diagnostics(
+    group_names: List[str],
+    dimensions: Dict[str, dict],
+    lims_records_by_code: Dict[str, List[dict]],
+) -> dict:
+    group_to_codes = {
+        group_name: [
+            str(code).strip().upper()
+            for code in dimensions.get(group_name, {}).get("codes", [])
+            if str(code or "").strip()
+        ]
+        for group_name in group_names
+    }
+    matched_codes = {
+        str(code).strip().upper()
+        for code, records in lims_records_by_code.items()
+        if str(code or "").strip() and records
+    }
+    code_to_groups: Dict[str, List[str]] = defaultdict(list)
+    for group_name, codes in group_to_codes.items():
+        for code in codes:
+            code_to_groups[code].append(group_name)
+
+    requested_codes = sorted(code_to_groups)
+    unmatched_codes = [code for code in requested_codes if code not in matched_codes]
+    unmatched_set = set(unmatched_codes)
+    groups_without_project_code = sorted(
+        group_name for group_name, codes in group_to_codes.items() if not codes
+    )
+    groups_with_unmatched_project_code = sorted(
+        group_name
+        for group_name, codes in group_to_codes.items()
+        if any(code in unmatched_set for code in codes)
+    )
+    groups_without_lims_link = sorted(
+        group_name
+        for group_name, codes in group_to_codes.items()
+        if codes and not any(code in matched_codes for code in codes)
+    )
+
+    return {
+        "group_to_codes": group_to_codes,
+        "code_to_groups": {code: sorted(groups) for code, groups in code_to_groups.items()},
+        "requested_codes": requested_codes,
+        "matched_codes": sorted(matched_codes),
+        "unmatched_codes": unmatched_codes,
+        "groups_without_project_code": groups_without_project_code,
+        "groups_with_unmatched_project_code": groups_with_unmatched_project_code,
+        "groups_without_lims_link": groups_without_lims_link,
+    }
+
+
 def get_verification_stats(
     period: str = "month",
     start_date: Optional[str] = None,
@@ -1116,6 +1190,7 @@ def get_verification_stats(
     qx_chat_room_ids = {str(row.get("roomid") or "") for row in chat_rows if row.get("roomid")}
     qx_chat_with_msgtime = sum(1 for row in chat_rows if row.get("msgtime"))
 
+    diagnostics = _project_code_diagnostics(group_names, dimensions, lims_records_by_code)
     lims_codes = set(lims_records_by_code)
     lims_region_codes = set()
     lims_after_codes = set()
@@ -1138,6 +1213,36 @@ def get_verification_stats(
             lims_active_groups.add(group_name)
 
     project_total = len(project_codes)
+    lims_unreturned_note = (
+        "LIMS接口不可用，本项表示接口未返回，不能直接判定项目号错误。"
+        if not lims_stats.get("available")
+        else "项目号请求后 LIMS base_data 未返回记录，需核对项目号或 LIMS 数据。"
+    )
+    missing_group_rows = [
+        [group_name, "群名中未匹配 LC-* 项目号"]
+        for group_name in diagnostics["groups_without_project_code"]
+    ] or [["(无)", "当前范围内所有群名都提取到了项目号"]]
+    unmatched_code_rows = [
+        [
+            code,
+            len(diagnostics["code_to_groups"].get(code, [])),
+            "；".join(diagnostics["code_to_groups"].get(code, [])),
+            lims_unreturned_note,
+        ]
+        for code in diagnostics["unmatched_codes"]
+    ] or [["(无)", 0, "", "当前范围内提取到的项目号均有 LIMS 返回记录"]]
+    unlinked_group_rows = [
+        [
+            group_name,
+            "、".join(diagnostics["group_to_codes"].get(group_name, [])),
+            "、".join(
+                code for code in diagnostics["group_to_codes"].get(group_name, [])
+                if code in set(diagnostics["unmatched_codes"])
+            ),
+            lims_unreturned_note,
+        ]
+        for group_name in diagnostics["groups_without_lims_link"]
+    ] or [["(无)", "", "", "当前范围内带项目号的群均至少命中一个 LIMS 项目"]]
     sections = [
         {
             "title": "当前筛选范围",
@@ -1149,6 +1254,31 @@ def get_verification_stats(
                 ["看板去重记录数", len(latest_rows), len(latest_rows), "按 groupName + DATE(CREATEDTIME) 取最新记录"],
                 ["漏回群数", len(group_names), len(dashboard_missed_groups), f"漏回率 {_ratio(len(dashboard_missed_groups), len(group_names))}%"],
             ],
+        },
+        {
+            "title": "项目号与 LIMS 关联诊断",
+            "columns": ["验证项", "当前范围", "异常/未命中", "说明"],
+            "rows": [
+                ["群名项目号提取", len(group_names), len(diagnostics["groups_without_project_code"]), "异常值为无法从群名提取 LC-* 项目号的群"],
+                ["LIMS未返回项目号", project_total, len(diagnostics["unmatched_codes"]), lims_unreturned_note],
+                ["完全无LIMS关联群", len(group_names), len(diagnostics["groups_without_lims_link"]), "群名能提取项目号，但这些项目号均未拿到 LIMS 返回记录"],
+                ["含未返回项目号群", len(group_names), len(diagnostics["groups_with_unmatched_project_code"]), "群名中至少有一个项目号未被 LIMS 返回"],
+            ],
+        },
+        {
+            "title": "未提取项目号的群名",
+            "columns": ["群名", "说明"],
+            "rows": missing_group_rows,
+        },
+        {
+            "title": "LIMS未返回项目号明细",
+            "columns": ["项目号", "涉及群数", "涉及群名", "说明"],
+            "rows": unmatched_code_rows,
+        },
+        {
+            "title": "完全无LIMS关联的群名",
+            "columns": ["群名", "提取项目号", "未返回项目号", "说明"],
+            "rows": unlinked_group_rows,
         },
         {
             "title": "数据库群聊数据源覆盖",
@@ -1178,6 +1308,9 @@ def get_verification_stats(
         "scope": {
             "groups": len(group_names),
             "project_codes": project_total,
+            "groups_without_project_code": len(diagnostics["groups_without_project_code"]),
+            "unmatched_project_codes": len(diagnostics["unmatched_codes"]),
+            "groups_without_lims_link": len(diagnostics["groups_without_lims_link"]),
             "raw_analysis_rows": len(raw_rows),
             "latest_analysis_rows": len(latest_rows),
         },
