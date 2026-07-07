@@ -1199,6 +1199,358 @@ def get_high_freq_summary(limit: int = 20) -> dict:
     return {"top_words": values, "total_unique_words": len(values)}
 
 
+
+
+def get_verification_stats(
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict:
+    """?????????????????????????????"""
+    from datetime import date, datetime, timedelta
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    end_str = (end + timedelta(days=1)).isoformat()
+    start_str = start.isoformat()
+
+    with database("dashboard.verify") as conn:
+        # V1: ?????qx_analysis_result ???????????
+        raw_count = _query(conn, "verify.raw_count",
+            "SELECT COUNT(*) c FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["c"]
+
+        # V2: ?????? (groupName, ??) ?????? dedup ???
+        dedup_count = _query(conn, "verify.dedup",
+            "SELECT COUNT(*) c FROM (SELECT DISTINCT groupName, DATE(CREATEDTIME) d FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s) t",
+            (start_str, end_str))[0]["c"]
+
+        # V3: ??????????????
+        unique_groups_raw = _query(conn, "verify.unique_groups",
+            "SELECT COUNT(DISTINCT groupName) c FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["c"]
+
+        # V4: ????
+        msg_total = _query(conn, "verify.msg_total",
+            "SELECT COALESCE(SUM(messageToDayCount),0) s FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["s"]
+
+        # V5: ?????????? isMissedMessage=1 ???
+        missed_groups = _query(conn, "verify.missed",
+            "SELECT COUNT(DISTINCT groupName) c FROM qx_analysis_result WHERE isMissedMessage=1 AND CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))[0]["c"]
+
+        # V6: ?????????? - ?????????????
+        all_groups = _query(conn, "verify.project_codes",
+            "SELECT DISTINCT groupName FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+            (start_str, end_str))
+
+        # V7: 通过 Python 提取项目号后验证区域和售后关联
+        all_codes = set()
+        code_to_group = {}
+        _pv_re = __import__("re").compile(r"LC-[A-Z]+\\d+")
+        for g in all_groups:
+            gname = g.get("groupName") or ""
+            codes = _pv_re.findall(gname)
+            for code in codes:
+                all_codes.add(code)
+                code_to_group.setdefault(code, []).append(gname)
+        linked_region_groups = 0
+        linked_after_groups = 0
+        if all_codes:
+            ph = ",".join(["%s"] * len(all_codes))
+            codes_list = list(all_codes)
+            proj_rows = _query(conn, "verify.project_lookup",
+                "SELECT PROJECTCODE, CREATEDBYORGNAME, AFTERSALER FROM t_project WHERE PROJECTCODE IN (" + ph + ")", codes_list)
+            region_set, after_set = set(), set()
+            for row in proj_rows:
+                code = str(row.get("PROJECTCODE") or "").upper()
+                if str(row.get("CREATEDBYORGNAME") or "").strip():
+                    for gn in code_to_group.get(code, []):
+                        region_set.add(gn)
+                if str(row.get("AFTERSALER") or "").strip():
+                    for gn in code_to_group.get(code, []):
+                        after_set.add(gn)
+            inc_rows = _query(conn, "verify.income_lookup",
+                "SELECT projectCode, afterSaler FROM t_income WHERE projectCode IN (" + ph + ")", codes_list)
+            for row in inc_rows:
+                code = str(row.get("projectCode") or "").upper()
+                if str(row.get("afterSaler") or "").strip():
+                    for gn in code_to_group.get(code, []):
+                        after_set.add(gn)
+            linked_region_groups = len(region_set)
+            linked_after_groups = len(after_set)
+
+        # V8: (已有 V7 中计算)
+
+        # V9: ???? ? ?????????????
+        group_project_samples = []
+        import re
+        project_re = re.compile(r"LC-[A-Z]+\d+")
+        for g in all_groups[:200]:
+            codes = project_re.findall(g["groupName"] or "")
+            group_project_samples.append({
+                "group_name": g["groupName"],
+                "extracted_codes": codes,
+                "has_codes": len(codes) > 0,
+            })
+
+        codes_linked = sum(1 for g in group_project_samples if g["has_codes"])
+        total_samples = len(group_project_samples)
+        code_match_rate = round(codes_linked / total_samples * 100, 1) if total_samples else 0
+
+        # V10: t_project ??
+        t_project_total = _query(conn, "verify.t_project",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%'")[0]["c"]
+        t_project_with_org = _query(conn, "verify.t_project_org",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND CREATEDBYORGNAME IS NOT NULL AND CREATEDBYORGNAME != ''")[0]["c"]
+        t_project_with_after = _query(conn, "verify.t_project_after",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND AFTERSALER IS NOT NULL AND AFTERSALER != ''")[0]["c"]
+        t_project_with_key = _query(conn, "verify.t_project_key",
+            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND KEYACCOUNT IS NOT NULL AND KEYACCOUNT != '' AND KEYACCOUNT != '0'")[0]["c"]
+
+        # V11: t_income ??
+        t_income_total = _query(conn, "verify.t_income",
+            "SELECT COUNT(DISTINCT projectCode) c FROM t_income WHERE projectCode LIKE 'LC-%%'")[0]["c"]
+        t_income_with_org = _query(conn, "verify.t_income_org",
+            "SELECT COUNT(DISTINCT projectCode) c FROM t_income WHERE projectCode LIKE 'LC-%%' AND orgName IS NOT NULL AND orgName != ''")[0]["c"]
+        t_income_with_after = _query(conn, "verify.t_income_after",
+            "SELECT COUNT(DISTINCT projectCode) c FROM t_income WHERE projectCode LIKE 'LC-%%' AND afterSaler IS NOT NULL AND afterSaler != ''")[0]["c"]
+
+        # V12: t_customer ??????
+        t_customer_key = _query(conn, "verify.t_customer_key",
+            "SELECT COUNT(*) c FROM t_customer WHERE KEYACCOUNT IS NOT NULL AND KEYACCOUNT != '' AND KEYACCOUNT != '0' AND KEYACCOUNT != 'false' AND KEYACCOUNT != '?'")[0]["c"]
+
+    return {
+        "period": {"start": start_str[:10], "end": end.isoformat(), "normalized": normalized_period},
+        "qx_analysis_result": {
+            "????": raw_count,
+            "????(????)": dedup_count,
+            "?????": unique_groups_raw,
+            "????": msg_total,
+            "????": missed_groups,
+            "????????": {"????": codes_linked, "???": total_samples, "???": code_match_rate},
+        },
+        "t_project_region_coverage": {
+            "????": t_project_total,
+            "???": t_project_with_org,
+            "?????": round(t_project_with_org / t_project_total * 100, 1) if t_project_total else 0,
+            "???": t_project_with_after,
+            "?????": round(t_project_with_after / t_project_total * 100, 1) if t_project_total else 0,
+            "?????": t_project_with_key,
+        },
+        "t_income_coverage": {
+            "????": t_income_total,
+            "???(orgName)": t_income_with_org,
+            "?????": round(t_income_with_org / t_income_total * 100, 1) if t_income_total else 0,
+            "???(afterSaler)": t_income_with_after,
+            "?????": round(t_income_with_after / t_income_total * 100, 1) if t_income_total else 0,
+        },
+        "t_customer": {
+            "?????": t_customer_key,
+        },
+        "group_samples": group_project_samples[:30],
+        "note": "?????? _build_overview ???????????????? SQL ??????????????",
+    }
+
+
 def get_unanswered_summary() -> dict:
     return get_overview("year")["service_quality"]["unanswered"]
 
+def get_export_csv(
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> str:
+    """?????????CSV????????????"""
+    import csv, io
+    data = get_overview(period=period, start_date=start_date, end_date=end_date,
+                        region=region, aftersaler=aftersaler, category=category, key_account=key_account)
+    s = data["summary"]
+    sq = data["service_quality"]
+    comm = data["communication"]
+    biz = data["business"]
+    qual = data["data_quality"]
+    cross = data["cross_analysis"]
+    meta = data["meta"]
+
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["===== ?????? ====="])
+    w.writerow(["????", meta["period"], "????", meta["start_date"], "????", meta["end_date"]])
+    w.writerow(["????", f"??={meta['filters']['region'] or '(??)'}",
+                 f"??={meta['filters']['aftersaler'] or '(??)'}",
+                 f"??={meta['filters']['category'] or '(??)'}",
+                 f"????={meta['filters']['key_account'] or '(??)'}"])
+    w.writerow([])
+
+    # 1. Summary KPIs
+    w.writerow(["===== 1. ???? (KPI) ====="])
+    w.writerow(["??", "??", "??"])
+    kpis = [
+        ("????", s["total_groups"], "????"),
+        ("????", s["total_messages"], "?????"),
+        ("???", s["project_groups"], "??????"),
+        ("????", s["regions"], "?????"),
+        ("????", s["aftersaler_count"], "LIMS afterSaler"),
+        ("????", s["product_categories"], "????"),
+        ("????", s["key_accounts"], "?????"),
+        ("???", sq["unanswered"]["missed_groups"], f"??? {sq['unanswered']['missed_rate']}%"),
+        ("??????", s["short_active_ratio"], "??<=30?"),
+    ]
+    for name, val, note in kpis:
+        w.writerow([name, val, note])
+    w.writerow([])
+
+    # 2. ????
+    w.writerow(["===== 2. ???? - ???? ====="])
+    w.writerow(["??", "??"])
+    w.writerow(["????", sq["sentiment"]["customer_good"]])
+    w.writerow(["????", sq["sentiment"]["customer_bad"]])
+    w.writerow(["????", sq["sentiment"]["employee_positive"]])
+    w.writerow(["????", sq["sentiment"]["employee_negative"]])
+    w.writerow([])
+
+    # 3. ???? (???)
+    w.writerow(["===== 3. ?????? (??) ====="])
+    w.writerow(["??", "???", "????", "???"])
+    for item in comm["trend"]:
+        w.writerow([item["date"], item["messages"], item["groups"], item["missed"]])
+    w.writerow([])
+
+    # 4. ??????
+    w.writerow(["===== 4. ???????? ====="])
+    w.writerow(["????", "??", "??", "??(%)"])
+    for item in comm["active_duration"]:
+        w.writerow([item["range"], item["label"], item["count"], item["percentage"]])
+    w.writerow([])
+
+    # 5. ???
+    w.writerow(["===== 5. ????? (Top 20) ====="])
+    w.writerow(["???", "????"])
+    for item in comm["high_frequency"]:
+        w.writerow([item["word"], item["count"]])
+    w.writerow([])
+
+    # 6. ???? (????)
+    tp = comm.get("time_period_breakdown", {})
+    w.writerow(["===== 6. ?????? (????) ====="])
+    w.writerow(["???", "???", "??", "??", "?????", "??"])
+    for item in tp.get("items", []):
+        w.writerow([item["aftersaler"], item["group_count"],
+                    item["morning"]["count"], item["afternoon"]["count"],
+                    item["after_hours"]["count"], item["total"]])
+    if tp.get("items"):
+        w.writerow(["?????", tp["total_aftersalers"], "????", tp["total_groups"]])
+    w.writerow([])
+
+    # 7. ????
+    w.writerow(["===== 7. ?????? ====="])
+    w.writerow(["??", "??", "???", "??(%)"])
+    for item in biz["regions"]:
+        w.writerow([item["region"], item["group_count"], item["message_count"], item["percentage"]])
+    w.writerow(["Top5???", "", "", biz.get("top5_coverage", "")])
+    w.writerow([])
+
+    # 8. ????
+    w.writerow(["===== 8. ?????? ====="])
+    w.writerow(["????", "????", "??(%)"])
+    for item in biz["aftersalers"]:
+        w.writerow([item["name"], item["count"], item["percentage"]])
+    w.writerow([])
+
+    # 9. ????
+    w.writerow(["===== 9. ???? (??) ====="])
+    w.writerow(["????", "???", "??(%)"])
+    for item in biz["product_categories"]:
+        w.writerow([item["category"], item["count"], item["percentage"]])
+    w.writerow([])
+
+    # 10. ???? (??/??/??)
+    w.writerow(["===== 10. ?????? (??) ====="])
+    w.writerow(["??", "??", "??", "???"])
+    def write_tree(nodes, level1="", level2=""):
+        for node in nodes:
+            if node.get("children"):
+                if not node.get("children", [])[0].get("children"):
+                    # level2 -> level3
+                    for c in node["children"]:
+                        for gc in c.get("children", []):
+                            w.writerow([level1, c["name"], gc["name"], gc["count"]])
+                        if not c.get("children"):
+                            w.writerow([level1, c["name"], "", c["count"]])
+                else:
+                    # level1 -> level2
+                    nc = node.get("children", [])
+                    for c in nc:
+                        for gc in c.get("children", []):
+                            w.writerow([node["name"], c["name"], gc["name"], gc["count"]])
+            else:
+                w.writerow([level1, "", "", node["count"]])
+    write_tree(biz.get("product_hierarchy", []))
+    w.writerow([])
+
+    # 11. ????
+    w.writerow(["===== 11. ???? ====="])
+    w.writerow(["????", "???", "???", "????", "???"])
+    for item in biz["key_accounts"]:
+        w.writerow([item["key_account"], item.get("group_count", 0),
+                    item["project_count"], item.get("customer_name", ""),
+                    "; ".join(item.get("aftersalers", []))])
+    w.writerow([])
+
+    # 12. ????
+    w.writerow(["===== 12. ?????? - ???? ====="])
+    w.writerow(["??", "????", "?????(?5)"])
+    for item in cross.get("region_sales", []):
+        names = "; ".join([f"{x['name']}({x['count']})" for x in item.get("items", [])[:5]])
+        w.writerow([item["region"], item.get("group_count", 0), names])
+
+    w.writerow(["===== ?????? - ???? ====="])
+    w.writerow(["??", "????", "?????(?5)"])
+    for item in cross.get("region_after", []):
+        names = "; ".join([f"{x['name']}({x['count']})" for x in item.get("items", [])[:5]])
+        w.writerow([item["region"], item.get("group_count", 0), names])
+
+    w.writerow(["===== ?????? - ????? ====="])
+    w.writerow(["??", "????", "????(?5)"])
+    for item in cross.get("region_product", []):
+        names = "; ".join([f"{x['category']}({x['count']})" for x in item.get("items", [])[:5]])
+        w.writerow([item["region"], item.get("group_count", 0), names])
+    w.writerow([])
+
+    # 13. ????
+    w.writerow(["===== 13. ???? ====="])
+    w.writerow(["??", "??"])
+    qual_rows = [
+        ("????", qual["raw_rows"]),
+        ("????", qual["deduplicated_rows"]),
+        ("??????", qual["duplicate_rows_removed"]),
+        ("??????", qual["project_codes"]),
+        ("???????", qual["matched_project_codes"]),
+        ("?????", f"{qual['project_match_rate']}%"),
+        ("?????", qual["product_records"]),
+        ("??????", qual["matched_products"]),
+        ("?????", f"{qual['product_match_rate']}%"),
+        ("??????", qual["groups_with_aftersaler"]),
+        ("?????", f"{qual['aftersaler_coverage_rate']}%"),
+        ("LIMS???", qual["groups_with_lims_link"]),
+        ("LIMS???", f"{qual['lims_link_rate']}%"),
+        ("?????", qual["groups_with_region"]),
+        ("?????", f"{qual['region_link_rate']}%"),
+        ("???????", qual["groups_with_key_account"]),
+        ("???????", f"{qual['key_account_link_rate']}%"),
+        ("???????", qual["groups_with_raw_aftersaler"]),
+        ("LIMS???", qual["groups_with_lims_members"]),
+        ("LIMS??", qual["lims_source"]),
+        ("LIMS API????", qual["lims_api_requests"]),
+        ("LIMS API???", qual["lims_api_records"]),
+        ("LIMS API???", qual["lims_api_errors"]),
+    ]
+    for name, val in qual_rows:
+        w.writerow([name, val])
+    w.writerow([])
+
+    return output.getvalue()
