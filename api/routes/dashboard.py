@@ -176,16 +176,16 @@ def export_data(
     category: str = Query("", max_length=100),
     key_account: str = Query("", max_length=100),
 ):
-    from fastapi.responses import PlainTextResponse
+    from fastapi.responses import Response
     csv_content = db_dashboard.get_export_csv(
         period=period, start_date=start_date, end_date=end_date,
         region=region, aftersaler=aftersaler, category=category, key_account=key_account,
     )
     filename = f"dashboard_export_{period}_{start_date or ''}_{end_date or ''}.csv"
-    return PlainTextResponse(
-        content=csv_content,
+    return Response(
+        content=csv_content.encode("utf-8-sig") if not csv_content.startswith("\ufeff") else csv_content.encode("utf-8"),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
     )
 
 @router.get("/unanswered-summary")
