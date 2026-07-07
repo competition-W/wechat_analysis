@@ -81,6 +81,36 @@ def _first_existing_column(columns: set[str], *candidates: str) -> Optional[str]
     return None
 
 
+def _field_value_case_insensitive(item: dict, *names: str) -> Any:
+    if not item:
+        return None
+    lowered = {str(key).lower(): value for key, value in item.items()}
+    for name in names:
+        if name in item and item[name] not in (None, ""):
+            return item[name]
+        value = lowered.get(name.lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def parse_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = re.search(r"-?\d+", str(value))
+    return int(match.group()) if match else None
+
+
+def extract_lims_active_day(item: dict) -> Optional[int]:
+    return parse_int(_field_value_case_insensitive(
+        item,
+        "activeDay", "active_day", "activeDays", "activeLay", "activeLlay",
+        "activelay", "activellay", "ACTIVE_DAY", "ACTIVEDAY",
+    ))
+
+
 def clear_cache() -> None:
     with _cache_lock:
         _cache.clear()
@@ -259,7 +289,7 @@ def normalize_lims_api_record(item: dict, code: str) -> dict:
         "raw_aftersaler": item.get("afterSaler") or "",
         "lims_members": members,
         "group_id": item.get("groupId") or "",
-        "active_day": item.get("activeDay"),
+        "active_day": extract_lims_active_day(item),
         "start_time": item.get("startTime") or "",
         "end_time": item.get("endTime") or "",
         "dimension_source": "lims_base_data_api",
@@ -726,6 +756,19 @@ def _active_durations(conn, group_names: List[str], start: date, end: date) -> D
     }
 
 
+def _active_durations_from_lims(dimensions: Dict[str, dict]) -> Dict[str, int]:
+    durations: Dict[str, int] = {}
+    for group_name, dim in dimensions.items():
+        values = [
+            parse_int(project.get("active_day"))
+            for project in dim.get("projects", [])
+            if parse_int(project.get("active_day")) is not None
+        ]
+        if values:
+            durations[group_name] = max(values)
+    return durations
+
+
 def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str, dict]:
     groups: Dict[str, dict] = {}
     for row in rows:
@@ -851,7 +894,10 @@ def _build_overview(
             rows = [row for row in rows if row["groupName"] in allowed_groups]
             dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
         groups = _group_aggregates(rows, dimensions)
-        durations = _active_durations(conn, list(groups), start, end)
+        durations = _active_durations_from_lims(dimensions)
+        missing_duration_groups = [name for name in groups if name not in durations]
+        fallback_durations = _active_durations(conn, missing_duration_groups, start, end)
+        durations.update(fallback_durations)
 
     _filter_region = region
     _filter_aftersaler = aftersaler
@@ -1051,6 +1097,9 @@ def _build_overview(
             "key_account_link_rate": _ratio(quality.get("groups_with_key_account", 0), total_groups),
             "groups_with_raw_aftersaler": quality.get("groups_with_raw_aftersaler", 0),
             "groups_with_lims_members": quality.get("groups_with_lims_members", 0),
+            "active_duration_source": "lims_base_data_active_day",
+            "active_duration_lims_groups": len(durations) - len(fallback_durations),
+            "active_duration_fallback_groups": len(fallback_durations),
             "lims_source": quality.get("lims_source", "unknown"),
             "lims_api_requests": quality.get("lims_api_requests", 0),
             "lims_api_records": quality.get("lims_api_records", 0),
@@ -1253,180 +1302,330 @@ def get_verification_stats(
     period: str = "month",
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
 ) -> dict:
-    """Return direct database checks used by the dashboard verification panel."""
-    from datetime import timedelta
+    """Return scoped verification data for the current dashboard filters."""
     start, end, normalized_period = resolve_period(period, start_date, end_date)
-    end_str = (end + timedelta(days=1)).isoformat()
-    start_str = start.isoformat()
 
     with database("dashboard.verify") as conn:
-        raw_count = _query(conn, "verify.raw_count",
-            "SELECT COUNT(*) c FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
-            (start_str, end_str))[0]["c"]
+        scope = _current_dashboard_scope(conn, start, end, region, aftersaler, category, key_account)
+        project_codes = scope["project_codes"]
+        latest_rows = scope["latest_rows"]
+        raw_rows = scope["raw_rows"]
+        dimensions = scope["dimensions"]
+        project_rows = _query_project_rows(conn, project_codes)
+        income_rows, income_code_columns = _query_income_rows(conn, project_codes)
+        customer_rows = _query_customer_rows(conn, project_rows, income_rows)
 
-        dedup_count = _query(conn, "verify.dedup",
-            "SELECT COUNT(*) c FROM (SELECT DISTINCT groupName, DATE(CREATEDTIME) d FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s) t",
-            (start_str, end_str))[0]["c"]
+    lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
 
-        unique_groups_raw = _query(conn, "verify.unique_groups",
-            "SELECT COUNT(DISTINCT groupName) c FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
-            (start_str, end_str))[0]["c"]
+    group_names = scope["group_names"]
+    dashboard_missed_groups = {
+        row.get("groupName")
+        for row in latest_rows
+        if row.get("groupName") and str(row.get("isMissedMessage")) == "1"
+    }
+    t_project_codes = _project_code_set(project_rows, "PROJECTCODE", "projectCode")
+    t_project_region_codes = {
+        str(row_get(row, "PROJECTCODE", "projectCode")).upper()
+        for row in project_rows
+        if row_get(row, "PROJECTCODE", "projectCode") and str(row_get(row, "CREATEDBYORGNAME") or "").strip()
+    }
+    t_project_after_codes = {
+        str(row_get(row, "PROJECTCODE", "projectCode")).upper()
+        for row in project_rows
+        if row_get(row, "PROJECTCODE", "projectCode") and str(row_get(row, "AFTERSALER", "afterSaler") or "").strip()
+    }
+    customer_by_key = {}
+    for customer in customer_rows:
+        for key in (row_get(customer, "ID"), row_get(customer, "CUSTOMERNO"), row_get(customer, "CUSTOMERID")):
+            if key is not None and str(key).strip():
+                customer_by_key[str(key).strip()] = customer
+    t_project_key_codes = set()
+    for project in project_rows:
+        customer = customer_lookup(
+            customer_by_key,
+            row_get(project, "CUSTOMERID"),
+            row_get(project, "CUSTOMERNO"),
+        )
+        if _valid_key_account(row_get(customer, "KEYACCOUNT", "keyAccount")):
+            code = row_get(project, "PROJECTCODE", "projectCode")
+            if code:
+                t_project_key_codes.add(str(code).upper())
 
-        msg_total = _query(conn, "verify.msg_total",
-            "SELECT COALESCE(SUM(messageToDayCount),0) s FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
-            (start_str, end_str))[0]["s"]
+    income_code_set = set()
+    income_region_codes = set()
+    income_after_codes = set()
+    for row in income_rows:
+        code = first_nonempty(*(row_get(row, column) for column in income_code_columns))
+        if not code:
+            continue
+        normalized_code = str(code).upper()
+        income_code_set.add(normalized_code)
+        if str(row_get(row, "orgName", "orgname", "CREATEDBYORGNAME") or "").strip():
+            income_region_codes.add(normalized_code)
+        if str(row_get(row, "afterSaler", "aftersaler", "AFTERSALER") or "").strip():
+            income_after_codes.add(normalized_code)
 
-        missed_groups = _query(conn, "verify.missed",
-            "SELECT COUNT(DISTINCT groupName) c FROM qx_analysis_result WHERE isMissedMessage=1 AND CREATEDTIME >= %s AND CREATEDTIME < %s",
-            (start_str, end_str))[0]["c"]
+    lims_codes = set(lims_records_by_code)
+    lims_region_codes = set()
+    lims_after_codes = set()
+    lims_key_codes = set()
+    lims_active_codes = set()
+    for code, records in lims_records_by_code.items():
+        for record in records:
+            if str(_field_value_case_insensitive(record, "orgName") or "").strip():
+                lims_region_codes.add(code)
+            if str(_field_value_case_insensitive(record, "afterSaler") or "").strip():
+                lims_after_codes.add(code)
+            if _valid_key_account(_field_value_case_insensitive(record, "keyAccount")):
+                lims_key_codes.add(code)
+            if extract_lims_active_day(record) is not None:
+                lims_active_codes.add(code)
 
-        all_groups = _query(conn, "verify.project_codes",
-            "SELECT DISTINCT groupName FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
-            (start_str, end_str))
-        dashboard_rows, _ = _latest_rows(conn, start, end)
-        dashboard_group_names = {row.get("groupName") for row in dashboard_rows if row.get("groupName")}
-        dashboard_missed_groups = {
-            row.get("groupName")
-            for row in dashboard_rows
-            if row.get("groupName") and str(row.get("isMissedMessage")) == "1"
-        }
+    lims_active_groups = set()
+    for group_name, dim in dimensions.items():
+        if any(parse_int(project.get("active_day")) is not None for project in dim.get("projects", [])):
+            lims_active_groups.add(group_name)
 
-        all_codes = set()
-        code_to_group = {}
-        project_re = re.compile(r"LC-[A-Z]+\d+", re.IGNORECASE)
-        for g in all_groups:
-            gname = g.get("groupName") or ""
-            codes = [code.upper() for code in project_re.findall(gname)]
-            for code in codes:
-                all_codes.add(code)
-                code_to_group.setdefault(code, []).append(gname)
-
-        if all_codes:
-            ph = ",".join(["%s"] * len(all_codes))
-            codes_list = list(all_codes)
-            proj_rows = _query(conn, "verify.project_lookup",
-                "SELECT PROJECTCODE, CREATEDBYORGNAME, AFTERSALER FROM t_project WHERE PROJECTCODE IN (" + ph + ")", codes_list)
-            region_set, after_set = set(), set()
-            for row in proj_rows:
-                code = str(row.get("PROJECTCODE") or "").upper()
-                if str(row.get("CREATEDBYORGNAME") or "").strip():
-                    for gn in code_to_group.get(code, []):
-                        region_set.add(gn)
-                if str(row.get("AFTERSALER") or "").strip():
-                    for gn in code_to_group.get(code, []):
-                        after_set.add(gn)
-
-            income_columns = _table_columns(conn, "t_income")
-            income_code_columns = [
-                col for col in ("projectCode", "projectcode", "businesscode", "projectproductcode")
-                if col.lower() in income_columns
-            ]
-            income_after_col = _first_existing_column(income_columns, "afterSaler", "aftersaler")
-            if income_code_columns and income_after_col:
-                where_sql = " OR ".join([f"{col} IN ({ph})" for col in income_code_columns])
-                select_sql = ", ".join(income_code_columns + [income_after_col])
-                params = []
-                for _ in income_code_columns:
-                    params.extend(codes_list)
-                inc_rows = _query(
-                    conn,
-                    "verify.income_lookup",
-                    f"SELECT {select_sql} FROM t_income WHERE {where_sql}",
-                    params,
-                )
-                for row in inc_rows:
-                    code = ""
-                    for col in income_code_columns:
-                        code = str(row_get(row, col) or "").upper()
-                        if code:
-                            break
-                    if str(row_get(row, income_after_col) or "").strip():
-                        for gn in code_to_group.get(code, []):
-                            after_set.add(gn)
-
-        group_project_samples = []
-        for g in all_groups[:200]:
-            codes = [code.upper() for code in project_re.findall(g["groupName"] or "")]
-            group_project_samples.append({
-                "group_name": g["groupName"],
-                "extracted_codes": codes,
-                "has_codes": len(codes) > 0,
-            })
-
-        codes_linked = sum(1 for g in group_project_samples if g["has_codes"])
-        total_samples = len(group_project_samples)
-        code_match_rate = round(codes_linked / total_samples * 100, 1) if total_samples else 0
-
-        t_project_total = _query(conn, "verify.t_project",
-            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%'")[0]["c"]
-        t_project_with_org = _query(conn, "verify.t_project_org",
-            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND CREATEDBYORGNAME IS NOT NULL AND CREATEDBYORGNAME != ''")[0]["c"]
-        t_project_with_after = _query(conn, "verify.t_project_after",
-            "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND AFTERSALER IS NOT NULL AND AFTERSALER != ''")[0]["c"]
-
-        income_columns = _table_columns(conn, "t_income")
-        income_code_col = _first_existing_column(income_columns, "projectCode", "projectcode", "businesscode", "projectproductcode")
-        income_org_col = _first_existing_column(income_columns, "orgName", "orgname", "CREATEDBYORGNAME")
-        income_after_col = _first_existing_column(income_columns, "afterSaler", "aftersaler", "AFTERSALER")
-        if income_code_col:
-            t_income_total = _query(conn, "verify.t_income",
-                f"SELECT COUNT(DISTINCT {income_code_col}) c FROM t_income WHERE {income_code_col} LIKE 'LC-%%'")[0]["c"]
-            if income_org_col:
-                t_income_with_org = _query(conn, "verify.t_income_org",
-                    f"SELECT COUNT(DISTINCT {income_code_col}) c FROM t_income WHERE {income_code_col} LIKE 'LC-%%' AND {income_org_col} IS NOT NULL AND {income_org_col} != ''")[0]["c"]
-            else:
-                t_income_with_org = 0
-            if income_after_col:
-                t_income_with_after = _query(conn, "verify.t_income_after",
-                    f"SELECT COUNT(DISTINCT {income_code_col}) c FROM t_income WHERE {income_code_col} LIKE 'LC-%%' AND {income_after_col} IS NOT NULL AND {income_after_col} != ''")[0]["c"]
-            else:
-                t_income_with_after = 0
-        else:
-            t_income_total = t_income_with_org = t_income_with_after = 0
-
-        t_customer_key = _query(conn, "verify.t_customer_key",
-            "SELECT COUNT(*) c FROM t_customer WHERE KEYACCOUNT IS NOT NULL AND KEYACCOUNT != '' AND KEYACCOUNT != '0' AND KEYACCOUNT != 'false' AND KEYACCOUNT != '?'")[0]["c"]
+    project_total = len(project_codes)
+    sections = [
+        {
+            "title": "当前筛选范围",
+            "columns": ["验证项", "范围值", "命中值", "说明"],
+            "rows": [
+                ["群聊数", len(group_names), len(group_names), "当前周期和筛选条件命中的群聊"],
+                ["项目号数", project_total, project_total, "从命中群名提取 LC-* 项目号后去重"],
+                ["分析原始记录数", len(raw_rows), len(raw_rows), "qx_analysis_result 当前范围原始记录"],
+                ["看板去重记录数", len(latest_rows), len(latest_rows), "按 groupName + DATE(CREATEDTIME) 取最新记录"],
+                ["漏回群数", len(group_names), len(dashboard_missed_groups), f"漏回率 {_ratio(len(dashboard_missed_groups), len(group_names))}%"],
+            ],
+        },
+        {
+            "title": "LIMS base_data 接口覆盖",
+            "columns": ["验证项", "当前范围项目号", "接口命中项目号", "说明"],
+            "rows": [
+                ["接口返回项目号", project_total, len(lims_codes), f"请求 {lims_stats.get('requests', 0)} 次，返回记录 {lims_stats.get('records', 0)} 条，错误 {lims_stats.get('errors', 0)} 次"],
+                ["区域(orgName)", project_total, len(lims_region_codes), f"覆盖率 {_ratio(len(lims_region_codes), project_total)}%"],
+                ["售后(afterSaler)", project_total, len(lims_after_codes), f"覆盖率 {_ratio(len(lims_after_codes), project_total)}%"],
+                ["重点客户(keyAccount)", project_total, len(lims_key_codes), f"覆盖率 {_ratio(len(lims_key_codes), project_total)}%"],
+                ["活跃周期(activeDay/activellay)", project_total, len(lims_active_codes), f"覆盖群聊 {len(lims_active_groups)} 个"],
+            ],
+        },
+        {
+            "title": "t_project 表覆盖",
+            "columns": ["验证项", "当前范围项目号", "数据库命中项目号", "说明"],
+            "rows": [
+                ["项目号命中", project_total, len(t_project_codes), f"覆盖率 {_ratio(len(t_project_codes), project_total)}%"],
+                ["区域(CREATEDBYORGNAME)", project_total, len(t_project_region_codes), f"覆盖率 {_ratio(len(t_project_region_codes), project_total)}%"],
+                ["售后(AFTERSALER)", project_total, len(t_project_after_codes), f"覆盖率 {_ratio(len(t_project_after_codes), project_total)}%"],
+                ["重点客户(t_customer.KEYACCOUNT)", project_total, len(t_project_key_codes), "通过 t_project CUSTOMERID/CUSTOMERNO 关联 t_customer"],
+            ],
+        },
+        {
+            "title": "t_income 表覆盖",
+            "columns": ["验证项", "当前范围项目号", "数据库命中项目号", "说明"],
+            "rows": [
+                ["项目号命中", project_total, len(income_code_set), "匹配字段: " + (", ".join(income_code_columns) or "未发现项目号字段")],
+                ["区域(orgName)", project_total, len(income_region_codes), f"覆盖率 {_ratio(len(income_region_codes), project_total)}%"],
+                ["售后(afterSaler)", project_total, len(income_after_codes), f"覆盖率 {_ratio(len(income_after_codes), project_total)}%"],
+            ],
+        },
+    ]
 
     return {
-        "period": {"start": start_str[:10], "end": end.isoformat(), "normalized": normalized_period},
-        "qx_analysis_result": {
-            "原始记录数": raw_count,
-            "去重记录数(按群按日)": dedup_count,
-            "唯一群聊数": unique_groups_raw,
-            "消息总数": msg_total,
-            "漏回群数": missed_groups,
-            "看板口径唯一群聊数": len(dashboard_group_names),
-            "看板口径漏回群数": len(dashboard_missed_groups),
-            "看板口径漏回率": _ratio(len(dashboard_missed_groups), len(dashboard_group_names)),
-            "群名含项目代码率": {"有代码群": codes_linked, "总群数": total_samples, "匹配率": code_match_rate},
+        "period": {"start": start.isoformat(), "end": end.isoformat(), "normalized": normalized_period},
+        "scope": {
+            "groups": len(group_names),
+            "project_codes": project_total,
+            "raw_analysis_rows": len(raw_rows),
+            "latest_analysis_rows": len(latest_rows),
         },
-        "t_project_region_coverage": {
-            "总项目数": t_project_total,
-            "有区域": t_project_with_org,
-            "区域覆盖率": round(t_project_with_org / t_project_total * 100, 1) if t_project_total else 0,
-            "有售后": t_project_with_after,
-            "售后覆盖率": round(t_project_with_after / t_project_total * 100, 1) if t_project_total else 0,
-            "有重点客户": t_customer_key,
-            "重点客户来源": "t_customer.KEYACCOUNT"
-        },
-        "t_income_coverage": {
-            "总项目数": t_income_total,
-            "有区域(orgName)": t_income_with_org,
-            "区域覆盖率": round(t_income_with_org / t_income_total * 100, 1) if t_income_total else 0,
-            "有售后(afterSaler)": t_income_with_after,
-            "售后覆盖率": round(t_income_with_after / t_income_total * 100, 1) if t_income_total else 0,
-        },
-        "t_customer": {
-            "重点客户数": t_customer_key,
-        },
-        "group_samples": group_project_samples[:30],
-        "note": "看板数据来自 _build_overview 中多重过滤聚合后的结果，与原始表 SQL 直查值存在去重差异属于正常。",
+        "sections": sections,
+        "note": "所有验证项均基于当前周期和筛选条件命中的群聊/项目号，不再使用 t_project、t_income、t_customer 的全库总量。",
     }
 
 
 def get_unanswered_summary() -> dict:
     return get_overview("year")["service_quality"]["unanswered"]
+
+
+def _query_by_chunks(
+    conn,
+    operation: str,
+    sql_template: str,
+    values: List[Any],
+    prefix_params: Optional[List[Any]] = None,
+    suffix_params: Optional[List[Any]] = None,
+    chunk_size: int = 100,
+) -> List[dict]:
+    if not values:
+        return []
+    rows: List[dict] = []
+    prefix_params = prefix_params or []
+    suffix_params = suffix_params or []
+    for chunk in _chunked(values, chunk_size):
+        placeholders = ",".join(["%s"] * len(chunk))
+        rows.extend(_query(conn, operation, sql_template.format(placeholders=placeholders), prefix_params + chunk + suffix_params))
+    return rows
+
+
+def _current_dashboard_scope(
+    conn,
+    start: date,
+    end: date,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> dict:
+    latest_rows, raw_count = _latest_rows(conn, start, end)
+    dimensions, quality = _load_dimensions(conn, latest_rows)
+    if region or aftersaler or category or key_account:
+        allowed_groups = {
+            group_name
+            for group_name, dim in dimensions.items()
+            if _dimension_matches(dim, region, aftersaler, category, key_account)
+        }
+        latest_rows = [row for row in latest_rows if row.get("groupName") in allowed_groups]
+        dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
+
+    group_names = sorted({row.get("groupName") for row in latest_rows if row.get("groupName")})
+    project_codes = sorted({
+        code.upper()
+        for dim in dimensions.values()
+        for code in dim.get("codes", [])
+        if code
+    })
+    raw_rows = _query_by_chunks(
+        conn,
+        "scope.analysis_raw",
+        """SELECT * FROM qx_analysis_result
+           WHERE CREATEDTIME >= %s AND CREATEDTIME < %s
+             AND groupName IN ({placeholders})
+           ORDER BY CREATEDTIME""",
+        group_names,
+        prefix_params=[start.isoformat(), (end + timedelta(days=1)).isoformat()],
+    ) if group_names else []
+    return {
+        "latest_rows": latest_rows,
+        "raw_rows": raw_rows,
+        "raw_count_before_filter": raw_count,
+        "dimensions": dimensions,
+        "quality": quality,
+        "group_names": group_names,
+        "project_codes": project_codes,
+    }
+
+
+def _query_project_rows(conn, project_codes: List[str]) -> List[dict]:
+    return _query_by_chunks(
+        conn,
+        "raw.t_project",
+        "SELECT * FROM t_project WHERE PROJECTCODE IN ({placeholders})",
+        project_codes,
+    )
+
+
+def _query_income_rows(conn, project_codes: List[str]) -> Tuple[List[dict], List[str]]:
+    income_columns = _table_columns(conn, "t_income")
+    code_columns = [
+        column
+        for column in ("projectCode", "projectcode", "businesscode", "projectproductcode")
+        if column.lower() in income_columns
+    ]
+    if not code_columns or not project_codes:
+        return [], code_columns
+    rows_by_key: Dict[str, dict] = {}
+    for column in code_columns:
+        for row in _query_by_chunks(
+            conn,
+            "raw.t_income",
+            f"SELECT * FROM t_income WHERE {column} IN ({{placeholders}})",
+            project_codes,
+        ):
+            key = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+            rows_by_key[key] = row
+    return list(rows_by_key.values()), code_columns
+
+
+def _query_customer_rows(conn, project_rows: List[dict], income_rows: List[dict]) -> List[dict]:
+    keys = sorted({
+        str(value).strip()
+        for row in project_rows + income_rows
+        for value in (
+            row_get(row, "CUSTOMERID", "CUSTOMERNO", "customerId", "customerNo", default=None),
+            row_get(row, "customerid", "customerno", default=None),
+        )
+        if value is not None and str(value).strip()
+    })
+    if not keys:
+        return []
+    customer_columns = _table_columns(conn, "t_customer")
+    match_columns = [column for column in ("ID", "CUSTOMERNO", "CUSTOMERID") if column.lower() in customer_columns]
+    if not match_columns:
+        return []
+    rows_by_key: Dict[str, dict] = {}
+    for chunk in _chunked(keys, 100):
+        placeholders = ",".join(["%s"] * len(chunk))
+        where_sql = " OR ".join([f"{column} IN ({placeholders})" for column in match_columns])
+        params = []
+        for _ in match_columns:
+            params.extend(chunk)
+        for row in _query(
+            conn,
+            "raw.t_customer",
+            f"SELECT * FROM t_customer WHERE {where_sql}",
+            params,
+        ):
+            key = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+            rows_by_key[key] = row
+    return list(rows_by_key.values())
+
+
+def _valid_key_account(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text and text not in ("0", "false", "no", "null", "none", "否", "无", "?"))
+
+
+def _project_code_set(rows: List[dict], *columns: str) -> set:
+    values = set()
+    for row in rows:
+        for column in columns:
+            value = row_get(row, column, default=None)
+            if value:
+                values.add(str(value).upper())
+    return values
+
+
+def _csv_cell(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return "" if value is None else value
+
+
+def _write_raw_csv_section(writer, title: str, rows: List[dict]) -> None:
+    writer.writerow([])
+    writer.writerow([f"===== {title} ====="])
+    if not rows:
+        writer.writerow(["(无数据)"])
+        return
+    columns = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([_csv_cell(row.get(column)) for column in columns])
+
 
 def get_export_csv(
     period: str = "month",
@@ -1437,194 +1636,40 @@ def get_export_csv(
     category: str = "",
     key_account: str = "",
 ) -> str:
-    """Export dashboard data as UTF-8-SIG CSV for Excel."""
+    """Export scoped raw database/API data as UTF-8-SIG CSV for Excel."""
     import csv, io
-    data = get_overview(period=period, start_date=start_date, end_date=end_date,
-                        region=region, aftersaler=aftersaler, category=category, key_account=key_account)
-    s = data["summary"]
-    sq = data["service_quality"]
-    comm = data["communication"]
-    biz = data["business"]
-    qual = data["data_quality"]
-    cross = data["cross_analysis"]
-    meta = data["meta"]
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    with database("dashboard.export") as conn:
+        scope = _current_dashboard_scope(conn, start, end, region, aftersaler, category, key_account)
+        project_codes = scope["project_codes"]
+        project_rows = _query_project_rows(conn, project_codes)
+        income_rows, income_code_columns = _query_income_rows(conn, project_codes)
+        customer_rows = _query_customer_rows(conn, project_rows, income_rows)
+
+    lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
+    lims_rows = []
+    for requested_code, records in sorted(lims_records_by_code.items()):
+        for record in records:
+            row = {"_requested_project_code": requested_code}
+            row.update(record)
+            lims_rows.append(row)
 
     output = io.StringIO()
     output.write("\ufeff")  # BOM for Excel
     w = csv.writer(output)
     w.writerow(["===== 导出信息 ====="])
-    w.writerow(["周期", meta["period"], "开始日期", meta["start_date"], "结束日期", meta["end_date"]])
-    w.writerow(["筛选条件", f"区域={meta['filters']['region'] or '(全部)'}",
-                 f"售后={meta['filters']['aftersaler'] or '(全部)'}",
-                 f"产品={meta['filters']['category'] or '(全部)'}",
-                 f"重点客户={meta['filters']['key_account'] or '(全部)'}"])
-    w.writerow([])
+    w.writerow(["导出类型", "当前筛选范围原始数据"])
+    w.writerow(["周期", normalized_period, "开始日期", start.isoformat(), "结束日期", end.isoformat()])
+    w.writerow(["筛选条件", f"区域={region or '(全部)'}", f"售后={aftersaler or '(全部)'}",
+                 f"产品={category or '(全部)'}", f"重点客户={key_account or '(全部)'}"])
+    w.writerow(["命中群聊数", len(scope["group_names"]), "命中项目号数", len(project_codes)])
+    w.writerow(["t_income项目号匹配字段", ", ".join(income_code_columns) or "(未发现)"])
+    w.writerow(["LIMS API请求", lims_stats.get("requests", 0), "返回记录", lims_stats.get("records", 0), "错误", lims_stats.get("errors", 0)])
 
-    # 1. Summary KPIs
-    w.writerow(["===== 1. 经营摘要 (KPI) ====="])
-    w.writerow(["指标", "数值", "说明"])
-    kpis = [
-        ("服务群数", s["total_groups"], "当前周期"),
-        ("沟通消息", s["total_messages"], "去重日记录"),
-        ("项目群", s["project_groups"], "包含项目编号"),
-        ("销售区域", s["regions"], "已关联区域"),
-        ("售后员", s["aftersaler_count"], "LIMS afterSaler"),
-        ("产品类别", s["product_categories"], "一级分类"),
-        ("重点客户", s["key_accounts"], "客户单位"),
-        ("漏回群", sq["unanswered"]["missed_groups"], f"漏回率 {sq['unanswered']['missed_rate']}%"),
-        ("短活跃群占比", s["short_active_ratio"], "活跃<=30天"),
-    ]
-    for name, val, note in kpis:
-        w.writerow([name, val, note])
-    w.writerow([])
-
-    # 2. ????
-    w.writerow(["===== 2. 服务质量 - 情感 ====="])
-    w.writerow(["指标", "数值"])
-    w.writerow(["客户好评", sq["sentiment"]["customer_good"]])
-    w.writerow(["客户差评", sq["sentiment"]["customer_bad"]])
-    w.writerow(["积极服务", sq["sentiment"]["employee_positive"]])
-    w.writerow(["负向服务", sq["sentiment"]["employee_negative"]])
-    w.writerow([])
-
-    # 3. ???? (???)
-    w.writerow(["===== 3. 消息趋势 (按日) ====="])
-    w.writerow(["日期", "消息数", "群聊数", "漏回数"])
-    for item in comm["trend"]:
-        w.writerow([item["date"], item["messages"], item["groups"], item["missed"]])
-    w.writerow([])
-
-    # 4. ??????
-    w.writerow(["===== 4. 群活跃时长分布 ====="])
-    w.writerow(["范围", "标签", "数量", "占比(%)"])
-    for item in comm["active_duration"]:
-        w.writerow([item["range"], item["label"], item["count"], item["percentage"]])
-    w.writerow([])
-
-    # 5. ???
-    w.writerow(["===== 5. 高频关注主题 (Top 20) ====="])
-    w.writerow(["关键词", "出现次数"])
-    for item in comm["high_frequency"]:
-        w.writerow([item["word"], item["count"]])
-    w.writerow([])
-
-    # 6. ???? (????)
-    tp = comm.get("time_period_breakdown", {})
-    w.writerow(["===== 6. 消息时段分布 (按售后) ====="])
-    w.writerow(["售后员", "群聊数", "上午", "下午", "非工作时间", "合计"])
-    for item in tp.get("items", []):
-        w.writerow([item["aftersaler"], item["group_count"],
-                    item["morning"]["count"], item["afternoon"]["count"],
-                    item["after_hours"]["count"], item["total"]])
-    if tp.get("items"):
-        w.writerow(["售后员合计", tp["total_aftersalers"], "群聊合计", tp["total_groups"]])
-    w.writerow([])
-
-    # 7. ????
-    w.writerow(["===== 7. 销售区域覆盖 ====="])
-    w.writerow(["区域", "群数", "消息数", "占比(%)"])
-    for item in biz["regions"]:
-        w.writerow([item["region"], item["group_count"], item["message_count"], item["percentage"]])
-    w.writerow(["Top5覆盖率", "", "", biz.get("top5_coverage", "")])
-    w.writerow([])
-
-    # 8. ????
-    w.writerow(["===== 8. 售后人员分布 ====="])
-    w.writerow(["售后员", "群聊数", "占比(%)"])
-    for item in biz["aftersalers"]:
-        w.writerow([item["name"], item["count"], item["percentage"]])
-    w.writerow([])
-
-    # 9. ????
-    w.writerow(["===== 9. 产品分类 (一级) ====="])
-    w.writerow(["产品分类", "项目数", "占比(%)"])
-    for item in biz["product_categories"]:
-        w.writerow([item["category"], item["count"], item["percentage"]])
-    w.writerow([])
-
-    # 10. ???? (??/??/??)
-    w.writerow(["===== 10. 产品分类层级 (三级) ====="])
-    w.writerow(["一级", "二级", "三级", "项目数"])
-    def write_tree(nodes, level1="", level2=""):
-        for node in nodes:
-            if node.get("children"):
-                if not node.get("children", [])[0].get("children"):
-                    # level2 -> level3
-                    for c in node["children"]:
-                        for gc in c.get("children", []):
-                            w.writerow([level1, c["name"], gc["name"], gc["count"]])
-                        if not c.get("children"):
-                            w.writerow([level1, c["name"], "", c["count"]])
-                else:
-                    # level1 -> level2
-                    nc = node.get("children", [])
-                    for c in nc:
-                        for gc in c.get("children", []):
-                            w.writerow([node["name"], c["name"], gc["name"], gc["count"]])
-            else:
-                w.writerow([level1, "", "", node["count"]])
-    write_tree(biz.get("product_hierarchy", []))
-    w.writerow([])
-
-    # 11. ????
-    w.writerow(["===== 11. 重点客户 ====="])
-    w.writerow(["客户单位", "群聊数", "项目数", "客户名称", "售后员"])
-    for item in biz["key_accounts"]:
-        w.writerow([item["key_account"], item.get("group_count", 0),
-                    item["project_count"], item.get("customer_name", ""),
-                    "; ".join(item.get("aftersalers", []))])
-    w.writerow([])
-
-    # 12. ????
-    w.writerow(["===== 12. 交叉分析 - 销售员 ====="])
-    w.writerow(["区域", "关联群数", "主要分布(前5)"])
-    for item in cross.get("region_sales", []):
-        names = "; ".join([f"{x['name']}({x['count']})" for x in item.get("items", [])[:5]])
-        w.writerow([item["region"], item.get("group_count", 0), names])
-
-    w.writerow(["===== 交叉分析 - 售后员 ====="])
-    w.writerow(["区域", "关联群数", "主要分布(前5)"])
-    for item in cross.get("region_after", []):
-        names = "; ".join([f"{x['name']}({x['count']})" for x in item.get("items", [])[:5]])
-        w.writerow([item["region"], item.get("group_count", 0), names])
-
-    w.writerow(["===== 交叉分析 - 产品类别 ====="])
-    w.writerow(["区域", "关联群数", "产品类别(前5)"])
-    for item in cross.get("region_product", []):
-        names = "; ".join([f"{x['category']}({x['count']})" for x in item.get("items", [])[:5]])
-        w.writerow([item["region"], item.get("group_count", 0), names])
-    w.writerow([])
-
-    # 13. ????
-    w.writerow(["===== 13. 数据质量 ====="])
-    w.writerow(["指标", "数值"])
-    qual_rows = [
-        ("原始记录数", qual["raw_rows"]),
-        ("去重记录数", qual["deduplicated_rows"]),
-        ("已剔除重复记录", qual["duplicate_rows_removed"]),
-        ("项目代码数", qual["project_codes"]),
-        ("已匹配项目代码数", qual["matched_project_codes"]),
-        ("项目匹配率", f"{qual['project_match_rate']}%"),
-        ("产品项目数", qual["product_records"]),
-        ("已匹配产品数", qual["matched_products"]),
-        ("产品匹配率", f"{qual['product_match_rate']}%"),
-        ("有关联售后的群", qual["groups_with_aftersaler"]),
-        ("售后覆盖率", f"{qual['aftersaler_coverage_rate']}%"),
-        ("LIMS关联群", qual["groups_with_lims_link"]),
-        ("LIMS关联率", f"{qual['lims_link_rate']}%"),
-        ("有关联区域的群", qual["groups_with_region"]),
-        ("区域关联率", f"{qual['region_link_rate']}%"),
-        ("有关联重点客户的群", qual["groups_with_key_account"]),
-        ("重点客户关联率", f"{qual['key_account_link_rate']}%"),
-        ("有原始售后字段的群", qual["groups_with_raw_aftersaler"]),
-        ("有LIMS成员字段的群", qual["groups_with_lims_members"]),
-        ("LIMS来源", qual["lims_source"]),
-        ("LIMS API请求数", qual["lims_api_requests"]),
-        ("LIMS API返回记录数", qual["lims_api_records"]),
-        ("LIMS API错误数", qual["lims_api_errors"]),
-    ]
-    for name, val in qual_rows:
-        w.writerow([name, val])
-    w.writerow([])
+    _write_raw_csv_section(w, "qx_analysis_result 原始记录", scope["raw_rows"])
+    _write_raw_csv_section(w, "t_project 原始记录", project_rows)
+    _write_raw_csv_section(w, "t_income 原始记录", income_rows)
+    _write_raw_csv_section(w, "t_customer 原始记录", customer_rows)
+    _write_raw_csv_section(w, "LIMS base_data API 原始返回", lims_rows)
 
     return output.getvalue()

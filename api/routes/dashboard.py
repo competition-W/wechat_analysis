@@ -162,8 +162,16 @@ def verify(
     period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    region: str = Query("", max_length=100),
+    aftersaler: str = Query("", max_length=100),
+    category: str = Query("", max_length=100),
+    key_account: str = Query("", max_length=100),
 ):
-    return _success("verify", db_dashboard.get_verification_stats, period=period, start_date=start_date, end_date=end_date)
+    return _success(
+        "verify", db_dashboard.get_verification_stats,
+        period=period, start_date=start_date, end_date=end_date,
+        region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+    )
 
 
 @router.get("/export")
