@@ -1141,6 +1141,7 @@ def get_evidence(
         items.append({
             "id": row.get("id"), "group_name": group_name,
             "analysis_date": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
+            "msg_times": _extract_msg_times(row.get("missedMessageList", "")) if metric == "unanswered" else [],
             "members": parse_members(row.get("member")),
             "content": content, "core_summary": row.get("coreInfoSummary") or "",
             "project_codes": dim.get("codes", []), "projects": dim.get("projects", []),
@@ -1199,6 +1200,21 @@ def get_high_freq_summary(limit: int = 20) -> dict:
     return {"top_words": values, "total_unique_words": len(values)}
 
 
+
+
+
+def _extract_msg_times(missed_list_json: str) -> list:
+    """从 missedMessageList JSON 中提取 msgtime。"""
+    if not missed_list_json:
+        return []
+    try:
+        import json
+        items = json.loads(missed_list_json) if isinstance(missed_list_json, str) else missed_list_json
+        if isinstance(items, list):
+            return [item.get("msgtime", "") for item in items if item.get("msgtime")]
+        return []
+    except Exception:
+        return []
 
 
 def get_verification_stats(
@@ -1304,7 +1320,7 @@ def get_verification_stats(
             "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND CREATEDBYORGNAME IS NOT NULL AND CREATEDBYORGNAME != ''")[0]["c"]
         t_project_with_after = _query(conn, "verify.t_project_after",
             "SELECT COUNT(*) c FROM t_project WHERE PROJECTCODE LIKE 'LC-%%' AND AFTERSALER IS NOT NULL AND AFTERSALER != ''")[0]["c"]
-        t_project_with_key = _query(conn, "verify.t_project_key",
+        t_project_with_key = 0  # KEYACCOUNT only in t_customer
 
         # V11: t_income ??
         t_income_total = _query(conn, "verify.t_income",
@@ -1329,29 +1345,27 @@ def get_verification_stats(
             "????????": {"????": codes_linked, "???": total_samples, "???": code_match_rate},
         },
         "t_project_region_coverage": {
-            "????": t_project_total,
-            "???": t_project_with_org,
-            "?????": round(t_project_with_org / t_project_total * 100, 1) if t_project_total else 0,
-            "???": t_project_with_after,
-            "?????": round(t_project_with_after / t_project_total * 100, 1) if t_project_total else 0,
-        # 有重点客户: KEYACCOUNT only in t_customer, removed from t_project
+            "总项目数": t_project_total,
+            "有区域": t_project_with_org,
+            "区域覆盖率": round(t_project_with_org / t_project_total * 100, 1) if t_project_total else 0,
+            "有售后": t_project_with_after,
+            "售后覆盖率": round(t_project_with_after / t_project_total * 100, 1) if t_project_total else 0,
+            "有重点客户": t_customer_key,
+            "重点客户来源": "t_customer.KEYACCOUNT"
         },
         "t_income_coverage": {
-            "????": t_income_total,
-            "???(orgName)": t_income_with_org,
-            "?????": round(t_income_with_org / t_income_total * 100, 1) if t_income_total else 0,
-            "???(afterSaler)": t_income_with_after,
-            "?????": round(t_income_with_after / t_income_total * 100, 1) if t_income_total else 0,
+            "总项目数": t_income_total,
+            "有区域(orgName)": t_income_with_org,
+            "区域覆盖率": round(t_income_with_org / t_income_total * 100, 1) if t_income_total else 0,
+            "有售后(afterSaler)": t_income_with_after,
+            "售后覆盖率": round(t_income_with_after / t_income_total * 100, 1) if t_income_total else 0,
         },
         "t_customer": {
-            "?????": t_customer_key,
+            "重点客户数": t_customer_key,
         },
         "group_samples": group_project_samples[:30],
-        "note": "?????? _build_overview ???????????????? SQL ??????????????",
+        "note": "看板数据来自 _build_overview 中多重过滤聚合后的结果，与原始表 SQL 直查值存在去重差异属于正常。",
     }
-
-
-def get_unanswered_summary() -> dict:
     return get_overview("year")["service_quality"]["unanswered"]
 
 def get_export_csv(
