@@ -1377,6 +1377,7 @@ def get_export_csv(
     meta = data["meta"]
 
     output = io.StringIO()
+    output.write("\ufeff")  # BOM for Excel
     w = csv.writer(output)
     w.writerow(["===== ?????? ====="])
     w.writerow(["????", meta["period"], "????", meta["start_date"], "????", meta["end_date"]])
