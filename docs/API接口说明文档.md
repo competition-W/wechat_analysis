@@ -4,7 +4,7 @@
  | :--- | :--- |
  | 版本号 | V2.0 |
  | 创建日期 | 2026-04-17 |
- | 更新日期 | 2026-07-03 |
+ | 更新日期 | 2026-07-07 |
  | 文档状态 | 已更新 |
  | 适用对象 | Java后端开发团队、系统运维人员 |
  
@@ -12,7 +12,15 @@
  
  ## 更新日志
  
- ### V2.0 (2026-07-03)
+ ### V3.0 (2026-07-07)
+ 
+新增功能：
+- Dashboard 数据看板 API（/api/v1/dashboard/overview, /evidence）
+- 数据验证 API（/api/v1/dashboard/verify）
+- CSV 导出 API（/api/v1/dashboard/export）
+- 前端交互式 Web 看板，支持区域/售后/产品/重点客户筛选
+
+### V2.0 (2026-07-03)
  
  新增功能：
  - 可视化API：POST /api/v1/visualize/chart（AntV 图表代理）、POST /api/v1/visualize/generate（看板数据）
