@@ -7,17 +7,22 @@ from services import db_dashboard
 
 class DashboardParsingTests(unittest.TestCase):
     def test_extracts_multiple_project_codes_and_removes_duplicates(self):
-        value = "客户群 LC-P2026001 / LC-X99 / LC-P2026001"
+        value = "客户群 LC-P2026001 / LC-X99 / LC-SP2026002 / LC-P2026001"
         self.assertEqual(
             db_dashboard.extract_project_codes(value),
-            ["LC-P2026001", "LC-X99"],
+            ["LC-P2026001", "LC-SP2026002"],
         )
 
-    def test_extracts_project_code_followed_by_chinese_text(self):
+    def test_extracts_supported_project_code_followed_by_chinese_text(self):
         self.assertEqual(
-            db_dashboard.extract_project_codes("LC-C202604130083项目综合群"),
-            ["LC-C202604130083"],
+            db_dashboard.extract_project_codes("LC-SP202604130083项目综合群"),
+            ["LC-SP202604130083"],
         )
+
+    def test_ignores_non_focus_group_codes(self):
+        self.assertEqual(db_dashboard.extract_project_codes("LC-C202604130083项目综合群"), [])
+        self.assertFalse(db_dashboard.is_focus_group_name("普通交流群"))
+        self.assertTrue(db_dashboard.is_focus_group_name("客户 LC-P202604130083 项目群"))
 
     def test_parses_count_fields(self):
         self.assertEqual(
@@ -54,16 +59,77 @@ class DashboardParsingTests(unittest.TestCase):
         dimension = {
             "regions": ["华东"],
             "aftersalers": ["张三"],
-            "projects": [{"category_l1": "环境", "key_account": "客户甲"}],
+            "projects": [{"category_l1": "环境", "category_l2": "常规转录组", "key_account": "客户甲"}],
         }
         self.assertTrue(
             db_dashboard._dimension_matches(
-                dimension, "华东", "张三", "环境", "客户甲"
+                dimension, "华东", "张三", "常规转录组", "客户甲"
             )
         )
         self.assertFalse(db_dashboard._dimension_matches(dimension, region="华南"))
         self.assertFalse(db_dashboard._dimension_matches(dimension, category="食品"))
 
+    def test_lims_record_keeps_work_unit_and_l2_category(self):
+        item = db_dashboard.normalize_lims_api_record(
+            {
+                "projectCode": "LC-P2026001",
+                "workUnit": "客户单位A",
+                "productBigSortTwo": "常规转录组",
+                "productBigSortThree": "mRNA",
+            },
+            "LC-P2026001",
+        )
+
+        self.assertEqual(item["work_unit"], "客户单位A")
+        self.assertEqual(item["category_l2"], "常规转录组")
+
+    def test_time_period_breakdown_uses_real_msgtime_and_separates_weekend(self):
+        groups = {
+            "客户 LC-P2026001 项目群": {
+                "dimension": {"aftersalers": ["张三"]},
+            }
+        }
+        chat_rows_by_group = {
+            "客户 LC-P2026001 项目群": [
+                {"raw_json": '{"msgtime":"2026-07-06 09:00:00"}'},
+                {"raw_json": '{"msgtime":"2026-07-06 13:00:00"}'},
+                {"raw_json": '{"msgtime":"2026-07-06 18:00:00"}'},
+                {"raw_json": '{"msgtime":"2026-07-11 10:00:00"}'},
+            ]
+        }
+
+        result = db_dashboard._time_period_breakdown(groups, {}, chat_rows_by_group)
+        item = result["items"][0]
+
+        self.assertEqual(item["morning"]["count"], 1)
+        self.assertEqual(item["afternoon"]["count"], 1)
+        self.assertEqual(item["after_hours"]["count"], 1)
+        self.assertEqual(item["weekend"]["count"], 1)
+        self.assertIn("不包含周末", result["after_hours"])
+
+    def test_chat_msgtime_prefers_raw_json_msgtime(self):
+        row = {
+            "msgtime": "2026-07-06 09:00:00",
+            "raw_json": '{"msgtime":"2026-07-06 10:30:00"}',
+        }
+        self.assertEqual(
+            db_dashboard.chat_msgtime(row).strftime("%Y-%m-%d %H:%M:%S"),
+            "2026-07-06 10:30:00",
+        )
+
+    def test_evidence_message_uses_raw_chat_msgtime(self):
+        missed = [{"msgid": "m1", "content": "请问进度", "msgtime": "2026-07-06 09:00:00"}]
+        raw_messages = [{
+            "msgid": "m1",
+            "content": "请问进度",
+            "sender_name": "客户",
+            "msgtime": "2026-07-06 18:30:00",
+        }]
+
+        result = db_dashboard._evidence_messages("unanswered", "", "", missed, raw_messages)
+
+        self.assertEqual(result[0]["msgtime"], "2026-07-06 18:30:00")
+        self.assertEqual(result[0]["sender_name"], "客户")
 
     def test_lims_api_dimensions_use_raw_after_saler(self):
         group_name = "Customer LC-P2026001 support"
@@ -101,6 +167,22 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(dimensions["Customer LC-P2026001 support"]["dimension_source"], "lims_unavailable")
         self.assertEqual(quality["matched_project_codes"], 0)
         self.assertEqual(quality["lims_source"], "base_data_api_unavailable")
+
+    def test_latest_rows_filters_non_focus_groups_from_rows_and_raw_count(self):
+        latest_rows = [
+            {"groupName": "客户 LC-P2026001 项目群"},
+            {"groupName": "普通交流群"},
+        ]
+        raw_rows = [
+            {"groupName": "客户 LC-P2026001 项目群"},
+            {"groupName": "普通交流群"},
+            {"groupName": "客户 LC-SP2026002 特殊项目群"},
+        ]
+        with patch.object(db_dashboard, "_query", side_effect=[latest_rows, raw_rows]):
+            rows, raw_count = db_dashboard._latest_rows(None, date(2026, 7, 1), date(2026, 7, 8))
+
+        self.assertEqual([row["groupName"] for row in rows], ["客户 LC-P2026001 项目群"])
+        self.assertEqual(raw_count, 2)
 
     def test_project_code_diagnostics_lists_missing_groups_and_unmatched_codes(self):
         diagnostics = db_dashboard._project_code_diagnostics(
