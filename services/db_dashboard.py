@@ -16,7 +16,8 @@ from loguru import logger
 
 
 CACHE_TTL_SECONDS = 300
-PROJECT_CODE_RE = re.compile(r"LC-[A-Z]+\d+(?![A-Z0-9])", re.IGNORECASE)
+PROJECT_CODE_RE = re.compile(r"LC-(?:SP|P)\d+(?![A-Z0-9])", re.IGNORECASE)
+ALLOWED_PRODUCT_L2 = {"常规转录组", "表观组学", "微生物"}
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_success: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
@@ -127,6 +128,10 @@ def extract_project_codes(group_name: str) -> List[str]:
     return codes
 
 
+def is_focus_group_name(group_name: str) -> bool:
+    return bool(extract_project_codes(group_name))
+
+
 def get_project_codes(group_name: str) -> List[str]:
     return extract_project_codes(group_name)
 
@@ -184,6 +189,80 @@ def parse_members(value: Any) -> List[str]:
     except (json.JSONDecodeError, TypeError):
         pass
     return [item.strip() for item in re.split(r"[,，、;；\n]", text) if item.strip()]
+
+
+def parse_json_object(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_msg_datetime(value: Any) -> Optional[datetime]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,13}", text):
+        timestamp = int(text)
+        if len(text) >= 13:
+            timestamp = timestamp / 1000
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except (OSError, OverflowError, ValueError):
+            return None
+    normalized = text.replace("T", " ").replace("/", "-").replace("Z", "")
+    if "." in normalized:
+        normalized = normalized.split(".", 1)[0]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized[:len(fmt.replace("%Y", "0000").replace("%m", "00").replace("%d", "00").replace("%H", "00").replace("%M", "00").replace("%S", "00"))], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(normalized).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def chat_msgtime(row: dict) -> Optional[datetime]:
+    raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
+    value = _field_value_case_insensitive(raw, "msgtime", "msgTime", "msg_time", "createTime", "createtime")
+    return parse_msg_datetime(value or row_get(row, "msgtime", "msg_time", default=None))
+
+
+def chat_text(row: dict) -> str:
+    raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
+    return first_nonempty(
+        _field_value_case_insensitive(raw, "content", "text", "msg", "message", "msgContent"),
+        row_get(row, "content", "text", "message", default=""),
+    )
+
+
+def chat_sender(row: dict) -> str:
+    raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
+    return first_nonempty(
+        _field_value_case_insensitive(raw, "sender_name", "sender", "from", "fromName", "name"),
+        row_get(row, "sender_name", "sender", "from", default=""),
+    )
+
+
+def chat_msgid(row: dict) -> str:
+    raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
+    return first_nonempty(
+        _field_value_case_insensitive(raw, "msgid", "msgId", "id"),
+        row_get(row, "msgid", "msgId", "id", default=""),
+    )
 
 
 def row_get(row: dict, *names: str, default: Any = "") -> Any:
@@ -286,6 +365,7 @@ def normalize_lims_api_record(item: dict, code: str) -> dict:
         "category_l1": item.get("productBigSortOne") or "未分类",
         "category_l2": item.get("productBigSortTwo") or "",
         "category_l3": item.get("productBigSortThree") or "",
+        "work_unit": item.get("workUnit") or "",
         "raw_aftersaler": item.get("afterSaler") or "",
         "lims_members": members,
         "group_id": item.get("groupId") or "",
@@ -385,6 +465,48 @@ def _dimensions_from_lims_api(
     return dimensions, quality
 
 
+def _quality_from_dimensions(dimensions: Dict[str, dict], base_quality: dict) -> dict:
+    project_codes = {
+        str(code).upper()
+        for dim in dimensions.values()
+        for code in dim.get("codes", [])
+        if code
+    }
+    matched_codes = {
+        str(project.get("project_code") or "").upper()
+        for dim in dimensions.values()
+        for project in dim.get("projects", [])
+        if project.get("project_code")
+    }
+    return {
+        **base_quality,
+        "project_codes": len(project_codes),
+        "matched_project_codes": len(project_codes & matched_codes),
+        "unmatched_project_codes": len(project_codes - matched_codes),
+        "groups_with_project_code": sum(1 for dim in dimensions.values() if dim.get("codes")),
+        "groups_without_project_code": sum(1 for dim in dimensions.values() if not dim.get("codes")),
+        "groups_without_lims_link": sum(1 for dim in dimensions.values() if dim.get("codes") and not dim.get("projects")),
+        "product_projects": sum(
+            1 for dim in dimensions.values() for project in dim.get("projects", [])
+            if project.get("product_name")
+        ),
+        "matched_products": sum(
+            1 for dim in dimensions.values() for project in dim.get("projects", [])
+            if project.get("category_l2") in ALLOWED_PRODUCT_L2
+        ),
+        "groups_with_aftersaler": sum(1 for dim in dimensions.values() if dim.get("aftersalers")),
+        "groups_with_confirmed_aftersaler": sum(1 for dim in dimensions.values() if dim.get("aftersalers")),
+        "groups_with_lims_link": sum(1 for dim in dimensions.values() if dim.get("projects")),
+        "groups_with_region": sum(1 for dim in dimensions.values() if dim.get("regions")),
+        "groups_with_key_account": sum(
+            1 for dim in dimensions.values()
+            if any(project.get("key_account") for project in dim.get("projects", []))
+        ),
+        "groups_with_raw_aftersaler": sum(1 for dim in dimensions.values() if dim.get("raw_aftersalers")),
+        "groups_with_lims_members": sum(1 for dim in dimensions.values() if dim.get("chat_members")),
+    }
+
+
 def _emotion_total(mapping: Dict[str, int], labels: Iterable[str]) -> int:
     total = 0
     for key, count in mapping.items():
@@ -456,14 +578,18 @@ def _latest_rows(conn, start: date, end: date) -> Tuple[List[dict], int]:
         ) latest ON latest.latest_id = a.id
         ORDER BY a.CREATEDTIME
     """
-    rows = _query(conn, "analysis.latest_daily", sql, params)
-    raw_count = _query(
+    rows = [
+        row for row in _query(conn, "analysis.latest_daily", sql, params)
+        if is_focus_group_name(row.get("groupName", ""))
+    ]
+    raw_count_rows = _query(
         conn,
         "analysis.raw_count",
-        "SELECT COUNT(*) count FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+        "SELECT groupName FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
         params,
-    )[0]["count"]
-    return rows, int(raw_count or 0)
+    )
+    raw_count = sum(1 for row in raw_count_rows if is_focus_group_name(row.get("groupName", "")))
+    return rows, raw_count
 
 
 def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
@@ -619,28 +745,39 @@ def _dimension_matches(
     return not (
         (region and region not in dimension.get("regions", []))
         or (aftersaler and aftersaler not in dimension.get("aftersalers", []))
-        or (category and not any(project.get("category_l1") == category for project in projects))
+        or (category and not any(project.get("category_l2") == category for project in projects))
         or (key_account and not any(project.get("key_account") == key_account for project in projects))
     )
 
 
 
-def _time_period_breakdown(groups, dimensions):
-    """按售后员统计各时段消息数量和群聊数量，反映售后工作量。
-    时段: 上午(8:30-12:00), 下午(12:00-17:30), 非工作时间(17:30-次日8:30), 周末
-    """
+def _time_period_breakdown(groups, dimensions, chat_rows_by_group: Optional[Dict[str, List[dict]]] = None):
+    """按售后员统计真实消息时间所在时段的消息数量和群聊数量。"""
     aftersaler_stats = {}
+    chat_rows_by_group = chat_rows_by_group or {}
     for group_name, item in groups.items():
         dim = dimensions.get(group_name, item.get("dimension", {}))
         aftersalers = dim.get("aftersalers", []) or ["未关联售后"]
-        total_msgs = item.get("messages", 0)
+        messages = chat_rows_by_group.get(group_name, [])
+        if not messages:
+            continue
+        buckets = {"morning": 0, "afternoon": 0, "after_hours": 0, "weekend": 0}
+        for message in messages:
+            msg_time = chat_msgtime(message)
+            if not msg_time:
+                continue
+            minutes = msg_time.hour * 60 + msg_time.minute
+            if msg_time.weekday() >= 5:
+                buckets["weekend"] += 1
+            elif 8 * 60 + 30 <= minutes < 12 * 60:
+                buckets["morning"] += 1
+            elif 12 * 60 <= minutes < 17 * 60 + 30:
+                buckets["afternoon"] += 1
+            else:
+                buckets["after_hours"] += 1
+        total_msgs = sum(buckets.values())
         if total_msgs == 0:
             continue
-        work_hours = round(total_msgs * 0.6)
-        non_work = total_msgs - work_hours
-        morning_msgs = round(work_hours * 0.5)
-        afternoon_msgs = work_hours - morning_msgs
-        after_hours_msgs = non_work
         for person in aftersalers:
             s = aftersaler_stats.setdefault(person, {
                 "aftersaler": person, "groups": set(),
@@ -648,9 +785,10 @@ def _time_period_breakdown(groups, dimensions):
                 "total": 0,
             })
             s["groups"].add(group_name)
-            s["morning"] += morning_msgs
-            s["afternoon"] += afternoon_msgs
-            s["after_hours"] += after_hours_msgs
+            s["morning"] += buckets["morning"]
+            s["afternoon"] += buckets["afternoon"]
+            s["after_hours"] += buckets["after_hours"]
+            s["weekend"] += buckets["weekend"]
             s["total"] += total_msgs
     items = []
     for person, s in aftersaler_stats.items():
@@ -668,7 +806,39 @@ def _time_period_breakdown(groups, dimensions):
     all_groups = set()
     for s in aftersaler_stats.values():
         all_groups.update(s["groups"])
-    return {"items": items, "total_aftersalers": len(items), "total_groups": len(all_groups)}
+    return {
+        "items": items,
+        "total_aftersalers": len(items),
+        "total_groups": len(all_groups),
+        "workday_morning": "08:30-12:00",
+        "workday_afternoon": "12:00-17:30",
+        "after_hours": "工作日 17:30-次日08:30，不包含周末",
+        "weekend": "周六、周日全天单独统计",
+    }
+
+
+def _filter_chat_rows_by_period(chat_rows: List[dict], start: date, end: date) -> List[dict]:
+    filtered = []
+    for row in chat_rows:
+        msg_time = chat_msgtime(row)
+        if msg_time and start <= msg_time.date() <= end:
+            filtered.append(row)
+    return filtered
+
+
+def _chat_rows_by_group_name(group_rows: List[dict], chat_rows: List[dict]) -> Dict[str, List[dict]]:
+    room_to_group = {
+        str(row.get("chat_id") or "").strip(): str(row.get("name") or "").strip()
+        for row in group_rows
+        if str(row.get("chat_id") or "").strip() and str(row.get("name") or "").strip()
+    }
+    result: Dict[str, List[dict]] = defaultdict(list)
+    for row in chat_rows:
+        group_name = room_to_group.get(str(row.get("roomid") or "").strip())
+        if group_name:
+            result[group_name].append(row)
+    return result
+
 
 def _build_overview(
     start: date,
@@ -685,7 +855,7 @@ def _build_overview(
         filter_options = {
             "regions": sorted({value for dim in dimensions.values() for value in dim.get("regions", [])}),
             "aftersalers": sorted({value for dim in dimensions.values() for value in dim.get("aftersalers", [])}),
-            "categories": sorted({p.get("category_l1") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("category_l1")}),
+            "categories": sorted({p.get("category_l2") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("category_l2") in ALLOWED_PRODUCT_L2}),
             "key_accounts": sorted({p.get("key_account") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("key_account")}),
         }
         allowed_groups = set()
@@ -695,11 +865,16 @@ def _build_overview(
         if region or aftersaler or category or key_account:
             rows = [row for row in rows if row["groupName"] in allowed_groups]
             dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
+        quality = _quality_from_dimensions(dimensions, quality)
         groups = _group_aggregates(rows, dimensions)
         durations = _active_durations_from_lims(dimensions)
         missing_duration_groups = [name for name in groups if name not in durations]
         fallback_durations = _active_durations(conn, missing_duration_groups, start, end)
         durations.update(fallback_durations)
+        scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
+        group_rows = _query_group_rows(conn, scoped_group_names)
+        chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
+        chat_rows_by_group = _chat_rows_by_group_name(group_rows, chat_rows)
 
     _filter_region = region
     _filter_aftersaler = aftersaler
@@ -715,9 +890,14 @@ def _build_overview(
     region_messages = Counter()
     region_group_count: Dict[str, int] = {}
     aftersalers = Counter()
+    aftersaler_messages = Counter()
+    aftersaler_projects: Dict[str, set] = defaultdict(set)
     tentative_aftersalers = Counter()
     categories = Counter()
-    product_tree = defaultdict(lambda: defaultdict(Counter))
+    category_groups: Dict[str, set] = defaultdict(set)
+    category_messages = Counter()
+    category_projects: Dict[str, set] = defaultdict(set)
+    product_tree = defaultdict(lambda: defaultdict(lambda: {"projects": set(), "groups": set(), "messages": 0}))
     region_sales = defaultdict(Counter)
     region_after = defaultdict(Counter)
     region_product = defaultdict(Counter)
@@ -736,8 +916,15 @@ def _build_overview(
         employee_negative += item["employee_negative"]
         words.update(item["high_freq"])
         dim = item["dimension"]
+        project_codes_for_group = {
+            project.get("project_code")
+            for project in dim.get("projects", [])
+            if project.get("project_code")
+        }
         for person in dim.get("aftersalers", []):
             aftersalers[person] += 1
+            aftersaler_messages[person] += item["messages"]
+            aftersaler_projects[person].update(project_codes_for_group)
         for person in dim.get("tentative_aftersalers", []):
             tentative_aftersalers[person] += 1
         group_regions = set(dim.get("regions", [])) or {"未关联区域"}
@@ -748,27 +935,46 @@ def _build_overview(
         seen_pairs = set()
         for project in dim.get("projects", []):
             region = project.get("region") or "未关联区域"
-            category = project.get("category_l1") or "未分类"
-            pair = (project.get("project_code"), region, category)
-            if pair not in seen_pairs:
-                categories[category] += 1
-                region_product[region][category] += 1
-                level2 = project.get("category_l2") or "未细分"
-                level3 = project.get("category_l3") or "未细分"
-                product_tree[category][level2][level3] += 1
-                seen_pairs.add(pair)
+            category = project.get("category_l2") or ""
+            if category in ALLOWED_PRODUCT_L2:
+                pair = (project.get("project_code"), region, category)
+                if pair not in seen_pairs:
+                    categories[category] += 1
+                    category_projects[category].add(project.get("project_code"))
+                    category_groups[category].add(group_name)
+                    category_messages[category] += item["messages"]
+                    region_product[region][category] += 1
+                    level3 = project.get("category_l3") or "未细分"
+                    leaf = product_tree[category][level3]
+                    leaf["projects"].add(project.get("project_code"))
+                    leaf["groups"].add(group_name)
+                    leaf["messages"] += item["messages"]
+                    seen_pairs.add(pair)
             sales = project.get("sales_person") or "未分配销售"
             region_sales[region][sales] += 1
             for after in dim.get("aftersalers", []) or ["未关联售后"]:
                 region_after[region][after] += 1
             key = project.get("key_account")
             if key:
-                account = key_accounts.setdefault(key, {"key_account": key, "projects": set(), "customers": set(), "aftersalers": set(), "groups": set()})
+                account = key_accounts.setdefault(key, {
+                    "key_account": key, "projects": set(), "customers": set(), "aftersalers": set(),
+                    "groups": set(), "messages": 0, "work_units": set(), "category_l3": set(),
+                    "high_freq": Counter(), "active_days": [],
+                })
                 account["projects"].add(project.get("project_code"))
                 if project.get("customer_name"):
                     account["customers"].add(project["customer_name"])
                 account["aftersalers"].update(dim.get("aftersalers", []))
+                if group_name not in account["groups"]:
+                    account["messages"] += item["messages"]
+                    account["high_freq"].update(item["high_freq"])
                 account["groups"].add(group_name)
+                if project.get("work_unit"):
+                    account["work_units"].add(project["work_unit"])
+                if project.get("category_l3"):
+                    account["category_l3"].add(project["category_l3"])
+                if parse_int(project.get("active_day")) is not None:
+                    account["active_days"].append(parse_int(project.get("active_day")))
     if _filter_aftersaler:
         aftersalers = Counter({_filter_aftersaler: aftersalers.get(_filter_aftersaler, 0)})
     if _filter_region:
@@ -800,35 +1006,47 @@ def _build_overview(
     account_items = []
     for value in key_accounts.values():
         customer_names = sorted(value.get("customers", set()))
+        work_units = sorted(value.get("work_units", set()))
         account_items.append({
             "key_account": value["key_account"],
+            "work_unit": work_units[0] if work_units else "",
+            "work_units": work_units[:5],
             "customer_name": customer_names[0] if customer_names else "",
             "customer_names": customer_names[:5],
             "group_count": len(value.get("groups", set())),
             "project_count": len(value["projects"]),
+            "message_count": value.get("messages", 0),
             "customer_count": len(value["customers"]),
             "aftersalers": sorted(value["aftersalers"]),
+            "category_l3": sorted(value.get("category_l3", set()))[:8],
+            "high_frequency_top5": [
+                {"word": word, "count": count}
+                for word, count in value.get("high_freq", Counter()).most_common(5)
+            ],
+            "active_day": max(value.get("active_days", []) or [0]),
         })
     account_items.sort(key=lambda value: (-value["group_count"], -value["project_count"], value["key_account"]))
     product_hierarchy = []
-    for level1, level2_map in product_tree.items():
+    for level2, level3_map in product_tree.items():
         children = []
-        for level2, level3_counter in level2_map.items():
+        for level3, stats in level3_map.items():
             children.append({
-                "name": level2,
-                "count": sum(level3_counter.values()),
-                "children": [
-                    {"name": name, "count": count}
-                    for name, count in level3_counter.most_common()
-                ],
+                "name": level3,
+                "project_count": len(stats["projects"]),
+                "group_count": len(stats["groups"]),
+                "message_count": stats["messages"],
+                "count": len(stats["projects"]),
             })
-        children.sort(key=lambda value: (-value["count"], value["name"]))
+        children.sort(key=lambda value: (-value["project_count"], value["name"]))
         product_hierarchy.append({
-            "name": level1,
-            "count": sum(value["count"] for value in children),
+            "name": level2,
+            "project_count": len(category_projects[level2]),
+            "group_count": len(category_groups[level2]),
+            "message_count": category_messages[level2],
+            "count": len(category_projects[level2]),
             "children": children,
         })
-    product_hierarchy.sort(key=lambda value: (-value["count"], value["name"]))
+    product_hierarchy.sort(key=lambda value: (-value["project_count"], value["name"]))
 
     matched_codes = quality["matched_project_codes"]
     project_codes = quality["project_codes"]
@@ -865,13 +1083,33 @@ def _build_overview(
             "trend": [{"date": day, "messages": value["messages"], "groups": len(value["groups"]), "missed": value["missed"]} for day, value in sorted(daily.items())],
             "high_frequency": [{"word": word, "count": count} for word, count in words.most_common(20)],
             "active_duration": duration_items,
-            "time_period_breakdown": _time_period_breakdown(groups, dimensions),
+            "time_period_breakdown": _time_period_breakdown(groups, dimensions, chat_rows_by_group),
         },
         "business": {
-            "aftersalers": _counter_items(aftersalers),
+            "aftersalers": [
+                {
+                    "name": name,
+                    "count": count,
+                    "group_count": count,
+                    "project_count": len(aftersaler_projects[name]),
+                    "message_count": aftersaler_messages[name],
+                    "percentage": _ratio(count, sum(aftersalers.values())),
+                }
+                for name, count in aftersalers.most_common()
+            ],
             "tentative_aftersalers": _counter_items(tentative_aftersalers),
             "regions": region_items, "top5_coverage": top5_coverage,
-            "product_categories": _counter_items(categories, "category"),
+            "product_categories": [
+                {
+                    "category": name,
+                    "count": len(category_projects[name]),
+                    "project_count": len(category_projects[name]),
+                    "group_count": len(category_groups[name]),
+                    "message_count": category_messages[name],
+                    "percentage": _ratio(len(category_projects[name]), sum(len(v) for v in category_projects.values())),
+                }
+                for name, _ in categories.most_common()
+            ],
             "product_hierarchy": product_hierarchy,
             "key_accounts": account_items,
         },
@@ -975,6 +1213,13 @@ def get_evidence(
     with database("dashboard.evidence") as conn:
         rows, _ = _latest_rows(conn, start, end)
         dimensions, _ = _load_dimensions(conn, rows)
+        allowed_groups = [
+            row.get("groupName") for row in rows
+            if row.get("groupName") and _dimension_matches(dimensions.get(row.get("groupName"), {}), region, aftersaler, category, key_account)
+        ]
+        group_rows = _query_group_rows(conn, sorted(set(allowed_groups)))
+        chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
+        raw_messages = _raw_messages_by_group(group_rows, chat_rows)
     items = []
     metric = metric.lower()
     for row in reversed(rows):
@@ -1009,11 +1254,18 @@ def get_evidence(
             continue
         if search and search.lower() not in (group_name + " " + str(content) + " " + str(row.get("member") or "")).lower():
             continue
+        group_raw_messages = raw_messages.get(group_name, [])
+        display_messages = _evidence_messages(metric, content, keyword or "", missed_messages, group_raw_messages)
+        msg_times = [
+            item["msgtime"] for item in display_messages if item.get("msgtime")
+        ] or [
+            item["msgtime"] for item in group_raw_messages if item.get("msgtime")
+        ][:1]
         items.append({
             "id": row.get("id"), "group_name": group_name,
             "analysis_date": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
-            "msg_times": [item["msgtime"] for item in missed_messages if item.get("msgtime")],
-            "messages": missed_messages,
+            "msg_times": msg_times,
+            "messages": display_messages,
             "members": parse_members(row.get("member")),
             "content": content, "core_summary": row.get("coreInfoSummary") or "",
             "project_codes": dim.get("codes", []), "projects": dim.get("projects", []),
@@ -1102,6 +1354,58 @@ def _extract_missed_messages(missed_list_json: Any) -> List[dict]:
 def _extract_msg_times(missed_list_json: Any) -> list:
     """Extract original msgtime values from missedMessageList."""
     return [item["msgtime"] for item in _extract_missed_messages(missed_list_json) if item.get("msgtime")]
+
+
+def _display_chat_message(row: dict) -> dict:
+    msg_time = chat_msgtime(row)
+    return {
+        "msgid": chat_msgid(row),
+        "sender_name": chat_sender(row),
+        "content": chat_text(row),
+        "msgtime": msg_time.strftime("%Y-%m-%d %H:%M:%S") if msg_time else "",
+    }
+
+
+def _raw_messages_by_group(group_rows: List[dict], chat_rows: List[dict]) -> Dict[str, List[dict]]:
+    grouped = _chat_rows_by_group_name(group_rows, chat_rows)
+    result = {}
+    for group_name, rows in grouped.items():
+        messages = [_display_chat_message(row) for row in rows]
+        messages.sort(key=lambda item: item.get("msgtime") or "")
+        result[group_name] = messages
+    return result
+
+
+def _match_raw_message(message: dict, raw_messages: List[dict]) -> dict:
+    msgid = str(message.get("msgid") or "").strip()
+    content = str(message.get("content") or "").strip()
+    for raw in raw_messages:
+        if msgid and msgid == str(raw.get("msgid") or "").strip():
+            return {**message, **{k: v for k, v in raw.items() if v}}
+    if content:
+        for raw in raw_messages:
+            raw_content = str(raw.get("content") or "")
+            if content in raw_content or raw_content in content:
+                return {**message, **{k: v for k, v in raw.items() if v}}
+    return message
+
+
+def _evidence_messages(metric: str, content: str, keyword: str, missed_messages: List[dict], raw_messages: List[dict]) -> List[dict]:
+    if metric == "unanswered":
+        return [_match_raw_message(message, raw_messages) for message in missed_messages]
+    if metric == "highfreq" and keyword:
+        lowered = keyword.lower()
+        return [
+            message for message in raw_messages
+            if lowered in str(message.get("content") or "").lower()
+        ][:10]
+    text = str(content or "")
+    if metric in ("customer_negative", "employee_negative") and text:
+        return [
+            message for message in raw_messages
+            if message.get("content") and str(message["content"]) in text
+        ][:10]
+    return []
 
 
 def _project_code_diagnostics(
