@@ -1053,9 +1053,9 @@ def _build_overview(
     matched_products = quality["matched_products"]
     product_projects = quality["product_projects"]
     aftersaler_groups = quality.get("groups_with_aftersaler", quality.get("groups_with_confirmed_aftersaler", 0))
-    cross_sales = [{"region": region, "group_count": region_group_count.get(region, 0), "items": _counter_items(counter)} for region, counter in region_sales.items()]
-    cross_after = [{"region": region, "group_count": region_group_count.get(region, 0), "items": _counter_items(counter)} for region, counter in region_after.items()]
-    cross_product = [{"region": region, "group_count": region_group_count.get(region, 0), "items": _counter_items(counter, "category")} for region, counter in region_product.items()]
+    cross_sales = [{"region": region, "group_count": region_group_count.get(region, 0), "message_count": region_messages.get(region, 0), "items": _counter_items(counter)} for region, counter in region_sales.items()]
+    cross_after = [{"region": region, "group_count": region_group_count.get(region, 0), "message_count": region_messages.get(region, 0), "items": _counter_items(counter)} for region, counter in region_after.items()]
+    cross_product = [{"region": region, "group_count": region_group_count.get(region, 0), "message_count": region_messages.get(region, 0), "items": _counter_items(counter, "category")} for region, counter in region_product.items()]
 
     return {
         "meta": {
