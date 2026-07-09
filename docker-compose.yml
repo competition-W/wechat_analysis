@@ -10,9 +10,9 @@ services:
     env_file:
       - .env.production
     volumes:
-      - app-logs:/app/logs
-      - app-reports:/app/reports
-      - app-archive:/app/archive
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./archive:/app/archive
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 30s
