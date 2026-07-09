@@ -10,8 +10,8 @@ class Settings(BaseSettings):
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         description="LLM API基础URL"
     )
-    LLM_MODEL_SUMMARY: str = Field(default="qwen-long", description="摘要生成模型")
-    LLM_MODEL_SENTIMENT: str = Field(default="qwen-plus", description="情感分析模型")
+    LLM_MODEL_SUMMARY: str = Field(default="qwen3.7-plus", description="摘要生成模型")
+    LLM_MODEL_SENTIMENT: str = Field(default="qwen3.7-plus", description="情感分析模型")
     
     SENSITIVE_WORDS: str = Field(default="", description="敏感词列表(逗号分隔)")
     
@@ -27,10 +27,10 @@ class Settings(BaseSettings):
     
     LLM_TIMEOUT: int = Field(default=120, description="LLM调用超时时间(秒)")
     LLM_MAX_RETRIES: int = Field(default=2, description="LLM调用最大重试次数")
-    LLM_BATCH_SIZE: int = Field(default=50, description="LLM批量分析每批消息数")
-    LLM_MAX_CONCURRENT: int = Field(default=10, description="LLM最大并发调用数")
+    LLM_BATCH_SIZE: int = Field(default=30, description="LLM批量分析每批消息数")
+    LLM_MAX_CONCURRENT: int = Field(default=5, description="LLM最大并发调用数")
     
-    SUMMARY_MAX_MESSAGES: int = Field(default=150, description="摘要最大消息数")
+    SUMMARY_MAX_MESSAGES: int = Field(default=100, description="摘要最大消息数")
     SUMMARY_MAX_LENGTH: int = Field(default=1000, description="摘要最大长度")
     HIGH_FREQ_TOP_N: int = Field(default=20, description="高频词返回数量")
 
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
         default="/base_data/",
         description="LIMS base_data 接口路径"
     )
-    LIMS_API_TIMEOUT: int = Field(default=30, description="LIMS API 超时时间(秒)")
+    LIMS_API_TIMEOUT: int = Field(default=60, description="LIMS API 超时时间(秒)")
 
     PROJECT_CODE_PATTERN: str = Field(
     default=r"LC-[A-Z]+\d+",
