@@ -1,0 +1,26 @@
+{
+  "rooms": [
+    {
+      "room_id": "test_room_001",
+      "room_name": "测试群",
+      "messages": [
+        {
+          "truename": "客户A",
+          "content": "老师您好，我想问一下结果什么时候出来？",
+          "msgtype": "text",
+          "from": "user_001",
+          "members": "[]"
+        },
+        {
+          "truename": "售后B",
+          "content": "老师您好，我们这边帮您确认一下进度。",
+          "msgtype": "text",
+          "from": "user_002",
+          "members": "[]"
+        }
+      ]
+    }
+  ],
+  "max_concurrent": 1,
+  "analysis_types": ["sentiment", "sensitive", "summary", "highfreq", "unanswered"]
+}

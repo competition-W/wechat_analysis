@@ -185,14 +185,14 @@ def export_data(
     key_account: str = Query("", max_length=100),
 ):
     from fastapi.responses import Response
-    csv_content = db_dashboard.get_export_csv(
+    excel_content = db_dashboard.get_export_excel(
         period=period, start_date=start_date, end_date=end_date,
         region=region, aftersaler=aftersaler, category=category, key_account=key_account,
     )
-    filename = f"dashboard_export_{period}_{start_date or ''}_{end_date or ''}.csv"
+    filename = f"dashboard_export_{period}_{start_date or ''}_{end_date or ''}.xlsx"
     return Response(
-        content=csv_content.encode("utf-8-sig") if not csv_content.startswith("\ufeff") else csv_content.encode("utf-8"),
-        media_type="text/csv; charset=utf-8",
+        content=excel_content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
     )
 
