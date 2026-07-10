@@ -1,5 +1,7 @@
 import unittest
+from contextlib import contextmanager
 from datetime import date
+from io import BytesIO
 from unittest.mock import patch
 
 from services import db_dashboard
@@ -59,7 +61,7 @@ class DashboardParsingTests(unittest.TestCase):
         dimension = {
             "regions": ["华东"],
             "aftersalers": ["张三"],
-            "projects": [{"category_l1": "环境", "category_l2": "常规转录组", "key_account": "客户甲"}],
+            "projects": [{"region": "华东", "raw_aftersaler": "张三", "category_l1": "环境", "category_l2": "常规转录组", "key_account": "客户甲"}],
         }
         self.assertTrue(
             db_dashboard._dimension_matches(
@@ -69,6 +71,214 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertFalse(db_dashboard._dimension_matches(dimension, region="华南"))
         self.assertFalse(db_dashboard._dimension_matches(dimension, category="食品"))
 
+    def test_all_products_excludes_projects_outside_the_three_allowed_categories(self):
+        dimension = {
+            "regions": ["华东"],
+            "aftersalers": ["张三"],
+            "projects": [
+                {"project_code": "LC-P1", "region": "华东", "category_l2": "常规转录组"},
+                {"project_code": "LC-P2", "region": "华东", "category_l2": "蛋白质组"},
+            ],
+        }
+
+        scoped = db_dashboard._scope_dimension(dimension)
+
+        self.assertTrue(db_dashboard._dimension_matches(dimension))
+        self.assertEqual([item["project_code"] for item in scoped["projects"]], ["LC-P1"])
+        self.assertEqual(scoped["codes"], ["LC-P1"])
+        self.assertFalse(db_dashboard._dimension_matches({
+            **dimension,
+            "projects": [{"category_l2": "蛋白质组"}],
+        }))
+
+    def test_project_filters_must_match_the_same_lims_record(self):
+        dimension = {
+            "aftersalers": ["张三"],
+            "projects": [
+                {"region": "华东", "raw_aftersaler": "张三", "category_l2": "常规转录组", "key_account": "客户甲"},
+                {"region": "华南", "raw_aftersaler": "李四", "category_l2": "微生物", "key_account": "客户乙"},
+            ],
+        }
+
+        self.assertFalse(db_dashboard._dimension_matches(
+            dimension, region="华东", category="微生物", key_account="客户乙"
+        ))
+        self.assertTrue(db_dashboard._dimension_matches(
+            dimension, region="华南", category="微生物", key_account="客户乙"
+        ))
+        self.assertFalse(db_dashboard._dimension_matches(
+            dimension, region="华南", aftersaler="张三", category="微生物", key_account="客户乙"
+        ))
+
+    def test_overview_applies_product_scope_to_topics_accounts_and_cross_analysis(self):
+        rows = [
+            {
+                "groupName": "允许产品群", "CREATEDTIME": "2026-07-08 10:00:00",
+                "messageToDayCount": 10, "isMissedMessage": "0",
+                "customerEmotionAnalysis": "好评:1", "saleEmotionAnalysis": "积极:1",
+                "highFrequencyWords": "允许主题:3",
+            },
+            {
+                "groupName": "其它产品群", "CREATEDTIME": "2026-07-08 10:00:00",
+                "messageToDayCount": 99, "isMissedMessage": "1",
+                "customerEmotionAnalysis": "差评:9", "saleEmotionAnalysis": "负向:9",
+                "highFrequencyWords": "其它主题:20",
+            },
+        ]
+        dimensions = {
+            "允许产品群": {
+                "codes": ["LC-P1", "LC-P3", "LC-P4"], "regions": ["华东"], "aftersalers": ["张三"],
+                "projects": [
+                    {
+                        "project_code": "LC-P1", "region": "华东", "sales_person": "销售甲",
+                        "raw_aftersaler": "张三", "analysis_simple_remark": "问题项目",
+                        "category_l2": "常规转录组", "category_l3": "mRNA",
+                        "key_account": "重点客户甲", "customer_name": "客户甲",
+                        "work_unit": "单位甲", "active_day": 12,
+                    },
+                    {
+                        "project_code": "LC-P3", "region": "华东", "sales_person": "销售甲",
+                        "raw_aftersaler": "张三", "analysis_simple_remark": "正常交付",
+                        "category_l2": "表观组学", "category_l3": "甲基化",
+                        "active_day": 8,
+                    },
+                    {
+                        "project_code": "LC-P4", "region": "华东", "sales_person": "销售甲",
+                        "raw_aftersaler": "张三", "analysis_simple_remark": "暂不交付",
+                        "category_l2": "微生物", "category_l3": "扩增子",
+                        "active_day": 5,
+                    },
+                ],
+            },
+            "其它产品群": {
+                "codes": ["LC-P2"], "regions": ["华南"], "aftersalers": ["李四"],
+                "projects": [{
+                    "project_code": "LC-P2", "region": "华南", "sales_person": "销售乙",
+                    "raw_aftersaler": "李四", "analysis_simple_remark": "问题项目",
+                    "category_l2": "蛋白质组", "category_l3": "蛋白",
+                    "key_account": "其它重点客户", "customer_name": "客户乙",
+                    "work_unit": "单位乙", "active_day": 20,
+                }],
+            },
+        }
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_latest_rows", return_value=(rows, 2)),
+            patch.object(db_dashboard, "_load_dimensions", return_value=(dimensions, {})),
+            patch.object(db_dashboard, "_raw_analysis_count", return_value=1),
+            patch.object(db_dashboard, "_query_group_rows", return_value=[]),
+            patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
+        ):
+            result = db_dashboard._build_overview(
+                date(2026, 7, 1), date(2026, 7, 8), "custom"
+            )
+            microbe_result = db_dashboard._build_overview(
+                date(2026, 7, 1), date(2026, 7, 8), "custom", category="微生物"
+            )
+
+        self.assertEqual(result["summary"]["total_groups"], 1)
+        self.assertEqual(result["summary"]["total_messages"], 10)
+        self.assertEqual(result["communication"]["high_frequency"], [
+            {"word": "允许主题", "count": 3}
+        ])
+        self.assertEqual(
+            [item["key_account"] for item in result["business"]["key_accounts"]],
+            ["重点客户甲"],
+        )
+        self.assertEqual(
+            [item["region"] for item in result["cross_analysis"]["region_sales"]],
+            ["华东"],
+        )
+        self.assertEqual(result["service_quality"]["unanswered"]["missed_groups"], 0)
+        self.assertEqual(result["project_attention"]["total_projects"], 2)
+        self.assertEqual(
+            [item["status"] for item in result["project_attention"]["summary"]],
+            ["问题项目", "暂不交付"],
+        )
+        self.assertEqual(
+            [item["project_code"] for item in result["project_attention"]["items"]],
+            ["LC-P1", "LC-P4"],
+        )
+        self.assertEqual(
+            [item["project_code"] for item in microbe_result["project_attention"]["items"]],
+            ["LC-P4"],
+        )
+
+    def test_excel_export_splits_dashboard_modules_and_raw_sources_into_sheets(self):
+        from openpyxl import load_workbook
+
+        overview = {
+            "summary": {
+                "total_groups": 1, "total_messages": 10, "project_groups": 1,
+                "regions": 1, "aftersaler_count": 1, "product_categories": 1,
+                "key_accounts": 1, "short_active_ratio": 100,
+            },
+            "communication": {
+                "trend": [{"date": "2026-07-08", "messages": 10, "groups": 1, "missed": 0}],
+                "high_frequency": [{"word": "转录", "count": 3}],
+                "active_duration": [{"range": "8-30天", "label": "短期服务", "count": 1, "percentage": 100}],
+            },
+            "business": {
+                "regions": [{"region": "华东", "group_count": 1}],
+                "aftersalers": [{"name": "张三", "group_count": 1}],
+                "product_categories": [{"category": "常规转录组", "project_count": 1}],
+                "key_accounts": [{"key_account": "重点客户甲", "project_count": 1}],
+            },
+            "project_attention": {
+                "target_statuses": ["问题项目", "暂不交付"],
+                "total_projects": 1,
+                "summary": [{"status": "问题项目", "project_count": 1}],
+                "items": [{"status": "问题项目", "project_code": "LC-P1"}],
+            },
+            "cross_analysis": {
+                "region_sales": [], "region_after": [], "region_product": [],
+            },
+            "service_quality": {
+                "unanswered": {"total_groups": 1, "missed_groups": 0},
+                "sentiment": {"customer_good": 1, "customer_bad": 0},
+            },
+            "data_quality": {"project_codes": 1, "matched_project_codes": 1},
+        }
+        scope = {
+            "project_codes": ["LC-P1"], "group_names": ["允许产品群"],
+            "raw_rows": [{"groupName": "允许产品群"}],
+            "group_rows": [{"name": "允许产品群"}],
+            "chat_rows": [{"roomid": "room-1", "content": "测试"}],
+        }
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "get_overview", return_value=overview),
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_query_qx_raw_scope", return_value=scope),
+            patch.object(db_dashboard, "fetch_lims_base_data", return_value=({
+                "LC-P1": [{
+                    "projectCode": "LC-P1", "productBigSortTwo": "常规转录组",
+                    "productName": "RNA", "customerName": "客户甲",
+                }]
+            }, {"requests": 1, "records": 1, "errors": 0})),
+        ):
+            content = db_dashboard.get_export_excel(
+                "custom", "2026-07-01", "2026-07-08"
+            )
+
+        workbook = load_workbook(BytesIO(content), read_only=True)
+        self.assertTrue({
+            "导出说明", "经营摘要", "高频关注主题", "重点客户", "项目状态关注", "服务质量",
+            "analysis原始数据", "group原始数据", "chat原始数据", "LIMS原始数据",
+        }.issubset(set(workbook.sheetnames)))
+        self.assertEqual(workbook["高频关注主题"]["A2"].value, "转录")
+        self.assertEqual(workbook["项目状态关注"]["A2"].value, "问题项目")
+        self.assertEqual(workbook["LIMS原始数据"]["B2"].value, "LC-P1")
+
     def test_lims_record_keeps_work_unit_and_l2_category(self):
         item = db_dashboard.normalize_lims_api_record(
             {
@@ -76,12 +286,14 @@ class DashboardParsingTests(unittest.TestCase):
                 "workUnit": "客户单位A",
                 "productBigSortTwo": "常规转录组",
                 "productBigSortThree": "mRNA",
+                "analysisSimpleRemark": "  问题项目  ",
             },
             "LC-P2026001",
         )
 
         self.assertEqual(item["work_unit"], "客户单位A")
         self.assertEqual(item["category_l2"], "常规转录组")
+        self.assertEqual(item["analysis_simple_remark"], "问题项目")
 
     def test_time_period_breakdown_uses_real_msgtime_and_separates_weekend(self):
         groups = {

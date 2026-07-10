@@ -13,6 +13,9 @@ from loguru import logger
 import httpx
 
 
+PROJECT_CODE_RE = re.compile(r"LC-(?:SP|P)\d+(?![A-Z0-9])", re.IGNORECASE)
+
+
 @dataclass
 class QxChatGroup:
     """从 qxChat API 拉取并分组后的群信息"""
@@ -121,7 +124,11 @@ def extract_project_codes(room_name: str) -> List[str]:
     """从群聊名称中提取所有项目编号 LC-XXXX"""
     if not room_name:
         return []
-    return re.findall(r"LC-[A-Z]+\d+", room_name)
+    codes = []
+    for match in PROJECT_CODE_RE.findall(room_name.upper()):
+        if match not in codes:
+            codes.append(match)
+    return codes
 
 
 def extract_project_code(room_name: str) -> Optional[str]:
@@ -140,7 +147,7 @@ class DataCollector:
         qxchat_url: Optional[str] = None,
         lims_base_url: Optional[str] = None,
         lims_path: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = 120,
     ):
         from config.settings import settings
         self.qxchat_url = qxchat_url or settings.JAVA_DATA_SOURCE_URL

@@ -18,6 +18,7 @@ from loguru import logger
 CACHE_TTL_SECONDS = 300
 PROJECT_CODE_RE = re.compile(r"LC-(?:SP|P)\d+(?![A-Z0-9])", re.IGNORECASE)
 ALLOWED_PRODUCT_L2 = {"常规转录组", "表观组学", "微生物"}
+PROJECT_ATTENTION_STATUSES = ("问题项目", "暂不交付")
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_success: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
@@ -372,6 +373,7 @@ def normalize_lims_api_record(item: dict, code: str) -> dict:
         "active_day": extract_lims_active_day(item),
         "start_time": item.get("startTime") or "",
         "end_time": item.get("endTime") or "",
+        "analysis_simple_remark": str(item.get("analysisSimpleRemark") or "").strip(),
         "dimension_source": "lims_base_data_api",
     }
 
@@ -592,6 +594,27 @@ def _latest_rows(conn, start: date, end: date) -> Tuple[List[dict], int]:
     return rows, raw_count
 
 
+def _raw_analysis_count(
+    conn,
+    start: date,
+    end: date,
+    group_names: List[str],
+) -> int:
+    """Count raw analysis records inside the already-filtered dashboard group scope."""
+    if not group_names:
+        return 0
+    rows = _query_by_chunks(
+        conn,
+        "analysis.scoped_raw_count",
+        """SELECT COUNT(*) AS total FROM qx_analysis_result
+           WHERE CREATEDTIME >= %s AND CREATEDTIME < %s
+             AND groupName IN ({placeholders})""",
+        group_names,
+        prefix_params=[start.isoformat(), (end + timedelta(days=1)).isoformat()],
+    )
+    return sum(int(row.get("total") or 0) for row in rows)
+
+
 def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
     group_codes = {row["groupName"]: extract_project_codes(row.get("groupName", "")) for row in rows}
     codes = sorted({code for values in group_codes.values() for code in values})
@@ -741,13 +764,56 @@ def _dimension_matches(
     category: str = "",
     key_account: str = "",
 ) -> bool:
-    projects = dimension.get("projects", [])
-    return not (
-        (region and region not in dimension.get("regions", []))
-        or (aftersaler and aftersaler not in dimension.get("aftersalers", []))
-        or (category and not any(project.get("category_l2") == category for project in projects))
-        or (key_account and not any(project.get("key_account") == key_account for project in projects))
-    )
+    return bool(_matching_projects(dimension, region, category, key_account, aftersaler))
+
+
+def _matching_projects(
+    dimension: dict,
+    region: str = "",
+    category: str = "",
+    key_account: str = "",
+    aftersaler: str = "",
+) -> List[dict]:
+    """Return projects in the dashboard product scope that match one record-level filter."""
+    if category and category not in ALLOWED_PRODUCT_L2:
+        return []
+    return [
+        project
+        for project in dimension.get("projects", [])
+        if project.get("category_l2") in ALLOWED_PRODUCT_L2
+        and (not category or project.get("category_l2") == category)
+        and (not region or project.get("region") == region)
+        and (not key_account or project.get("key_account") == key_account)
+        and (not aftersaler or project.get("raw_aftersaler") == aftersaler)
+    ]
+
+
+def _scope_dimension(
+    dimension: dict,
+    region: str = "",
+    category: str = "",
+    key_account: str = "",
+    aftersaler: str = "",
+) -> dict:
+    """Copy a dimension and remove projects outside the shared dashboard scope."""
+    scoped = copy.deepcopy(dimension)
+    projects = _matching_projects(dimension, region, category, key_account, aftersaler)
+    scoped["projects"] = projects
+    scoped["codes"] = sorted({
+        str(project.get("project_code") or "").upper()
+        for project in projects
+        if project.get("project_code")
+    })
+    scoped["regions"] = sorted({
+        project.get("region") for project in projects if project.get("region")
+    })
+    scoped["aftersalers"] = sorted({
+        project.get("raw_aftersaler")
+        for project in projects
+        if project.get("raw_aftersaler")
+    })
+    scoped["raw_aftersalers"] = list(scoped["aftersalers"])
+    return scoped
 
 
 
@@ -852,19 +918,38 @@ def _build_overview(
     with database("dashboard.overview") as conn:
         rows, raw_count = _latest_rows(conn, start, end)
         dimensions, quality = _load_dimensions(conn, rows)
-        filter_options = {
-            "regions": sorted({value for dim in dimensions.values() for value in dim.get("regions", [])}),
-            "aftersalers": sorted({value for dim in dimensions.values() for value in dim.get("aftersalers", [])}),
-            "categories": sorted({p.get("category_l2") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("category_l2") in ALLOWED_PRODUCT_L2}),
-            "key_accounts": sorted({p.get("key_account") for dim in dimensions.values() for p in dim.get("projects", []) if p.get("key_account")}),
+        base_dimensions = {
+            group_name: _scope_dimension(dim)
+            for group_name, dim in dimensions.items()
+            if _dimension_matches(dim)
         }
-        allowed_groups = set()
-        for group_name, dim in dimensions.items():
-            if _dimension_matches(dim, region, aftersaler, category, key_account):
-                allowed_groups.add(group_name)
-        if region or aftersaler or category or key_account:
-            rows = [row for row in rows if row["groupName"] in allowed_groups]
-            dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
+        filter_options = {
+            "regions": sorted({value for dim in base_dimensions.values() for value in dim.get("regions", [])}),
+            "aftersalers": sorted({value for dim in base_dimensions.values() for value in dim.get("aftersalers", [])}),
+            "categories": sorted({
+                p.get("category_l2")
+                for dim in base_dimensions.values()
+                for p in dim.get("projects", [])
+                if p.get("category_l2") in ALLOWED_PRODUCT_L2
+            }),
+            "key_accounts": sorted({
+                p.get("key_account")
+                for dim in base_dimensions.values()
+                for p in dim.get("projects", [])
+                if p.get("key_account")
+            }),
+        }
+        allowed_groups = {
+            group_name
+            for group_name, dim in dimensions.items()
+            if _dimension_matches(dim, region, aftersaler, category, key_account)
+        }
+        rows = [row for row in rows if row["groupName"] in allowed_groups]
+        dimensions = {
+            name: _scope_dimension(value, region, category, key_account, aftersaler)
+            for name, value in dimensions.items()
+            if name in allowed_groups
+        }
         quality = _quality_from_dimensions(dimensions, quality)
         groups = _group_aggregates(rows, dimensions)
         durations = _active_durations_from_lims(dimensions)
@@ -872,6 +957,7 @@ def _build_overview(
         fallback_durations = _active_durations(conn, missing_duration_groups, start, end)
         durations.update(fallback_durations)
         scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
+        raw_count = _raw_analysis_count(conn, start, end, scoped_group_names)
         group_rows = _query_group_rows(conn, scoped_group_names)
         chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
         chat_rows_by_group = _chat_rows_by_group_name(group_rows, chat_rows)
@@ -902,6 +988,9 @@ def _build_overview(
     region_after = defaultdict(Counter)
     region_product = defaultdict(Counter)
     key_accounts: Dict[str, dict] = {}
+    attention_projects: Dict[Tuple[str, str], dict] = {}
+    attention_status_groups: Dict[str, set] = defaultdict(set)
+    attention_status_messages = Counter()
 
     for row in rows:
         day = str(row.get("CREATEDTIME"))[:10]
@@ -950,6 +1039,36 @@ def _build_overview(
                     leaf["groups"].add(group_name)
                     leaf["messages"] += item["messages"]
                     seen_pairs.add(pair)
+            attention_status = str(project.get("analysis_simple_remark") or "").strip()
+            if attention_status in PROJECT_ATTENTION_STATUSES:
+                if group_name not in attention_status_groups[attention_status]:
+                    attention_status_groups[attention_status].add(group_name)
+                    attention_status_messages[attention_status] += item["messages"]
+                project_code = str(project.get("project_code") or "").upper()
+                attention_key = (attention_status, project_code or f"{group_name}:{project.get('product_name') or ''}")
+                attention = attention_projects.setdefault(attention_key, {
+                    "status": attention_status,
+                    "project_code": project_code,
+                    "project_name": project.get("product_name") or "",
+                    "category_l2": category,
+                    "category_l3": project.get("category_l3") or "",
+                    "customer_name": project.get("customer_name") or "",
+                    "work_unit": project.get("work_unit") or "",
+                    "key_account": project.get("key_account") or "",
+                    "region": project.get("region") or "",
+                    "sales_person": project.get("sales_person") or "",
+                    "aftersaler": project.get("raw_aftersaler") or "",
+                    "groups": set(),
+                    "message_count": 0,
+                    "active_days": [],
+                    "start_time": project.get("start_time") or "",
+                    "end_time": project.get("end_time") or "",
+                })
+                if group_name not in attention["groups"]:
+                    attention["groups"].add(group_name)
+                    attention["message_count"] += item["messages"]
+                if parse_int(project.get("active_day")) is not None:
+                    attention["active_days"].append(parse_int(project.get("active_day")))
             sales = project.get("sales_person") or "未分配销售"
             region_sales[region][sales] += 1
             for after in dim.get("aftersalers", []) or ["未关联售后"]:
@@ -1026,6 +1145,31 @@ def _build_overview(
             "active_day": max(value.get("active_days", []) or [0]),
         })
     account_items.sort(key=lambda value: (-value["group_count"], -value["project_count"], value["key_account"]))
+    attention_items = []
+    status_order = {status: index for index, status in enumerate(PROJECT_ATTENTION_STATUSES)}
+    for value in attention_projects.values():
+        attention_items.append({
+            **{key: item_value for key, item_value in value.items() if key not in ("groups", "active_days")},
+            "group_count": len(value["groups"]),
+            "group_names": sorted(value["groups"]),
+            "active_day": max(value.get("active_days", []) or [0]),
+        })
+    attention_items.sort(key=lambda value: (
+        status_order.get(value["status"], 99),
+        -value["message_count"],
+        value["project_code"],
+    ))
+    attention_summary = []
+    total_attention_projects = len(attention_items)
+    for status in PROJECT_ATTENTION_STATUSES:
+        status_items = [value for value in attention_items if value["status"] == status]
+        attention_summary.append({
+            "status": status,
+            "project_count": len(status_items),
+            "group_count": len(attention_status_groups[status]),
+            "message_count": attention_status_messages[status],
+            "percentage": _ratio(len(status_items), total_attention_projects),
+        })
     product_hierarchy = []
     for level2, level3_map in product_tree.items():
         children = []
@@ -1064,6 +1208,7 @@ def _build_overview(
             "source_min_date": min((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
             "source_max_date": max((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
             "filters": {"region": region, "aftersaler": aftersaler, "category": category, "key_account": key_account},
+            "allowed_product_categories": sorted(ALLOWED_PRODUCT_L2),
             "filter_options": filter_options,
         },
         "summary": {
@@ -1113,6 +1258,12 @@ def _build_overview(
             "product_hierarchy": product_hierarchy,
             "key_accounts": account_items,
         },
+        "project_attention": {
+            "target_statuses": list(PROJECT_ATTENTION_STATUSES),
+            "total_projects": total_attention_projects,
+            "summary": attention_summary,
+            "items": attention_items,
+        },
         "cross_analysis": {
             "region_sales": sorted(cross_sales, key=lambda x: -x.get("group_count", 0)),
             "region_after": sorted(cross_after, key=lambda x: -x.get("group_count", 0)),
@@ -1148,7 +1299,7 @@ def _build_overview(
             "lims_api_requests": quality.get("lims_api_requests", 0),
             "lims_api_records": quality.get("lims_api_records", 0),
             "lims_api_errors": quality.get("lims_api_errors", 0),
-            "note": "业务维度仅来源于 POST /unionLims/base_data/，请求体 [{projectCode: 项目号}]。售后人员取接口 afterSaler 字段，销售区域取 orgName，重点客户取 keyAccount，活跃周期取 activeDay/activellay；接口不可用时维度标记为未关联，不再读取其他业务表补数。",
+            "note": "业务维度仅来源于 POST /unionLims/base_data/，请求体 [{projectCode: 项目号}]。看板仅统计产品二级分类为常规转录组、表观组学、微生物的项目；售后人员取接口 afterSaler 字段，销售区域取 orgName，重点客户取 keyAccount，活跃周期取 activeDay/activellay；接口不可用或产品不在限定范围时不纳入统计。",
         },
     }
 
@@ -1213,9 +1364,14 @@ def get_evidence(
     with database("dashboard.evidence") as conn:
         rows, _ = _latest_rows(conn, start, end)
         dimensions, _ = _load_dimensions(conn, rows)
+        dimensions = {
+            group_name: _scope_dimension(dim, region, category, key_account, aftersaler)
+            for group_name, dim in dimensions.items()
+            if _dimension_matches(dim, region, aftersaler, category, key_account)
+        }
         allowed_groups = [
             row.get("groupName") for row in rows
-            if row.get("groupName") and _dimension_matches(dimensions.get(row.get("groupName"), {}), region, aftersaler, category, key_account)
+            if row.get("groupName") in dimensions
         ]
         group_rows = _query_group_rows(conn, sorted(set(allowed_groups)))
         chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
@@ -1225,7 +1381,7 @@ def get_evidence(
     for row in reversed(rows):
         group_name = row.get("groupName") or ""
         dim = dimensions.get(group_name, {})
-        if not _dimension_matches(dim, region, aftersaler, category, key_account):
+        if group_name not in dimensions:
             continue
         content = ""
         matched = False
@@ -1500,6 +1656,7 @@ def get_verification_stats(
     lims_after_codes = set()
     lims_key_codes = set()
     lims_active_codes = set()
+    lims_remark_codes = set()
     for code, records in lims_records_by_code.items():
         for record in records:
             if str(_field_value_case_insensitive(record, "orgName") or "").strip():
@@ -1510,11 +1667,18 @@ def get_verification_stats(
                 lims_key_codes.add(code)
             if extract_lims_active_day(record) is not None:
                 lims_active_codes.add(code)
+            if str(_field_value_case_insensitive(record, "analysisSimpleRemark") or "").strip():
+                lims_remark_codes.add(code)
 
     lims_active_groups = set()
+    attention_codes_by_status: Dict[str, set] = defaultdict(set)
     for group_name, dim in dimensions.items():
         if any(parse_int(project.get("active_day")) is not None for project in dim.get("projects", [])):
             lims_active_groups.add(group_name)
+        for project in dim.get("projects", []):
+            status = str(project.get("analysis_simple_remark") or "").strip()
+            if status in PROJECT_ATTENTION_STATUSES and project.get("project_code"):
+                attention_codes_by_status[status].add(str(project["project_code"]).upper())
 
     project_total = len(project_codes)
     lims_unreturned_note = (
@@ -1603,6 +1767,9 @@ def get_verification_stats(
                 ["售后(afterSaler)", project_total, len(lims_after_codes), f"覆盖率 {_ratio(len(lims_after_codes), project_total)}%"],
                 ["重点客户(keyAccount)", project_total, len(lims_key_codes), f"覆盖率 {_ratio(len(lims_key_codes), project_total)}%"],
                 ["活跃周期(activeDay/activellay)", project_total, len(lims_active_codes), f"覆盖群聊 {len(lims_active_groups)} 个"],
+                ["项目状态(analysisSimpleRemark)", project_total, len(lims_remark_codes), f"非空覆盖率 {_ratio(len(lims_remark_codes), project_total)}%"],
+                ["问题项目", project_total, len(attention_codes_by_status["问题项目"]), "仅统计当前公共筛选作用域内的限定三类产品"],
+                ["暂不交付", project_total, len(attention_codes_by_status["暂不交付"]), "仅统计当前公共筛选作用域内的限定三类产品"],
             ],
         },
     ]
@@ -1658,16 +1825,21 @@ def _current_dashboard_scope(
 ) -> dict:
     latest_rows, raw_count = _latest_rows(conn, start, end)
     dimensions, quality = _load_dimensions(conn, latest_rows)
-    if region or aftersaler or category or key_account:
-        allowed_groups = {
-            group_name
-            for group_name, dim in dimensions.items()
-            if _dimension_matches(dim, region, aftersaler, category, key_account)
-        }
-        latest_rows = [row for row in latest_rows if row.get("groupName") in allowed_groups]
-        dimensions = {name: value for name, value in dimensions.items() if name in allowed_groups}
+    allowed_groups = {
+        group_name
+        for group_name, dim in dimensions.items()
+        if _dimension_matches(dim, region, aftersaler, category, key_account)
+    }
+    latest_rows = [row for row in latest_rows if row.get("groupName") in allowed_groups]
+    dimensions = {
+        name: _scope_dimension(value, region, category, key_account, aftersaler)
+        for name, value in dimensions.items()
+        if name in allowed_groups
+    }
+    quality = _quality_from_dimensions(dimensions, quality)
 
     group_names = sorted({row.get("groupName") for row in latest_rows if row.get("groupName")})
+    raw_count = _raw_analysis_count(conn, start, end, group_names)
     project_codes = sorted({
         code.upper()
         for dim in dimensions.values()
@@ -1740,7 +1912,7 @@ def _query_qx_raw_scope(
 ) -> dict:
     scope = _current_dashboard_scope(conn, start, end, region, aftersaler, category, key_account)
     group_rows = _query_group_rows(conn, scope["group_names"])
-    chat_rows = _query_chat_rows(conn, group_rows)
+    chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
     return {
         **scope,
         "group_rows": group_rows,
@@ -1824,4 +1996,174 @@ def get_export_csv(
     _write_raw_csv_section(w, "qx_chat 原始记录", scope["chat_rows"])
     _write_raw_csv_section(w, "LIMS base_data API 原始返回", lims_rows)
 
+    return output.getvalue()
+
+
+def _excel_cell(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (dict, list, tuple, set)):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    if value is None:
+        return ""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def _write_excel_sheet(workbook, title: str, rows: List[dict], columns: Optional[List[str]] = None):
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    sheet = workbook.create_sheet(title=title[:31])
+    if columns is None:
+        columns = []
+        seen = set()
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(key)
+    if not columns:
+        sheet.append(["无数据"])
+        return sheet
+
+    sheet.append(columns)
+    for row in rows:
+        sheet.append([_excel_cell(row.get(column)) for column in columns])
+
+    header_fill = PatternFill("solid", fgColor="176B5B")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    sheet.freeze_panes = "A2"
+    if rows:
+        sheet.auto_filter.ref = sheet.dimensions
+    for index, column in enumerate(columns, 1):
+        values = [str(column)] + [str(_excel_cell(row.get(column)) or "") for row in rows[:200]]
+        width = min(42, max(10, max(len(value) for value in values) + 2))
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    return sheet
+
+
+def _cross_rows(items: List[dict]) -> List[dict]:
+    return [
+        {
+            "销售区域": row.get("region"),
+            "关联群数": row.get("group_count"),
+            "消息数": row.get("message_count"),
+            "主要分布": row.get("items", []),
+        }
+        for row in items
+    ]
+
+
+def get_export_excel(
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> bytes:
+    """Export filtered dashboard modules and source data into separate XLSX sheets."""
+    from io import BytesIO
+    from openpyxl import Workbook
+
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    overview = get_overview(
+        period=period,
+        start_date=start_date,
+        end_date=end_date,
+        region=region,
+        aftersaler=aftersaler,
+        category=category,
+        key_account=key_account,
+    )
+    with database("dashboard.export") as conn:
+        scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
+        project_codes = scope["project_codes"]
+
+    lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
+    lims_rows = []
+    for requested_code, records in sorted(lims_records_by_code.items()):
+        for record in records:
+            normalized = normalize_lims_api_record(record, requested_code)
+            if normalized.get("category_l2") not in ALLOWED_PRODUCT_L2:
+                continue
+            if category and normalized.get("category_l2") != category:
+                continue
+            if region and normalized.get("region") != region:
+                continue
+            if key_account and normalized.get("key_account") != key_account:
+                continue
+            if aftersaler and normalized.get("raw_aftersaler") != aftersaler:
+                continue
+            row = {"_requested_project_code": requested_code}
+            row.update(record)
+            lims_rows.append(row)
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    allowed_text = "、".join(sorted(ALLOWED_PRODUCT_L2))
+    _write_excel_sheet(workbook, "导出说明", [
+        {"项目": "统计周期", "内容": normalized_period},
+        {"项目": "开始日期", "内容": start.isoformat()},
+        {"项目": "结束日期", "内容": end.isoformat()},
+        {"项目": "销售区域", "内容": region or "全部区域"},
+        {"项目": "售后员", "内容": aftersaler or "全部售后"},
+        {"项目": "产品类别", "内容": category or f"全部产品（仅{allowed_text}）"},
+        {"项目": "重点客户", "内容": key_account or "全部客户"},
+        {"项目": "命中群聊数", "内容": len(scope["group_names"])},
+        {"项目": "命中项目号数", "内容": len(project_codes)},
+        {"项目": "LIMS API请求", "内容": lims_stats.get("requests", 0)},
+        {"项目": "LIMS返回记录", "内容": lims_stats.get("records", 0)},
+        {"项目": "LIMS错误", "内容": lims_stats.get("errors", 0)},
+    ], ["项目", "内容"])
+
+    summary_labels = {
+        "total_groups": "服务群数", "total_messages": "沟通消息数",
+        "project_groups": "项目群数", "regions": "销售区域数",
+        "aftersaler_count": "售后人员数", "product_categories": "产品分类数",
+        "key_accounts": "重点客户数", "short_active_ratio": "短周期群占比",
+    }
+    _write_excel_sheet(workbook, "经营摘要", [
+        {"指标": summary_labels.get(key, key), "值": value}
+        for key, value in overview["summary"].items()
+        if key in summary_labels
+    ], ["指标", "值"])
+    _write_excel_sheet(workbook, "消息趋势", overview["communication"]["trend"], ["date", "messages", "groups", "missed"])
+    _write_excel_sheet(workbook, "高频关注主题", overview["communication"]["high_frequency"], ["word", "count"])
+    _write_excel_sheet(workbook, "群活跃周期", overview["communication"]["active_duration"], ["range", "label", "count", "percentage"])
+    _write_excel_sheet(workbook, "销售区域覆盖", overview["business"]["regions"])
+    _write_excel_sheet(workbook, "售后人员分布", overview["business"]["aftersalers"])
+    _write_excel_sheet(workbook, "产品分类", overview["business"]["product_categories"])
+    _write_excel_sheet(workbook, "重点客户", overview["business"]["key_accounts"])
+    _write_excel_sheet(workbook, "项目状态关注", overview["project_attention"]["items"])
+    _write_excel_sheet(workbook, "交叉分析-销售", _cross_rows(overview["cross_analysis"]["region_sales"]))
+    _write_excel_sheet(workbook, "交叉分析-售后", _cross_rows(overview["cross_analysis"]["region_after"]))
+    _write_excel_sheet(workbook, "交叉分析-产品", _cross_rows(overview["cross_analysis"]["region_product"]))
+
+    service_quality = overview["service_quality"]
+    _write_excel_sheet(workbook, "服务质量", [
+        {"模块": "消息漏回", "指标": key, "值": value}
+        for key, value in service_quality["unanswered"].items()
+    ] + [
+        {"模块": "情感与服务态度", "指标": key, "值": value}
+        for key, value in service_quality["sentiment"].items()
+    ], ["模块", "指标", "值"])
+    _write_excel_sheet(workbook, "数据质量", [
+        {"指标": key, "值": value} for key, value in overview["data_quality"].items()
+    ], ["指标", "值"])
+    _write_excel_sheet(workbook, "analysis原始数据", scope["raw_rows"])
+    _write_excel_sheet(workbook, "group原始数据", scope["group_rows"])
+    _write_excel_sheet(workbook, "chat原始数据", scope["chat_rows"])
+    _write_excel_sheet(workbook, "LIMS原始数据", lims_rows)
+
+    output = BytesIO()
+    workbook.save(output)
     return output.getvalue()
