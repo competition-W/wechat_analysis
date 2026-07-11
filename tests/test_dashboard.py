@@ -390,6 +390,80 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(display[0]["msgtime"], "2026-07-11 13:42:15")
         self.assertEqual(display[1]["msgtime"], "2026-07-11 13:45:30")
 
+    def test_extract_missed_messages_parses_sender_with_spaces_and_phone(self):
+        """用户实际数据：发送人姓名带空格+手机号也能正确解析。"""
+        text = (
+            "@张兴瑞 @李祖杰 这些分别代表什么,"
+            "张敏  13103738626:@李祖杰 每个通路具体哪些分子？,"
+            "张敏  13103738626:「张敏  13103738626：@李祖杰 每个通路具体哪些分子？」"
+        )
+        result = db_dashboard._extract_missed_messages(text)
+        self.assertEqual(len(result), 3)
+        # 首条自由文本（无 sender）
+        self.assertEqual(result[0]["sender_name"], "")
+        self.assertIn("张兴瑞", result[0]["content"])
+        # 第二条：sender 含空格+手机号
+        self.assertEqual(result[1]["sender_name"], "张敏  13103738626")
+        self.assertIn("每个通路具体哪些分子", result[1]["content"])
+        # 第三条：含全角引号 + 内部全角冒号
+        self.assertEqual(result[2]["sender_name"], "张敏  13103738626")
+        self.assertTrue(result[2]["content"].startswith("「"))
+
+    def test_get_evidence_fills_per_message_CREATEDTIME_fallback(self):
+        """display 和 raw 都没有 msgtime 时，每条 message.msgtime 也应被 CREATEDTIME 兜底，
+        避免前端逐条渲染时仍显示"无原始时间"。
+        """
+        from contextlib import contextmanager
+
+        mock_row = {
+            "id": 1,
+            "groupName": "客户 LC-P2026001 项目群",
+            "isMissedMessage": "1",
+            "missedMessageList": "客户A:催一下结果,客户A:还有进度吗",
+            "CREATEDTIME": "2026-07-11 14:00:00",
+            "messageToDayCount": 0,
+            "highFrequencyWords": "",
+            "customerEmotionAnalysis": "",
+            "saleEmotionAnalysis": "",
+            "afterSalesTopicAnalysis": "",
+        }
+        test_dimension = {
+            "客户 LC-P2026001 项目群": {
+                "codes": ["LC-P2026001"], "regions": [], "aftersalers": [],
+                "projects": [{
+                    "project_code": "LC-P2026001", "category_l2": "常规转录组",
+                    "region": "", "raw_aftersaler": "",
+                }],
+            },
+        }
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_latest_rows", return_value=([mock_row], 1)),
+            patch.object(db_dashboard, "_load_dimensions", return_value=(test_dimension, {"matched_project_codes": 1})),
+            patch.object(db_dashboard, "_query_group_rows", return_value=[]),
+            patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
+        ):
+            response = db_dashboard.get_evidence(
+                "unanswered", "custom", "2026-07-11", "2026-07-11",
+            )
+
+        matched = [
+            item for item in response.get("items", [])
+            if item.get("group_name") == "客户 LC-P2026001 项目群"
+        ]
+        self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
+        self.assertTrue(matched[0]["msg_times"], "msg_times 应该有兜底日期")
+        self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
+        # 每条 message.msgtime 也应被填上兜底日期
+        for msg in matched[0]["messages"]:
+            self.assertTrue(msg.get("msgtime"), f"message.msgtime 不应为空: {msg}")
+            self.assertTrue(msg["msgtime"].startswith("2026-07-11"))
+
     def test_get_evidence_uses_CREATEDTIME_as_final_fallback(self):
         """display 和 raw 都没有 msgtime 时，用分析行的 CREATEDTIME 日期兜底。"""
         from contextlib import contextmanager
@@ -437,6 +511,73 @@ class DashboardParsingTests(unittest.TestCase):
         ]
         self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
         self.assertTrue(matched[0]["msg_times"], "msg_times 应该有兜底日期")
+        self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
+
+    def test_get_evidence_falls_back_per_message_when_raw_has_unmatched_msgtime(self):
+        """用户实际场景：missedMessageList 是纯文本格式，display_messages 中所有
+        msgtime 为空；qx_chat 原始数据有时间戳但通过 content 匹配不上
+        (msgid 空 + content 不包含)。此时每条 message.msgtime 也应被 CREATEDTIME 兜底，
+        避免前端显示"无原始时间"。
+        """
+        from contextlib import contextmanager
+
+        mock_row = {
+            "id": 1,
+            "groupName": "客户 LC-P2026001 项目群",
+            "isMissedMessage": "1",
+            "missedMessageList": (
+                "@张兴瑞 @李祖杰 这些分别代表什么,"
+                "张敏  13103738626:@李祖杰 每个通路具体哪些分子？,"
+                "张敏  13103738626:「张敏  13103738626：@李祖杰 每个通路具体哪些分子？」"
+            ),
+            "CREATEDTIME": "2026-07-11 14:00:00",
+            "messageToDayCount": 0,
+            "highFrequencyWords": "",
+            "customerEmotionAnalysis": "",
+            "saleEmotionAnalysis": "",
+            "afterSalesTopicAnalysis": "",
+        }
+        test_dimension = {
+            "客户 LC-P2026001 项目群": {
+                "codes": ["LC-P2026001"], "regions": [], "aftersalers": [],
+                "projects": [{
+                    "project_code": "LC-P2026001", "category_l2": "常规转录组",
+                    "region": "", "raw_aftersaler": "",
+                }],
+            },
+        }
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_latest_rows", return_value=([mock_row], 1)),
+            patch.object(db_dashboard, "_load_dimensions", return_value=(test_dimension, {"matched_project_codes": 1})),
+            patch.object(db_dashboard, "_query_group_rows", return_value=[]),
+            patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
+        ):
+            response = db_dashboard.get_evidence(
+                "unanswered", "custom", "2026-07-11", "2026-07-11",
+            )
+
+        matched = [
+            item for item in response.get("items", [])
+            if item.get("group_name") == "客户 LC-P2026001 项目群"
+        ]
+        self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
+        # 纯文本解析出的 display_messages 中所有 msgtime 都为空，
+        # qx_chat 中又没有匹配的 content / msgid，
+        # 此时每条 message.msgtime 也必须被 CREATEDTIME 兜底。
+        for msg in matched[0]["messages"]:
+            self.assertTrue(msg.get("msgtime"), f"message.msgtime 不应为空: {msg}")
+            self.assertTrue(
+                msg["msgtime"].startswith("2026-07-11"),
+                f"message.msgtime 应被 CREATEDTIME 兜底, 实际={msg['msgtime']}",
+            )
+        # msg_times 至少有一个兜底时间
+        self.assertTrue(matched[0]["msg_times"])
         self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
 
     def test_lims_api_dimensions_use_raw_after_saler(self):
