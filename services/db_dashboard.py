@@ -1417,6 +1417,11 @@ def get_evidence(
         ] or [
             item["msgtime"] for item in group_raw_messages if item.get("msgtime")
         ][:1]
+        # 最后兜底：用分析行的 CREATEDTIME 日期，避免整条都显示"无原始时间"
+        if not msg_times:
+            analysis_dt = parse_msg_datetime(row.get("CREATEDTIME"))
+            if analysis_dt:
+                msg_times = [analysis_dt.strftime("%Y-%m-%d %H:%M:%S")]
         items.append({
             "id": row.get("id"), "group_name": group_name,
             "analysis_date": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
@@ -1483,28 +1488,77 @@ def get_high_freq_summary(limit: int = 20) -> dict:
 
 
 
+def _parse_missed_text(text: str) -> List[dict]:
+    """解析纯文本格式的漏回消息：每行 "<sender>:<content>"。
+    兼容同一行包含多条消息（如 "1呢,南枝:@李祖杰..."）。
+    """
+    pattern = re.compile(r'([^\s:：\n,，]{1,30})[：:]([^\n]*)')
+    messages = []
+    for match in pattern.finditer(text):
+        sender = match.group(1).strip()
+        content = match.group(2).strip()
+        if not content:
+            continue
+        messages.append({
+            "msgid": "",
+            "sender_name": sender,
+            "content": content,
+            "msgtime": "",
+        })
+    return messages
+
+
 def _extract_missed_messages(missed_list_json: Any) -> List[dict]:
-    """Normalize missedMessageList into displayable original messages."""
+    """Normalize missedMessageList into displayable original messages.
+    支持三种格式（按优先级尝试）：
+      1) JSON 数组 [{msgid, msgtime, content, ...}, ...]
+      2) 纯文本 "<sender>:<content>" 多行 / 同行多条
+      3) 兜底：整段当作一条 content
+    """
     if not missed_list_json:
         return []
+    text = missed_list_json.strip() if isinstance(missed_list_json, str) else str(missed_list_json).strip()
+    if not text:
+        return []
+
+    # 1) 尝试 JSON 解析
     try:
         import json
-        items = json.loads(missed_list_json) if isinstance(missed_list_json, str) else missed_list_json
+        items = json.loads(text) if isinstance(missed_list_json, str) else text
         if isinstance(items, list):
             messages = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
+                msgtime = (
+                    item.get("msgtime") or item.get("msgTime") or item.get("msg_time")
+                    or item.get("time") or item.get("timestamp")
+                    or item.get("createTime") or item.get("createtime")
+                    or ""
+                )
                 messages.append({
                     "msgid": item.get("msgid") or item.get("id") or "",
                     "sender_name": item.get("sender_name") or item.get("sender") or item.get("from") or "",
                     "content": item.get("content") or item.get("text") or item.get("message") or "",
-                    "msgtime": item.get("msgtime") or "",
+                    "msgtime": str(msgtime) if msgtime else "",
                 })
-            return messages
+            if messages:
+                return messages
     except Exception:
         logger.debug("dashboard.evidence.missed_messages_parse_failed", exc_info=True)
-    return []
+
+    # 2) 纯文本格式：每行 <sender>:<content>
+    text_messages = _parse_missed_text(text)
+    if text_messages:
+        return text_messages
+
+    # 3) 兜底：整段当作一条 content
+    return [{
+        "msgid": "",
+        "sender_name": "",
+        "content": text,
+        "msgtime": "",
+    }]
 
 
 def _extract_msg_times(missed_list_json: Any) -> list:
