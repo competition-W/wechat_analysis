@@ -1261,6 +1261,7 @@ def _build_overview(
         "project_attention": {
             "target_statuses": list(PROJECT_ATTENTION_STATUSES),
             "total_projects": total_attention_projects,
+            "all_projects": product_projects,
             "summary": attention_summary,
             "items": attention_items,
         },
