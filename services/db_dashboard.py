@@ -1412,16 +1412,27 @@ def get_evidence(
             continue
         group_raw_messages = raw_messages.get(group_name, [])
         display_messages = _evidence_messages(metric, content, keyword or "", missed_messages, group_raw_messages)
+        # 先计算兜底时间（始终计算一次，供后面补全每条 message 使用）
+        row_fallback_time = ""
+        analysis_dt = parse_msg_datetime(row.get("CREATEDTIME"))
+        if analysis_dt:
+            row_fallback_time = analysis_dt.strftime("%Y-%m-%d %H:%M:%S")
+
         msg_times = [
             item["msgtime"] for item in display_messages if item.get("msgtime")
         ] or [
             item["msgtime"] for item in group_raw_messages if item.get("msgtime")
         ][:1]
-        # 最后兜底：用分析行的 CREATEDTIME 日期，避免整条都显示"无原始时间"
-        if not msg_times:
-            analysis_dt = parse_msg_datetime(row.get("CREATEDTIME"))
-            if analysis_dt:
-                msg_times = [analysis_dt.strftime("%Y-%m-%d %H:%M:%S")]
+        if not msg_times and row_fallback_time:
+            msg_times = [row_fallback_time]
+        # 兜底也要补到每条 message 上，否则前端逐条渲染时仍会显示"无原始时间"。
+        # 注意：即使 group_raw_messages 里有时间戳，但纯文本格式的漏回消息
+        # 往往无法通过 msgid/content 匹配到 qx_chat 中具体那一行，导致
+        # display_messages 里所有 msgtime 都为空，此时也要补上 CREATEDTIME。
+        if row_fallback_time:
+            for msg in display_messages:
+                if not msg.get("msgtime"):
+                    msg["msgtime"] = row_fallback_time
         items.append({
             "id": row.get("id"), "group_name": group_name,
             "analysis_date": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
@@ -1490,22 +1501,114 @@ def get_high_freq_summary(limit: int = 20) -> dict:
 
 def _parse_missed_text(text: str) -> List[dict]:
     """解析纯文本格式的漏回消息：每行 "<sender>:<content>"。
-    兼容同一行包含多条消息（如 "1呢,南枝:@李祖杰..."）。
+
+    兼容：
+    - sender 含空格、姓名+手机号等（如 "张敏  13103738626"）
+    - 同一行包含多条消息（用中/英逗号分隔）
+    - "<sender>:「<quoted message>」"（含全角引号的内容，引号内部的冒号
+      不会再被切分成新消息）
+    - 文本开头的纯自由文本（无 sender:content 格式）作为独立一条
+
+    注：中间夹在两条 sender:content 之间的纯文本片段（测试数据中
+    `"南枝:... \n 1呢,南枝:..."` 的 "1呢"）会归入上一条的 content，
+    以保持现有 `test_extract_missed_messages_parses_pure_text_with_multiple_messages`
+    的断言。
     """
-    pattern = re.compile(r'([^\s:：\n,，]{1,30})[：:]([^\n]*)')
-    messages = []
-    for match in pattern.finditer(text):
-        sender = match.group(1).strip()
-        content = match.group(2).strip()
+    messages: List[dict] = []
+    if not text:
+        return messages
+
+    positions = _find_sender_colon_matches(text)
+
+    if not positions:
+        stripped = text.strip()
+        if stripped:
+            messages.append({
+                "msgid": "",
+                "sender_name": "",
+                "content": stripped,
+                "msgtime": "",
+            })
+        return messages
+
+    # 1) 解析开头的自由文本（无 sender 的部分）
+    first_start, _, _ = positions[0]
+    if first_start > 0:
+        prefix = text[:first_start].rstrip(",，").strip()
+        if prefix:
+            messages.append({
+                "msgid": "",
+                "sender_name": "",
+                "content": prefix,
+                "msgtime": "",
+            })
+
+    # 2) 解析 sender:content 对
+    #    content = 冒号之后、到下一条 sender:content 起点之间的文本
+    for i, (start, end, sender) in enumerate(positions):
+        if i + 1 < len(positions):
+            next_start = positions[i + 1][0]
+            content = text[end:next_start].rstrip(",，").strip()
+        else:
+            content = text[end:].strip()
         if not content:
             continue
+        # 兜底：sender 太长（>60字符）很可能是误识别
+        if len(sender) > 60:
+            content = f"{sender}:{content}"
+            sender = ""
         messages.append({
             "msgid": "",
             "sender_name": sender,
             "content": content,
             "msgtime": "",
         })
+
     return messages
+
+
+def _find_sender_colon_matches(text: str) -> List[Tuple[int, int, str]]:
+    """在纯文本中查找所有 sender:content 的边界。
+
+    返回 `[(start, end_of_colon, sender), ...]`：
+    - `start`：sender 的起始下标（含）
+    - `end_of_colon`：冒号之后的下标（content 起点）
+    - `sender`：strip 后的发送人文本
+
+    规则：
+    - 仅在「」之外的顶层查找（引号内不再切分）
+    - sender 不能包含冒号、换行、逗号、「、」
+    - 非贪婪：从冒号往前逐字回溯，遇到分隔符即停
+    """
+    results: List[Tuple[int, int, str]] = []
+    bracket_depth = 0
+    for i, ch in enumerate(text):
+        if ch in "「『\u201c":
+            bracket_depth += 1
+            continue
+        if ch in "」』\u201d":
+            bracket_depth = max(0, bracket_depth - 1)
+            continue
+        if bracket_depth != 0 or ch not in "：:":
+            continue
+        # 找到顶层冒号，从 i-1 向前回溯找 sender
+        j = i - 1
+        chars: List[str] = []
+        sender_start = i
+        while j >= 0:
+            cj = text[j]
+            if cj in "：:\n,，\"「」『』\u201c\u201d":
+                break
+            chars.insert(0, cj)
+            j -= 1
+            if len(chars) >= 80:
+                break
+        sender = "".join(chars).strip()
+        if not sender:
+            continue
+        sender_start = j + 1
+        results.append((sender_start, i + 1, sender))
+    return results
 
 
 def _extract_missed_messages(missed_list_json: Any) -> List[dict]:
@@ -1586,9 +1689,18 @@ def _raw_messages_by_group(group_rows: List[dict], chat_rows: List[dict]) -> Dic
     return result
 
 
+def _normalize_chat_content(value: str) -> str:
+    """把任意空白（换行/制表/多空格）压缩为单个空格，便于跨源匹配。"""
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def _match_raw_message(message: dict, raw_messages: List[dict]) -> dict:
     msgid = str(message.get("msgid") or "").strip()
     content = str(message.get("content") or "").strip()
+    sender = str(message.get("sender_name") or "").strip()
+    norm_content = _normalize_chat_content(content)
     for raw in raw_messages:
         if msgid and msgid == str(raw.get("msgid") or "").strip():
             return {**message, **{k: v for k, v in raw.items() if v}}
@@ -1597,6 +1709,19 @@ def _match_raw_message(message: dict, raw_messages: List[dict]) -> dict:
             raw_content = str(raw.get("content") or "")
             if content in raw_content or raw_content in content:
                 return {**message, **{k: v for k, v in raw.items() if v}}
+            # 空白字符可能在不同来源间出现差异（如 `"... \n 1呢"` vs `"...\n 1呢"`），
+            # 标准化后再次比较
+            norm_raw = _normalize_chat_content(raw_content)
+            if norm_content and norm_raw and (
+                norm_content in norm_raw or norm_raw in norm_content
+            ):
+                return {**message, **{k: v for k, v in raw.items() if v}}
+    # 兜底：按 sender_name 选最近一条消息作为时间戳参考（处理纯文本漏回消息
+    # 没有 msgid / 文本片段的边界场景），仅复制 msgtime
+    if sender:
+        for raw in raw_messages:
+            if str(raw.get("sender_name") or "").strip() == sender and raw.get("msgtime"):
+                return {**message, "msgtime": raw["msgtime"]}
     return message
 
 
