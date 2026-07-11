@@ -343,6 +343,102 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(result[0]["msgtime"], "2026-07-06 18:30:00")
         self.assertEqual(result[0]["sender_name"], "客户")
 
+    def test_extract_missed_messages_parses_pure_text_with_multiple_messages(self):
+        """用户实际场景：missedMessageList 存的是 '<sender>:<content>' 纯文本。"""
+        text = '南枝:这个组Ss_Tcorolla只有2、3吗 \n 1呢,南枝:@李祖杰 这会能电话沟通下吗'
+        result = db_dashboard._extract_missed_messages(text)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["sender_name"], "南枝")
+        self.assertIn("这个组Ss_Tcorolla", result[0]["content"])
+        self.assertEqual(result[1]["sender_name"], "南枝")
+        self.assertIn("@李祖杰", result[1]["content"])
+
+    def test_extract_missed_messages_handles_json_with_msgTime_alias(self):
+        """Java 端写入时使用 msgTime 字段名也应能解析。"""
+        text = '[{"id":"m1","msgTime":"2026-07-11 09:30:00","text":"怎么弄","sender":"A"}]'
+        result = db_dashboard._extract_missed_messages(text)
+        self.assertEqual(result[0]["msgtime"], "2026-07-11 09:30:00")
+        self.assertEqual(result[0]["content"], "怎么弄")
+
+    def test_extract_missed_messages_fallback_for_plain_text(self):
+        """不是 sender:content 格式也不是 JSON 时，整段当作一条 content。"""
+        text = "这是一段普通文本，没有冒号分隔"
+        result = db_dashboard._extract_missed_messages(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["content"], text)
+        self.assertEqual(result[0]["sender_name"], "")
+
+    def test_pure_text_missed_messages_get_msgtime_via_raw_chat_match(self):
+        """纯文本格式解析出的漏回消息，能通过 content 匹配拿到 qx_chat 的 msgtime。"""
+        text = '南枝:这个组Ss_Tcorolla只有2、3吗 \n 1呢,南枝:@李祖杰 这会能电话沟通下吗'
+        missed = db_dashboard._extract_missed_messages(text)
+        raw_messages = [{
+            "msgid": "r1",
+            "sender_name": "南枝",
+            "content": "这个组Ss_Tcorolla只有2、3吗\n 1呢",
+            "msgtime": "2026-07-11 13:42:15",
+        }, {
+            "msgid": "r2",
+            "sender_name": "南枝",
+            "content": "@李祖杰 这会能电话沟通下吗",
+            "msgtime": "2026-07-11 13:45:30",
+        }]
+
+        display = db_dashboard._evidence_messages("unanswered", "", "", missed, raw_messages)
+
+        self.assertEqual(len(display), 2)
+        self.assertEqual(display[0]["msgtime"], "2026-07-11 13:42:15")
+        self.assertEqual(display[1]["msgtime"], "2026-07-11 13:45:30")
+
+    def test_get_evidence_uses_CREATEDTIME_as_final_fallback(self):
+        """display 和 raw 都没有 msgtime 时，用分析行的 CREATEDTIME 日期兜底。"""
+        from contextlib import contextmanager
+
+        mock_row = {
+            "id": 1,
+            "groupName": "客户 LC-P2026001 项目群",
+            "isMissedMessage": "1",
+            "missedMessageList": "客户A:催一下结果",
+            "CREATEDTIME": "2026-07-11 14:00:00",
+            "messageToDayCount": 0,
+            "highFrequencyWords": "",
+            "customerEmotionAnalysis": "",
+            "saleEmotionAnalysis": "",
+            "afterSalesTopicAnalysis": "",
+        }
+        test_dimension = {
+            "客户 LC-P2026001 项目群": {
+                "codes": ["LC-P2026001"], "regions": [], "aftersalers": [],
+                "projects": [{
+                    "project_code": "LC-P2026001", "category_l2": "常规转录组",
+                    "region": "", "raw_aftersaler": "",
+                }],
+            },
+        }
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_latest_rows", return_value=([mock_row], 1)),
+            patch.object(db_dashboard, "_load_dimensions", return_value=(test_dimension, {"matched_project_codes": 1})),
+            patch.object(db_dashboard, "_query_group_rows", return_value=[]),
+            patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
+        ):
+            response = db_dashboard.get_evidence(
+                "unanswered", "custom", "2026-07-11", "2026-07-11",
+            )
+
+        matched = [
+            item for item in response.get("items", [])
+            if item.get("group_name") == "客户 LC-P2026001 项目群"
+        ]
+        self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
+        self.assertTrue(matched[0]["msg_times"], "msg_times 应该有兜底日期")
+        self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
+
     def test_lims_api_dimensions_use_raw_after_saler(self):
         group_name = "Customer LC-P2026001 support"
         records = {

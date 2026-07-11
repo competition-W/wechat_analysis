@@ -19,6 +19,8 @@ wheels/
 .installed.cfg
 *.egg
 
+.trae/
+
 .env
 .env.production
 .venv
