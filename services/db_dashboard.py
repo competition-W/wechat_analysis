@@ -1,4 +1,4 @@
-﻿"""Read-only dashboard analytics built from the existing MySQL analysis tables."""
+"""Read-only dashboard analytics built from the existing MySQL analysis tables."""
 
 from __future__ import annotations
 
@@ -105,8 +105,27 @@ def parse_int(value: Any) -> Optional[int]:
     return int(match.group()) if match else None
 
 
-def extract_lims_active_day(item: dict) -> Optional[int]:
-    return parse_int(_field_value_case_insensitive(
+def parse_active_day(value: Any) -> Optional[float]:
+    """原样保留 LIMS activeDay 的精度，不取整。
+
+    接受 12 / 12.5 / 0.08 / "0.08天" / None。
+    返回 float；不命中时返回 None。
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"-?\d+(\.\d+)?", text)
+    return float(match.group()) if match else None
+
+
+def extract_lims_active_day(item: dict) -> Optional[float]:
+    return parse_active_day(_field_value_case_insensitive(
         item,
         "activeDay", "active_day", "activeDays", "activeLay", "activeLlay",
         "activelay", "activellay", "ACTIVE_DAY", "ACTIVEDAY",
@@ -686,34 +705,13 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
     return dimensions, quality
 
 
-def _active_durations(conn, group_names: List[str], start: date, end: date) -> Dict[str, int]:
-    if not group_names:
-        return {}
-    placeholders = ",".join(["%s"] * len(group_names))
-    rows = _query(
-        conn,
-        "analysis.active_duration",
-        f"""SELECT groupName, MIN(DATE(CREATEDTIME)) first_date,
-                   MAX(DATE(CREATEDTIME)) last_date
-            FROM qx_analysis_result
-            WHERE groupName IN ({placeholders})
-              AND CREATEDTIME >= %s AND CREATEDTIME < %s
-            GROUP BY groupName""",
-        group_names + [start.isoformat(), (end + timedelta(days=1)).isoformat()],
-    )
-    return {
-        row["groupName"]: (row["last_date"] - row["first_date"]).days
-        for row in rows if row.get("first_date") and row.get("last_date")
-    }
-
-
-def _active_durations_from_lims(dimensions: Dict[str, dict]) -> Dict[str, int]:
-    durations: Dict[str, int] = {}
+def _active_durations_from_lims(dimensions: Dict[str, dict]) -> Dict[str, float]:
+    durations: Dict[str, float] = {}
     for group_name, dim in dimensions.items():
         values = [
-            parse_int(project.get("active_day"))
+            parse_active_day(project.get("active_day"))
             for project in dim.get("projects", [])
-            if parse_int(project.get("active_day")) is not None
+            if parse_active_day(project.get("active_day")) is not None
         ]
         if values:
             durations[group_name] = max(values)
@@ -953,9 +951,7 @@ def _build_overview(
         quality = _quality_from_dimensions(dimensions, quality)
         groups = _group_aggregates(rows, dimensions)
         durations = _active_durations_from_lims(dimensions)
-        missing_duration_groups = [name for name in groups if name not in durations]
-        fallback_durations = _active_durations(conn, missing_duration_groups, start, end)
-        durations.update(fallback_durations)
+        missing_duration_groups = sorted(name for name in groups if name not in durations)
         scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
         raw_count = _raw_analysis_count(conn, start, end, scoped_group_names)
         group_rows = _query_group_rows(conn, scoped_group_names)
@@ -1067,8 +1063,8 @@ def _build_overview(
                 if group_name not in attention["groups"]:
                     attention["groups"].add(group_name)
                     attention["message_count"] += item["messages"]
-                if parse_int(project.get("active_day")) is not None:
-                    attention["active_days"].append(parse_int(project.get("active_day")))
+                if parse_active_day(project.get("active_day")) is not None:
+                    attention["active_days"].append(parse_active_day(project.get("active_day")))
             sales = project.get("sales_person") or "未分配销售"
             region_sales[region][sales] += 1
             for after in dim.get("aftersalers", []) or ["未关联售后"]:
@@ -1092,8 +1088,8 @@ def _build_overview(
                     account["work_units"].add(project["work_unit"])
                 if project.get("category_l3"):
                     account["category_l3"].add(project["category_l3"])
-                if parse_int(project.get("active_day")) is not None:
-                    account["active_days"].append(parse_int(project.get("active_day")))
+                if parse_active_day(project.get("active_day")) is not None:
+                    account["active_days"].append(parse_active_day(project.get("active_day")))
     if _filter_aftersaler:
         aftersalers = Counter({_filter_aftersaler: aftersalers.get(_filter_aftersaler, 0)})
     if _filter_region:
@@ -1294,8 +1290,8 @@ def _build_overview(
             "groups_with_raw_aftersaler": quality.get("groups_with_raw_aftersaler", 0),
             "groups_with_lims_members": quality.get("groups_with_lims_members", 0),
             "active_duration_source": "lims_base_data_active_day",
-            "active_duration_lims_groups": len(durations) - len(fallback_durations),
-            "active_duration_fallback_groups": len(fallback_durations),
+            "active_duration_lims_groups": len(durations),
+            "active_duration_missing_groups": len(missing_duration_groups),
             "lims_source": quality.get("lims_source", "unknown"),
             "lims_api_requests": quality.get("lims_api_requests", 0),
             "lims_api_records": quality.get("lims_api_records", 0),
@@ -1853,7 +1849,7 @@ def get_verification_stats(
     lims_active_groups = set()
     attention_codes_by_status: Dict[str, set] = defaultdict(set)
     for group_name, dim in dimensions.items():
-        if any(parse_int(project.get("active_day")) is not None for project in dim.get("projects", [])):
+        if any(parse_active_day(project.get("active_day")) is not None for project in dim.get("projects", [])):
             lims_active_groups.add(group_name)
         for project in dim.get("projects", []):
             status = str(project.get("analysis_simple_remark") or "").strip()

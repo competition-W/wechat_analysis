@@ -38,6 +38,35 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(db_dashboard.normalize_key_account("KA-001", "客户甲"), "KA-001")
         self.assertEqual(db_dashboard.normalize_key_account("0", "客户甲", "KA-002"), "KA-002")
 
+    def test_parse_active_day_preserves_float_precision(self):
+        self.assertIsNone(db_dashboard.parse_active_day(None))
+        self.assertIsNone(db_dashboard.parse_active_day(""))
+        self.assertIsNone(db_dashboard.parse_active_day("未知"))
+        self.assertEqual(db_dashboard.parse_active_day(0.08), 0.08)
+        self.assertEqual(db_dashboard.parse_active_day(12), 12.0)
+        self.assertEqual(db_dashboard.parse_active_day(12.5), 12.5)
+        self.assertEqual(db_dashboard.parse_active_day("0.08"), 0.08)
+        self.assertEqual(db_dashboard.parse_active_day("12.5天"), 12.5)
+        self.assertEqual(db_dashboard.parse_active_day("-3.2"), -3.2)
+        self.assertFalse(db_dashboard.parse_active_day(True) is not None)
+
+    def test_extract_lims_active_day_preserves_float(self):
+        self.assertEqual(db_dashboard.extract_lims_active_day({"activeDay": 0.08}), 0.08)
+        self.assertEqual(db_dashboard.extract_lims_active_day({"activeDay": 12.5}), 12.5)
+        self.assertEqual(db_dashboard.extract_lims_active_day({"activellay": 7.4}), 7.4)
+        self.assertIsNone(db_dashboard.extract_lims_active_day({}))
+
+    def test_active_durations_from_lims_preserves_float_max(self):
+        dimensions = {
+            "群A": {"projects": [{"active_day": 0.08}, {"active_day": 3.5}]},
+            "群B": {"projects": [{"active_day": "12.5"}]},
+            "群C": {"projects": [{"active_day": None}]},
+        }
+        durations = db_dashboard._active_durations_from_lims(dimensions)
+        self.assertEqual(durations["群A"], 3.5)
+        self.assertEqual(durations["群B"], 12.5)
+        self.assertNotIn("群C", durations)
+
     def test_period_boundaries(self):
         today = date(2026, 7, 6)
         self.assertEqual(
