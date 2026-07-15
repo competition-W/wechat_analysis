@@ -117,6 +117,7 @@ class HighFreqAnalyzer:
             prompt,
             model=settings.LLM_MODEL_SUMMARY,
             temperature=0.3,
+            max_tokens=4000,
         )
         
         if not response:

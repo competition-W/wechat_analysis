@@ -7,6 +7,7 @@ import time
 from typing import List, Optional
 
 from models.request import AnalyzeRequest, AnalysisType, BatchAnalyzeRequest, RoomData
+from config.settings import settings
 from models.response import (
     AnalyzeResponse,
     ResponseData,
@@ -248,7 +249,7 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest, raw_request: Request)
     
     start_time = time.time()
     analysis_types = request.get_analysis_types()
-    semaphore = asyncio.Semaphore(request.max_concurrent or 5)
+    semaphore = asyncio.Semaphore(request.max_concurrent or settings.LLM_MAX_CONCURRENT)
     
     async def analyze_single_room(room: RoomData) -> RoomAnalysisResult:
         async with semaphore:

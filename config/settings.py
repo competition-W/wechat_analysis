@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     LLM_TIMEOUT: int = Field(default=120, description="LLM调用超时时间(秒)")
     LLM_MAX_RETRIES: int = Field(default=2, description="LLM调用最大重试次数")
     LLM_BATCH_SIZE: int = Field(default=30, description="LLM批量分析每批消息数")
-    LLM_MAX_CONCURRENT: int = Field(default=5, description="LLM最大并发调用数")
+    LLM_MAX_CONCURRENT: int = Field(default=10, description="LLM最大并发调用数")
     
     SUMMARY_MAX_MESSAGES: int = Field(default=100, description="摘要最大消息数")
     SUMMARY_MAX_LENGTH: int = Field(default=1000, description="摘要最大长度")

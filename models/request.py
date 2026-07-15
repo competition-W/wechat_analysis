@@ -72,8 +72,8 @@ class BatchAnalyzeRequest(BaseModel):
         description="需启用的分析类型，默认全部"
     )
     max_concurrent: Optional[int] = Field(
-        default=10,
-        description="最大并发处理数，默认10"
+        default=15,
+        description="最大并发处理数，默认15（覆盖 settings.LLM_MAX_CONCURRENT=10，可按需调整）"
     )
     
     def get_analysis_types(self) -> List[AnalysisType]:
