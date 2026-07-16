@@ -58,17 +58,17 @@ class LimsRecord:
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_api_response(cls, item: dict) -> "LimsRecord":
+    def from_api_response(cls, item: dict, mapping_snapshot: Optional[dict] = None) -> "LimsRecord":
         """从 LIMS API 响应构造，同时计算派生字段"""
         after_saler = item.get("afterSaler", "") or ""
         members_raw = item.get("members", "") or ""
+        from services.aftersaler_mapping import resolve_final_aftersaler
 
-        member_names = _parse_members_field(members_raw)
-
-        if after_saler and after_saler in member_names:
-            final_after_saler = after_saler
-        else:
-            final_after_saler = ""
+        owner = resolve_final_aftersaler(
+            item.get("productBigSortThree"), item.get("orgName"), after_saler,
+            mapping_snapshot,
+        )
+        final_after_saler = owner["final_aftersaler"]
 
         sales_person = final_after_saler if final_after_saler else after_saler
 
@@ -214,6 +214,10 @@ class DataCollector:
         logger.info(f"开始拉取 LIMS 数据, {len(project_codes)} 个项目号")
 
         result: Dict[str, List[LimsRecord]] = {}
+        from datetime import date
+        from services.aftersaler_mapping import get_mapping_snapshot
+
+        mapping_snapshot = get_mapping_snapshot(date.today())
         for code in project_codes:
             if not code:
                 continue
@@ -222,7 +226,9 @@ class DataCollector:
                 resp.raise_for_status()
                 body = resp.json()
                 items = body.get("data", [])
-                records = [LimsRecord.from_api_response(item) for item in items]
+                records = [
+                    LimsRecord.from_api_response(item, mapping_snapshot) for item in items
+                ]
                 if records:
                     result[code] = records
                     logger.debug(f"  {code}: {len(records)} 条记录")
@@ -349,9 +355,9 @@ def test_parse_members():
 def test_final_after_saler():
     cases = [
         ("张三", '["张三","李四"]', "张三", "张三"),
-        ("王五", '["张三","李四"]', "", "王五"),
+        ("王五", '["张三","李四"]', "王五", "王五"),
         ("", '["张三","李四"]', "", ""),
-        ("张三", "", "", "张三"),
+        ("张三", "", "张三", "张三"),
     ]
     for after, members_str, exp_final, exp_sales in cases:
         item = {"afterSaler": after, "members": members_str, "projectCode": "LC-P001"}

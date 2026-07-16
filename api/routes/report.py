@@ -91,7 +91,9 @@ async def generate_report(
             raise HTTPException(status_code=404, detail="无可用数据")
         
         # 已经过滤过了，直接聚合
-        report_data = aggregate_report(merged_groups, all_records)
+        report_data = aggregate_report(
+            merged_groups, all_records, report_end=time_range.get("end")
+        )
         report_data["report_time_range"] = time_range
         
         # 生成 HTML
@@ -131,7 +133,9 @@ async def generate_report(
 
     # 聚合分析
     try:
-        report_data = aggregate_report(merged_groups, all_records)
+        report_data = aggregate_report(
+            merged_groups, all_records, report_end=time_range.get("end")
+        )
         report_data["report_time_range"] = time_range
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"报告聚合失败: {e}")

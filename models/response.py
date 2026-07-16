@@ -70,15 +70,25 @@ class HighFreqResult(BaseModel):
 class UnansweredDetail(BaseModel):
     msgid: str
     sender_name: str
+    sender_userid: str = ""
+    sender_role: str = "客户"
+    roomid: str = ""
     msgtime: str
     content: str
+    time_source: str = "original_message"
+    waiting_minutes: Optional[int] = None
 
 
 class UnansweredResult(BaseModel):
     is_missed: bool = False
+    decision_status: str = "no_missed"
     risk_level: str = "low"
     missed_messages: List[UnansweredDetail] = Field(default_factory=list)
     suggested_action: Optional[str] = None
+    analysis_time: Optional[str] = None
+    explanation: Optional[str] = None
+    criteria_version: str = "unanswered-v2"
+    review_required: bool = False
 
 
 class MemberInfo(BaseModel):

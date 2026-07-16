@@ -1,13 +1,29 @@
 import unittest
+import json
+import tempfile
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
 from services import db_dashboard
 
 
 class DashboardParsingTests(unittest.TestCase):
+    def test_lims_outage_keeps_unfiltered_project_groups_visible(self):
+        dimension = {
+            "codes": ["LC-P2026001"], "projects": [], "regions": [],
+            "aftersalers": [], "dimension_source": "lims_unavailable",
+        }
+        self.assertTrue(db_dashboard._dimension_matches_or_degrades(dimension))
+        self.assertFalse(db_dashboard._dimension_matches_or_degrades(dimension, region="华东"))
+        self.assertEqual(db_dashboard._scope_dimension(dimension)["codes"], ["LC-P2026001"])
+
     def test_extracts_multiple_project_codes_and_removes_duplicates(self):
         value = "客户群 LC-P2026001 / LC-X99 / LC-SP2026002 / LC-P2026001"
         self.assertEqual(
@@ -139,6 +155,77 @@ class DashboardParsingTests(unittest.TestCase):
             dimension, region="华南", aftersaler="张三", category="微生物", key_account="客户乙"
         ))
 
+    def test_parse_core_summary_normalizes_json_and_plain_text(self):
+        parsed = db_dashboard.parse_core_summary(json.dumps({
+            "overview": "讨论交付进度", "demands": ["确认交付时间"],
+            "actions": "已安排复核", "todos": None,
+        }, ensure_ascii=False))
+        self.assertEqual(parsed["overview"], "讨论交付进度")
+        self.assertEqual(parsed["demands"], ["确认交付时间"])
+        self.assertEqual(parsed["actions"], ["已安排复核"])
+        self.assertEqual(parsed["todos"], [])
+        self.assertEqual(db_dashboard.parse_core_summary("无法解析的摘要")["overview"], "无法解析的摘要")
+
+    def test_top_message_customers_uses_unambiguous_work_unit_and_all_message_denominator(self):
+        def group(name, messages, projects, words=None, rows=None):
+            return {
+                "group_name": name, "messages": messages,
+                "high_freq": Counter(words or {}), "rows": rows or [],
+                "dimension": {"projects": projects, "aftersalers": ["张三"]},
+            }
+
+        groups = {
+            "乙客户群": group("乙客户群", 50, [{
+                "project_code": "LC-P2", "work_unit": "单位乙",
+                "customer_name": "客户乙", "category_l2": "微生物",
+            }], {"进度": 3}),
+            "甲客户群一": group("甲客户群一", 40, [
+                {"project_code": "LC-P1", "work_unit": "单位甲", "customer_name": "客户甲", "category_l2": "常规转录组"},
+                {"project_code": "LC-P3", "work_unit": "单位甲", "customer_name": "客户甲", "category_l2": "表观组学"},
+            ], {"交付": 2}, [
+                {"CREATEDTIME": "2026-07-01 10:00:00", "coreInfoSummary": "旧摘要"},
+                {"CREATEDTIME": "2026-07-02 10:00:00", "coreInfoSummary": json.dumps({"overview": "最新摘要", "demands": ["确认结果"]}, ensure_ascii=False)},
+            ]),
+            "甲客户群二": group("甲客户群二", 20, [{
+                "project_code": "LC-P4", "work_unit": "单位甲",
+                "customer_name": "客户甲二", "category_l2": "常规转录组",
+            }], {"交付": 4}),
+            "无单位群": group("无单位群", 10, [{"project_code": "LC-P5", "work_unit": ""}]),
+            "多单位群": group("多单位群", 10, [
+                {"project_code": "LC-P6", "work_unit": "单位丙"},
+                {"project_code": "LC-P7", "work_unit": "单位丁"},
+            ]),
+        }
+
+        result = db_dashboard._build_top_message_customers(groups, 130)
+
+        self.assertEqual([item["customer_unit"] for item in result["items"]], ["单位甲", "单位乙"])
+        self.assertEqual(result["attributed_messages"], 110)
+        self.assertEqual(result["top5_messages"], 110)
+        self.assertEqual(result["coverage_percentage"], 84.6)
+        self.assertEqual(result["attribution_percentage"], 84.6)
+        first = result["items"][0]
+        self.assertEqual(first["message_count"], 60)
+        self.assertEqual(first["group_count"], 2)
+        self.assertEqual(first["high_frequency_top5"][0], {"word": "交付", "count": 6})
+        self.assertEqual(first["groups"][0]["summary"]["overview"], "最新摘要")
+        self.assertEqual(first["groups"][0]["percentage_of_customer"], 66.7)
+
+    def test_top_message_customers_tie_breaks_by_group_count_then_name(self):
+        groups = {
+            "B群": {"messages": 10, "high_freq": Counter(), "rows": [], "dimension": {"projects": [{"work_unit": "Unit B"}]}},
+            "A群": {"messages": 10, "high_freq": Counter(), "rows": [], "dimension": {"projects": [{"work_unit": "Unit A"}]}},
+        }
+        result = db_dashboard._build_top_message_customers(groups, 20)
+        self.assertEqual([item["customer_unit"] for item in result["items"]], ["Unit A", "Unit B"])
+
+    def test_top_message_customers_returns_stable_empty_shape(self):
+        self.assertEqual(db_dashboard._build_top_message_customers({}, 0), {
+            "limit": 5, "total_messages": 0, "attributed_messages": 0,
+            "top5_messages": 0, "coverage_percentage": 0.0,
+            "attribution_percentage": 0.0, "items": [],
+        })
+
     def test_overview_applies_product_scope_to_topics_accounts_and_cross_analysis(self):
         rows = [
             {
@@ -220,6 +307,12 @@ class DashboardParsingTests(unittest.TestCase):
             ["重点客户甲"],
         )
         self.assertEqual(
+            result["business"]["top_message_customers"]["items"][0]["customer_unit"],
+            "单位甲",
+        )
+        self.assertEqual(result["business"]["top_message_customers"]["coverage_percentage"], 100.0)
+        self.assertEqual(microbe_result["business"]["top_message_customers"]["items"], [])
+        self.assertEqual(
             [item["region"] for item in result["cross_analysis"]["region_sales"]],
             ["华东"],
         )
@@ -257,6 +350,22 @@ class DashboardParsingTests(unittest.TestCase):
                 "aftersalers": [{"name": "张三", "group_count": 1}],
                 "product_categories": [{"category": "常规转录组", "project_count": 1}],
                 "key_accounts": [{"key_account": "重点客户甲", "project_count": 1}],
+                "top_message_customers": {
+                    "items": [{
+                        "rank": 1, "customer_unit": "单位甲",
+                        "customer_names": ["客户甲"], "message_count": 10,
+                        "percentage_of_all": 100, "group_count": 1,
+                        "high_frequency_top5": [{"word": "转录", "count": 3}],
+                        "groups": [{
+                            "group_name": "允许产品群", "message_count": 10,
+                            "percentage_of_customer": 100,
+                            "summary": {"overview": "讨论转录结果", "demands": ["确认结果"]},
+                            "high_frequency_top5": [{"word": "转录", "count": 3}],
+                            "project_codes": ["LC-P1"], "product_categories": ["常规转录组"],
+                            "aftersalers": ["张三"], "latest_analysis_time": "2026-07-08 10:00:00",
+                        }],
+                    }],
+                },
             },
             "project_attention": {
                 "target_statuses": ["问题项目", "暂不交付"],
@@ -301,10 +410,13 @@ class DashboardParsingTests(unittest.TestCase):
 
         workbook = load_workbook(BytesIO(content), read_only=True)
         self.assertTrue({
-            "导出说明", "经营摘要", "高频关注主题", "重点客户", "项目状态关注", "服务质量",
+            "导出说明", "经营摘要", "高频关注主题", "重点客户", "消息Top5客户",
+            "Top5客户群聊", "项目状态关注", "服务质量",
             "analysis原始数据", "group原始数据", "chat原始数据", "LIMS原始数据",
         }.issubset(set(workbook.sheetnames)))
         self.assertEqual(workbook["高频关注主题"]["A2"].value, "转录")
+        self.assertEqual(workbook["消息Top5客户"]["B2"].value, "单位甲")
+        self.assertEqual(workbook["Top5客户群聊"]["C2"].value, "允许产品群")
         self.assertEqual(workbook["项目状态关注"]["A2"].value, "问题项目")
         self.assertEqual(workbook["LIMS原始数据"]["B2"].value, "LC-P1")
 
@@ -438,11 +550,108 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(result[2]["sender_name"], "张敏  13103738626")
         self.assertTrue(result[2]["content"].startswith("「"))
 
-    def test_get_evidence_fills_per_message_CREATEDTIME_fallback(self):
-        """display 和 raw 都没有 msgtime 时，每条 message.msgtime 也应被 CREATEDTIME 兜底，
-        避免前端逐条渲染时仍显示"无原始时间"。
-        """
+    def test_display_chat_message_never_uses_roomid_as_sender(self):
+        roomid = "wrROOM_123456"
+        message = db_dashboard._display_chat_message({
+            "roomid": roomid,
+            "from": roomid,
+            "truename": roomid,
+            "content": "请问什么时候有结果？",
+            "msgtime": "2026-07-11 10:00:00",
+        })
+        self.assertEqual(message["sender_name"], "未知发送人")
+        self.assertEqual(message["sender_role"], "未知")
+
+    def test_raw_message_role_uses_qx_group_member_type(self):
+        grouped = db_dashboard._raw_messages_by_group(
+            [{
+                "chat_id": "room-1", "name": "测试群",
+                "member_list_json": '[{"userid":"wmInternal001","name":"员工甲","type":1}]',
+            }],
+            [{
+                "roomid": "room-1", "from": "wmInternal001", "truename": "员工甲",
+                "content": "我来处理", "msgtime": "2026-07-11 10:00:00",
+            }],
+        )
+        self.assertEqual(grouped["测试群"][0]["sender_role"], "员工")
+
+    def test_unanswered_reconciliation_excludes_message_with_employee_reply(self):
+        raw = [
+            {
+                "msgid": "c1", "sender_name": "客户甲", "sender_userid": "wmCustomer001",
+                "sender_role": "客户", "roomid": "r1", "content": "什么时候出结果？",
+                "msgtime": "2026-07-11 10:00:00", "time_source": "original_message",
+            },
+            {
+                "msgid": "e1", "sender_name": "徐工", "sender_userid": "XuJun",
+                "sender_role": "员工", "roomid": "r1", "content": "预计今天下午给您。",
+                "msgtime": "2026-07-11 11:00:00", "time_source": "original_message",
+            },
+        ]
+        result = db_dashboard._evaluate_unanswered_messages(
+            [{"msgid": "c1", "content": "什么时候出结果？"}], raw,
+            datetime(2026, 7, 11, 12, 0, 0),
+        )
+        self.assertEqual(result[0]["verification_status"], "answered_before_analysis")
+        self.assertEqual(result[0]["reply_sender_name"], "徐工")
+
+    def test_unanswered_reconciliation_keeps_unique_unanswered_customer_message(self):
+        raw = [{
+            "msgid": "c1", "sender_name": "客户甲", "sender_userid": "wmCustomer001",
+            "sender_role": "客户", "roomid": "r1", "content": "什么时候出结果？",
+            "msgtime": "2026-07-11 10:00:00", "time_source": "original_message",
+        }]
+        result = db_dashboard._evaluate_unanswered_messages(
+            [
+                {"msgid": "c1", "content": "什么时候出结果？"},
+                {"msgid": "c1", "content": "什么时候出结果？"},
+            ], raw, datetime(2026, 7, 11, 12, 0, 0),
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["verification_status"], "unanswered")
+        self.assertEqual(result[0]["msgtime"], "2026-07-11 10:00:00")
+
+    def test_unanswered_reconciliation_rejects_phone_number(self):
+        raw = [{
+            "msgid": "c1", "sender_name": "客户甲", "sender_userid": "wmCustomer001",
+            "sender_role": "客户", "roomid": "r1", "content": "15642622729",
+            "msgtime": "2026-07-11 10:00:00", "time_source": "original_message",
+        }]
+        result = db_dashboard._evaluate_unanswered_messages(
+            [{"msgid": "c1", "content": "15642622729"}], raw,
+            datetime(2026, 7, 11, 12, 0, 0),
+        )
+        self.assertEqual(result[0]["verification_status"], "no_action_needed")
+
+    def test_unanswered_reconciliation_rejects_declarative_context(self):
+        raw = [{
+            "msgid": "c1", "sender_name": "客户甲", "sender_userid": "wmCustomer001",
+            "sender_role": "客户", "roomid": "r1", "content": "刚刚那个截图就是KEGG里面的结果",
+            "msgtime": "2026-07-11 10:00:00", "time_source": "original_message",
+        }]
+        result = db_dashboard._evaluate_unanswered_messages(
+            [{"msgid": "c1", "content": "刚刚那个截图就是KEGG里面的结果"}], raw,
+            datetime(2026, 7, 11, 12, 0, 0),
+        )
+        self.assertEqual(result[0]["verification_status"], "no_action_needed")
+
+    def test_unanswered_reconciliation_checks_reply_body_not_quoted_question(self):
+        content = "「客户：能打个折吗？」\n- - - - - - - -\n收到老师，我跟领导申请一下"
+        raw = [{
+            "msgid": "c1", "sender_name": "外部联系人", "sender_userid": "wmCustomer001",
+            "sender_role": "客户", "roomid": "r1", "content": content,
+            "msgtime": "2026-07-11 10:00:00", "time_source": "original_message",
+        }]
+        result = db_dashboard._evaluate_unanswered_messages(
+            [{"msgid": "c1", "content": content}], raw,
+            datetime(2026, 7, 11, 12, 0, 0),
+        )
+        self.assertEqual(result[0]["verification_status"], "no_action_needed")
+
+    def test_get_evidence_does_not_treat_analysis_time_as_message_time(self):
+        """没有原始消息证据时不能用 CREATEDTIME 冒充消息发送时间。"""
         from contextlib import contextmanager
+        db_dashboard._evidence_cache.clear()
 
         mock_row = {
             "id": 1,
@@ -485,17 +694,13 @@ class DashboardParsingTests(unittest.TestCase):
             item for item in response.get("items", [])
             if item.get("group_name") == "客户 LC-P2026001 项目群"
         ]
-        self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
-        self.assertTrue(matched[0]["msg_times"], "msg_times 应该有兜底日期")
-        self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
-        # 每条 message.msgtime 也应被填上兜底日期
-        for msg in matched[0]["messages"]:
-            self.assertTrue(msg.get("msgtime"), f"message.msgtime 不应为空: {msg}")
-            self.assertTrue(msg["msgtime"].startswith("2026-07-11"))
+        self.assertFalse(matched)
+        self.assertEqual(response["verification"].get("unverified"), 2)
 
-    def test_get_evidence_uses_CREATEDTIME_as_final_fallback(self):
-        """display 和 raw 都没有 msgtime 时，用分析行的 CREATEDTIME 日期兜底。"""
+    def test_get_evidence_excludes_unverified_analysis_text(self):
+        """模型文本匹配不到原始消息时进入待核查，不进入确认漏回。"""
         from contextlib import contextmanager
+        db_dashboard._evidence_cache.clear()
 
         mock_row = {
             "id": 1,
@@ -538,17 +743,13 @@ class DashboardParsingTests(unittest.TestCase):
             item for item in response.get("items", [])
             if item.get("group_name") == "客户 LC-P2026001 项目群"
         ]
-        self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
-        self.assertTrue(matched[0]["msg_times"], "msg_times 应该有兜底日期")
-        self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
+        self.assertFalse(matched)
+        self.assertEqual(response["verification"].get("unverified"), 1)
 
-    def test_get_evidence_falls_back_per_message_when_raw_has_unmatched_msgtime(self):
-        """用户实际场景：missedMessageList 是纯文本格式，display_messages 中所有
-        msgtime 为空；qx_chat 原始数据有时间戳但通过 content 匹配不上
-        (msgid 空 + content 不包含)。此时每条 message.msgtime 也应被 CREATEDTIME 兜底，
-        避免前端显示"无原始时间"。
-        """
+    def test_get_evidence_excludes_unmatched_text_even_when_other_raw_rows_have_time(self):
+        """群内其他消息的时间不能被宽松匹配到漏回候选上。"""
         from contextlib import contextmanager
+        db_dashboard._evidence_cache.clear()
 
         mock_row = {
             "id": 1,
@@ -595,21 +796,10 @@ class DashboardParsingTests(unittest.TestCase):
             item for item in response.get("items", [])
             if item.get("group_name") == "客户 LC-P2026001 项目群"
         ]
-        self.assertTrue(matched, "应该有一条匹配客户群LC-P2026001的证据")
-        # 纯文本解析出的 display_messages 中所有 msgtime 都为空，
-        # qx_chat 中又没有匹配的 content / msgid，
-        # 此时每条 message.msgtime 也必须被 CREATEDTIME 兜底。
-        for msg in matched[0]["messages"]:
-            self.assertTrue(msg.get("msgtime"), f"message.msgtime 不应为空: {msg}")
-            self.assertTrue(
-                msg["msgtime"].startswith("2026-07-11"),
-                f"message.msgtime 应被 CREATEDTIME 兜底, 实际={msg['msgtime']}",
-            )
-        # msg_times 至少有一个兜底时间
-        self.assertTrue(matched[0]["msg_times"])
-        self.assertTrue(matched[0]["msg_times"][0].startswith("2026-07-11"))
+        self.assertFalse(matched)
+        self.assertGreaterEqual(response["verification"].get("unverified", 0), 1)
 
-    def test_lims_api_dimensions_use_raw_after_saler(self):
+    def test_lims_api_dimensions_use_computed_final_after_saler(self):
         group_name = "Customer LC-P2026001 support"
         records = {
             "LC-P2026001": [{
@@ -620,15 +810,27 @@ class DashboardParsingTests(unittest.TestCase):
                 "orgName": "RegionA",
                 "productName": "ProductA",
                 "productBigSortOne": "CategoryA",
+                "productBigSortThree": "CategoryA",
             }]
+        }
+        mapping_snapshot = {
+            "available": True, "version_id": 1, "effective_month": "2026-07",
+            "revision": 1, "reason": "ok", "rules": [{
+                "id": 1, "version_id": 1, "product_name": "ProductA",
+                "product_keywords": ["CategoryA"], "region_name": "RegionA",
+                "lims_aftersaler": "RawAfter", "actual_aftersaler": "RealAfter",
+            }],
         }
         dimensions, quality = db_dashboard._dimensions_from_lims_api(
             {group_name: ["LC-P2026001"]},
             records,
             {"requests": 1, "records": 1, "errors": 0},
+            mapping_snapshot,
         )
 
-        self.assertEqual(dimensions[group_name]["aftersalers"], ["RawAfter"])
+        self.assertEqual(dimensions[group_name]["aftersalers"], ["RealAfter"])
+        self.assertEqual(dimensions[group_name]["raw_aftersalers"], ["RawAfter"])
+        self.assertEqual(dimensions[group_name]["projects"][0]["aftersaler_source"], "mapping")
         self.assertEqual(dimensions[group_name]["tentative_aftersalers"], [])
         self.assertEqual(quality["groups_with_aftersaler"], 1)
 
@@ -652,15 +854,64 @@ class DashboardParsingTests(unittest.TestCase):
             {"groupName": "普通交流群"},
         ]
         raw_rows = [
-            {"groupName": "客户 LC-P2026001 项目群"},
-            {"groupName": "普通交流群"},
-            {"groupName": "客户 LC-SP2026002 特殊项目群"},
+            {"groupName": "客户 LC-P2026001 项目群", "count": 3},
+            {"groupName": "普通交流群", "count": 20},
+            {"groupName": "客户 LC-SP2026002 特殊项目群", "count": 2},
         ]
         with patch.object(db_dashboard, "_query", side_effect=[latest_rows, raw_rows]):
             rows, raw_count = db_dashboard._latest_rows(None, date(2026, 7, 1), date(2026, 7, 8))
 
         self.assertEqual([row["groupName"] for row in rows], ["客户 LC-P2026001 项目群"])
-        self.assertEqual(raw_count, 2)
+        self.assertEqual(raw_count, 5)
+
+    def test_query_chat_rows_pushes_period_filter_into_sql(self):
+        with patch.object(db_dashboard, "_query_by_chunks", return_value=[]) as query:
+            rows = db_dashboard._query_chat_rows(
+                object(),
+                [{"chat_id": "room-1"}],
+                date(2026, 7, 1),
+                date(2026, 7, 16),
+            )
+
+        self.assertEqual(rows, [])
+        sql = query.call_args.args[2]
+        self.assertIn("msgtime >= %s", sql)
+        self.assertIn("msgtime < %s", sql)
+        self.assertEqual(
+            query.call_args.kwargs["suffix_params"],
+            ["2026-07-01", "2026-07-17"],
+        )
+
+    def test_lims_fresh_cache_avoids_remote_request(self):
+        with db_dashboard._lims_cache_lock:
+            db_dashboard._lims_cache["LC-P1"] = (
+                time.time(), [{"projectCode": "LC-P1"}],
+            )
+
+        records, stats = db_dashboard.fetch_lims_base_data(["LC-P1"])
+
+        self.assertEqual(records["LC-P1"][0]["projectCode"], "LC-P1")
+        self.assertEqual(stats["requests"], 0)
+        self.assertEqual(stats["cache_hits"], 1)
+
+    def test_lims_cache_survives_process_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_file = Path(temp_dir) / "dashboard_lims_cache.json"
+            cache_file.write_text(json.dumps({
+                "saved_at": time.time() - 3600,
+                "records": {"LC-P1": [{"projectCode": "LC-P1"}]},
+            }), encoding="utf-8")
+            with patch.object(db_dashboard, "LIMS_CACHE_FILE", cache_file):
+                with db_dashboard._lims_cache_lock:
+                    db_dashboard._lims_cache.clear()
+                    db_dashboard._lims_stale.clear()
+                    db_dashboard._lims_cache_loaded = False
+                db_dashboard._load_persisted_lims_cache()
+                with db_dashboard._lims_cache_lock:
+                    self.assertEqual(
+                        db_dashboard._lims_stale["LC-P1"][0]["projectCode"],
+                        "LC-P1",
+                    )
 
     def test_project_code_diagnostics_lists_missing_groups_and_unmatched_codes(self):
         diagnostics = db_dashboard._project_code_diagnostics(
@@ -693,6 +944,37 @@ class DashboardCacheTests(unittest.TestCase):
             db_dashboard.get_overview("month", region="华南")
             db_dashboard.get_overview("month", region="华东")
         self.assertEqual(build.call_count, 2)
+
+    def test_evidence_result_is_cached_for_retries(self):
+        result = {"items": [], "total": 0, "page": 1, "total_pages": 1}
+        with patch.object(db_dashboard, "_build_evidence", return_value=result) as build:
+            first = db_dashboard.get_evidence("unanswered")
+            second = db_dashboard.get_evidence("unanswered")
+
+        self.assertEqual(first, second)
+        self.assertEqual(build.call_count, 1)
+
+    def test_simultaneous_overview_requests_share_one_build(self):
+        base = {
+            "meta": {}, "summary": {}, "service_quality": {}, "communication": {},
+            "business": {}, "cross_analysis": {}, "data_quality": {},
+        }
+        barrier = threading.Barrier(2)
+
+        def build(*_args, **_kwargs):
+            time.sleep(0.05)
+            return base
+
+        def request():
+            barrier.wait()
+            return db_dashboard.get_overview("month")
+
+        with patch.object(db_dashboard, "_build_overview", side_effect=build) as mocked:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _value: request(), range(2)))
+
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual({item["meta"]["cache"] for item in results}, {"miss", "coalesced"})
 
 
 if __name__ == "__main__":

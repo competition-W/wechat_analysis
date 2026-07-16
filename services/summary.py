@@ -25,9 +25,12 @@ class SummaryGenerator:
             if not text_messages:
                 return None
 
-        sampled = self._sample_messages(text_messages)
-        
-        formatted_text = self._format_messages(sampled)
+        formatted_text = self._format_messages(text_messages)
+
+        # 极大群（>300条消息，输入约>100K字符）回退到抽样，避免超 128K context
+        if len(formatted_text) > 100000:
+            sampled = self._sample_messages(text_messages)
+            formatted_text = self._format_messages(sampled)
         
         try:
             summary = self._llm_generate(formatted_text)

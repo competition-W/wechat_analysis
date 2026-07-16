@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     SUMMARY_MAX_MESSAGES: int = Field(default=100, description="摘要最大消息数")
     SUMMARY_MAX_LENGTH: int = Field(default=1000, description="摘要最大长度")
     HIGH_FREQ_TOP_N: int = Field(default=20, description="高频词返回数量")
+    UNANSWERED_MIN_WAIT_MINUTES: int = Field(
+        default=60,
+        description="客户消息至少等待多少分钟后才允许判定为漏回",
+    )
 
     JAVA_DATA_SOURCE_URL: str = Field(
         default="http://192.168.0.129:8081/qxChat/",
@@ -59,6 +63,10 @@ class Settings(BaseSettings):
         description="LIMS base_data 接口路径"
     )
     LIMS_API_TIMEOUT: int = Field(default=60, description="LIMS API 超时时间(秒)")
+    DASHBOARD_ADMIN_KEY: str = Field(
+        default="",
+        description="数据看板售后对应表维护口令；未配置时管理接口禁用",
+    )
 
     PROJECT_CODE_PATTERN: str = Field(
     default=r"LC-(?:SP|P)\d+(?![A-Z0-9])",

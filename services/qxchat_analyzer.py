@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 from loguru import logger
 import re
 
+from config.settings import settings
+from services.preprocessor import infer_sender_role, parse_members_payload, safe_sender_name
+
 
 def _parse_time(time_str: str) -> Optional[datetime]:
     if not time_str:
@@ -62,17 +65,15 @@ class QxChatAnalyzer:
 
     def _get_sender_role(self, msg: dict, room_members: List[Dict] = None) -> str:
         """推断消息发送者角色：客户/员工/未知"""
-        job = msg.get("job", "")
-        sender_type = self._get_member_type(msg.get("from", ""), room_members)
-        if sender_type == 2:
-            return "客户"
-        elif sender_type == 1:
-            if job in ["售后", "销售"]:
-                return job
-            return "员工"
-        if job in ["售后", "销售"]:
-            return job
-        return "未知"
+        userid = str(msg.get("from", "") or "")
+        members = parse_members_payload(room_members or [])
+        return infer_sender_role(
+            from_userid=userid,
+            roomid=str(msg.get("roomid", "") or ""),
+            sender_job=str(msg.get("job", "") or ""),
+            sender_position=str(msg.get("position", "") or ""),
+            member=members.get(userid),
+        )
 
     def _get_member_type(self, userid: str, room_members: List[Dict] = None) -> int:
         """从 members 中查找用户类型"""
@@ -85,16 +86,7 @@ class QxChatAnalyzer:
 
     def _parse_members(self, members_str: str) -> List[Dict]:
         """解析 members JSON 字符串"""
-        if not members_str:
-            return []
-        import json
-        try:
-            parsed = json.loads(members_str)
-            if isinstance(parsed, list):
-                return parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return []
+        return [vars(member) for member in parse_members_payload(members_str).values()]
 
     def analyze_groups(self, merged_groups: List[Dict]) -> Dict[str, Any]:
         """对合并后的所有群组数据进行 M12-M17 分析"""
@@ -393,7 +385,7 @@ class QxChatAnalyzer:
 
         for g in groups:
             msgs = g.get("messages", [])
-            if len(msgs) < 2:
+            if not msgs:
                 continue
 
             # 按时间排序
@@ -405,37 +397,72 @@ class QxChatAnalyzer:
                 msgs[0].get("members", "") if msgs else ""
             )
 
-            # 分析消息尾部（最后 N 条客户消息是否有员工回复）
+            # 只分析最后一条员工消息之后的客户消息。任何后续员工消息都表示
+            # 此前客户消息已经得到响应，不能继续算作漏回。
             tail_size = min(20, len(sorted_msgs))
             tail = sorted_msgs[-tail_size:]
-
+            last_employee_index = max(
+                (
+                    index for index, item in enumerate(tail)
+                    if self._get_sender_role(item, members) in ["员工", "售后", "销售"]
+                ),
+                default=-1,
+            )
             room_missed = 0
-            for i, msg in enumerate(tail):
+            seen = set()
+            for i, msg in enumerate(tail[last_employee_index + 1:], start=last_employee_index + 1):
                 role = self._get_sender_role(msg, members)
                 if role != "客户":
                     continue
                 msgtime = _parse_time(msg.get("msgtime", ""))
                 if not msgtime:
                     continue
-                # 检查之后是否有员工回复
-                has_reply = False
-                for j in range(i + 1, len(tail)):
-                    reply_role = self._get_sender_role(tail[j], members)
-                    if reply_role not in ["客户", "未知"]:
-                        reply_time = _parse_time(tail[j].get("msgtime", ""))
-                        if reply_time and (reply_time - msgtime).total_seconds() < 3600:
-                            has_reply = True
-                            break
-                if not has_reply:
-                    room_missed += 1
-                    content = _extract_text_content(msg.get("content", ""))
-                    all_missed_details.append({
-                        "room_id": g.get("room_id", ""),
-                        "room_name": g.get("room_name", ""),
-                        "sender_name": msg.get("truename", ""),
-                        "content": content[:100],
-                        "msgtime": msg.get("msgtime", ""),
-                    })
+                if (datetime.now() - msgtime).total_seconds() < settings.UNANSWERED_MIN_WAIT_MINUTES * 60:
+                    continue
+                content = _extract_text_content(msg.get("content", "")).strip()
+                semantic_content = content
+                if "引用/回复消息" in content or content.lstrip().startswith(("「", "\"")):
+                    parts = re.split(r"\n\s*(?:-\s*){5,}\n", content)
+                    if len(parts) > 1:
+                        semantic_content = parts[-1]
+                meaningful = re.sub(r"@[\w\u4e00-\u9fff ._-]+", "", semantic_content).strip(" ,，。!！")
+                if (
+                    not meaningful
+                    or re.fullmatch(r"[+\d\s()-]{6,}", meaningful)
+                    or re.fullmatch(
+                        r"(?:(?:好的?|好滴|收到|谢谢|感谢|辛苦(?:了)?|麻烦了|知道了|ok|已加|我?加你了|1)(?:[，,、\s]+)?)+",
+                        meaningful,
+                        re.I,
+                    )
+                ):
+                    continue
+                if not re.search(
+                    r"[?？]|(?:吗|么|呢|是吧|对吧|怎么|如何|为什么|能否|能不能|可不可以|请问|麻烦|帮忙|帮我|协助|需要|希望|想问|想要|哪里|在哪|是否|有没有|什么时候|何时|进度|报错|错误|失败|异常|不对|打不开|无法|还没|未收到|催|尽快|链接|下载|制作|补送|沟通一下)",
+                    meaningful,
+                    re.I,
+                ):
+                    continue
+                identity = str(msg.get("msgid") or "").strip() or (
+                    f"{msg.get('from', '')}|{msg.get('msgtime', '')}|{meaningful}"
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                room_missed += 1
+                sender_userid = str(msg.get("from", "") or "")
+                roomid = str(msg.get("roomid", "") or "")
+                all_missed_details.append({
+                    "msgid": msg.get("msgid", ""),
+                    "room_id": g.get("room_id", ""),
+                    "room_name": g.get("room_name", ""),
+                    "sender_name": safe_sender_name(msg.get("truename", ""), sender_userid, roomid),
+                    "sender_userid": sender_userid,
+                    "sender_role": role,
+                    "content": content[:100],
+                    "msgtime": msg.get("msgtime", ""),
+                    "time_source": "original_message",
+                    "verification_status": "unanswered",
+                })
 
             if room_missed > 0:
                 total_missed += room_missed

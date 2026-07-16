@@ -1,8 +1,13 @@
 import json
+import re
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from loguru import logger
+
+
+EMPLOYEE_JOBS = {"售后", "销售", "员工", "技术支持", "项目经理"}
+EXTERNAL_USERID_RE = re.compile(r"^w[mo][A-Za-z0-9_-]{8,}$", re.IGNORECASE)
 
 
 @dataclass
@@ -12,10 +17,87 @@ class MemberInfo:
     group_nickname: str = ""
     type: int = 1
     join_time: int = 0
+    type_known: bool = True
     
     @property
     def is_customer(self) -> bool:
-        return self.type == 2
+        return str(self.type) == "2"
+
+
+def parse_members_payload(value) -> Dict[str, MemberInfo]:
+    """Parse members from JSON text, a list, or a wrapper object."""
+    if not value:
+        return {}
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if isinstance(parsed, dict):
+        parsed = parsed.get("members") or parsed.get("data") or []
+    if not isinstance(parsed, list):
+        return {}
+    result: Dict[str, MemberInfo] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        userid = str(item.get("userid") or item.get("user_id") or "").strip()
+        if not userid:
+            continue
+        try:
+            member_type = int(item.get("type", 1))
+        except (TypeError, ValueError):
+            member_type = 1
+        try:
+            join_time = int(item.get("join_time") or 0)
+        except (TypeError, ValueError):
+            join_time = 0
+        result[userid] = MemberInfo(
+            userid=userid,
+            name=str(item.get("name") or ""),
+            group_nickname=str(item.get("group_nickname") or ""),
+            type=member_type,
+            join_time=join_time,
+            type_known="type" in item and item.get("type") not in (None, ""),
+        )
+    return result
+
+
+def infer_sender_role(
+    from_userid: str,
+    roomid: str = "",
+    sender_job: str = "",
+    sender_position: str = "",
+    member: Optional[MemberInfo] = None,
+) -> str:
+    """Infer customer/employee without ever treating roomid as a person."""
+    userid = str(from_userid or "").strip()
+    if not userid or userid == str(roomid or "").strip():
+        return "未知"
+    if member is not None and member.type_known:
+        return "客户" if member.is_customer else "员工"
+    if str(sender_job or "").strip() in EMPLOYEE_JOBS:
+        return "员工"
+    if str(sender_position or "").strip() in EMPLOYEE_JOBS:
+        return "员工"
+    if EXTERNAL_USERID_RE.match(userid):
+        return "客户"
+    if member is not None:
+        return "员工"
+    # Enterprise WeChat internal accounts in the source are short aliases,
+    # names, or phone numbers; external contacts use the wm/wo prefix above.
+    return "员工"
+
+
+def safe_sender_name(value: str, from_userid: str = "", roomid: str = "") -> str:
+    """Return a display name only; internal identifiers are not person names."""
+    name = str(value or "").strip()
+    userid = str(from_userid or "").strip()
+    room = str(roomid or "").strip()
+    if not name or name in {userid, room} or EXTERNAL_USERID_RE.match(name):
+        return "未知发送人"
+    return name
 
 
 @dataclass
@@ -81,16 +163,17 @@ class Preprocessor:
         sender_position = msg.get("position", "")
         sender_job = msg.get("job", "")
         
-        if from_userid and from_userid in members_map:
-            member = members_map[from_userid]
-            if not sender_name:
-                sender_name = member.name
-            sender_role = "客户" if member.is_customer else "员工"
-        else:
-            if sender_job in ["售后", "销售"]:
-                sender_role = "员工"
-            else:
-                sender_role = "未知"
+        member = members_map.get(from_userid) if from_userid else None
+        if member and not sender_name:
+            sender_name = member.name or member.group_nickname
+        sender_role = infer_sender_role(
+            from_userid=from_userid,
+            roomid=msg.get("roomid", ""),
+            sender_job=sender_job,
+            sender_position=sender_position,
+            member=member,
+        )
+        sender_name = safe_sender_name(sender_name, from_userid, msg.get("roomid", ""))
         
         return NormalizedMessage(
             msgid=msg.get("msgid", ""),
@@ -109,29 +192,10 @@ class Preprocessor:
         )
     
     def _parse_members(self, members_str: str) -> Dict[str, MemberInfo]:
-        if not members_str:
-            return {}
-        
-        try:
-            members_list = json.loads(members_str)
-            if not isinstance(members_list, list):
-                return {}
-            
-            result = {}
-            for m in members_list:
-                userid = m.get("userid", "")
-                if userid:
-                    result[userid] = MemberInfo(
-                        userid=userid,
-                        name=m.get("name", ""),
-                        group_nickname=m.get("group_nickname", ""),
-                        type=m.get("type", 1),
-                        join_time=m.get("join_time", 0),
-                    )
-            return result
-        except json.JSONDecodeError:
-            logger.warning(f"解析members字段失败: {members_str[:100]}")
-            return {}
+        result = parse_members_payload(members_str)
+        if members_str and not result:
+            logger.debug("members payload did not contain usable user records")
+        return result
     
     def _extract_text_content(self, content_str: str) -> str:
         if not content_str:

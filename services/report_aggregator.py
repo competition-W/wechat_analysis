@@ -6,7 +6,7 @@
 
 from typing import List, Dict, Any, Optional
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from loguru import logger
 
 
@@ -61,6 +61,10 @@ def _normalize_record(item) -> Dict[str, Any]:
         return d
 
 
+def _final_aftersaler(record: Dict[str, Any]) -> str:
+    return str(record.get("finalAfterSaler") or record.get("afterSaler") or "").strip()
+
+
 def _parse_time(time_str: str) -> Optional[datetime]:
     if not time_str:
         return None
@@ -98,6 +102,8 @@ def _classify_duration(days: int) -> str:
 def aggregate_report(
     merged_groups: List[Dict],
     all_records_data: List,
+    mapping_snapshot: Optional[dict] = None,
+    report_end: Optional[str] = None,
 ) -> Dict[str, Any]:
     logger.info(f"开始聚合: {len(merged_groups)} 个群, {len(all_records_data)} 条 LIMS 记录")
 
@@ -134,6 +140,18 @@ def aggregate_report(
                 "end": max(parsed).strftime("%Y-%m-%d"),
             }
 
+    from services.aftersaler_mapping import get_mapping_snapshot, resolve_final_aftersaler
+
+    snapshot = mapping_snapshot or get_mapping_snapshot(report_end or time_range.get("end") or date.today())
+    for record in lims_dicts:
+        owner = resolve_final_aftersaler(
+            record.get("productBigSortThree"), record.get("orgName"),
+            record.get("afterSaler"), snapshot,
+        )
+        record["rawAfterSaler"] = owner["raw_aftersaler"]
+        record["finalAfterSaler"] = owner["final_aftersaler"]
+        record["aftersalerSource"] = owner["aftersaler_source"]
+
     # ==================== M03 摘要指标卡 ====================
     org_names = set()
     after_salers = set()
@@ -144,8 +162,8 @@ def aggregate_report(
     for d in lims_dicts:
         if d.get("orgName"):
             org_names.add(d["orgName"])
-        if d.get("afterSaler"):
-            after_salers.add(d["afterSaler"])
+        if _final_aftersaler(d):
+            after_salers.add(_final_aftersaler(d))
         if d.get("productBigSortOne"):
             prod_cats.add(d["productBigSortOne"])
         ka = d.get("keyAccount") or ""
@@ -181,7 +199,7 @@ def aggregate_report(
     # ==================== M04 售后人员分布 ====================
     after_sales_counter = Counter()
     for d in lims_dicts:
-        name = d.get("afterSaler") or "无售后"
+        name = _final_aftersaler(d) or "无售后"
         after_sales_counter[name] += 1
     after_sales_distribution = [
         {"name": name, "count": count}
@@ -237,7 +255,7 @@ def aggregate_report(
     for d in lims_dicts:
         ka = d.get("keyAccount") or ""
         cn = d.get("customerName") or ""
-        fas = d.get("afterSaler") or ""
+        fas = _final_aftersaler(d)
         if ka:
             key_cust_tree[ka][cn].add(fas)
     key_customer_hierarchy = []
@@ -297,7 +315,7 @@ def aggregate_report(
     region_after_sales_raw: Dict[str, Counter] = defaultdict(Counter)
     for d in lims_dicts:
         region = d.get("orgName") or "未分配"
-        fas = d.get("afterSaler") or "无售后"
+        fas = _final_aftersaler(d) or "无售后"
         region_after_sales_raw[region][fas] += 1
     region_after_sales = {}
     for region, counter in region_after_sales_raw.items():

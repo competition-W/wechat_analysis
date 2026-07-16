@@ -4,24 +4,40 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import threading
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
+from services import aftersaler_mapping
+from services.preprocessor import infer_sender_role, parse_members_payload, safe_sender_name
 
 
 CACHE_TTL_SECONDS = 300
+EVIDENCE_CACHE_TTL_SECONDS = 120
+LIMS_CACHE_TTL_SECONDS = 1800
+LIMS_REQUEST_BUDGET_SECONDS = 10.0
+LIMS_CACHE_FILE = Path(os.getenv("DASHBOARD_LIMS_CACHE_FILE", "logs/dashboard_lims_cache.json"))
 PROJECT_CODE_RE = re.compile(r"LC-(?:SP|P)\d+(?![A-Z0-9])", re.IGNORECASE)
 ALLOWED_PRODUCT_L2 = {"常规转录组", "表观组学", "微生物"}
 PROJECT_ATTENTION_STATUSES = ("问题项目", "暂不交付")
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_success: Dict[str, dict] = {}
+_evidence_cache: Dict[str, Tuple[float, dict]] = {}
+_overview_inflight: Dict[str, threading.Event] = {}
+_evidence_inflight: Dict[str, threading.Event] = {}
 _cache_lock = threading.Lock()
+_lims_cache: Dict[str, Tuple[float, List[dict]]] = {}
+_lims_stale: Dict[str, List[dict]] = {}
+_lims_cache_lock = threading.Lock()
+_lims_refresh_lock = threading.Lock()
+_lims_cache_loaded = False
 
 
 @contextmanager
@@ -133,8 +149,27 @@ def extract_lims_active_day(item: dict) -> Optional[float]:
 
 
 def clear_cache() -> None:
+    global _lims_cache_loaded
     with _cache_lock:
         _cache.clear()
+        _last_success.clear()
+        _evidence_cache.clear()
+    with _lims_cache_lock:
+        _lims_cache.clear()
+        _lims_stale.clear()
+        _lims_cache_loaded = False
+    try:
+        LIMS_CACHE_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("lims.cache.clear_failed path={} error={}", LIMS_CACHE_FILE, exc)
+
+
+def clear_analytics_cache() -> None:
+    """Invalidate derived dashboard results without discarding reusable LIMS data."""
+    with _cache_lock:
+        _cache.clear()
+        _last_success.clear()
+        _evidence_cache.clear()
 
 
 def extract_project_codes(group_name: str) -> List[str]:
@@ -188,6 +223,37 @@ def parse_high_freq(value: Any) -> List[dict]:
         {"word": word, "count": count}
         for word, count in parse_count_map(value).items()
     ]
+
+
+def parse_core_summary(value: Any) -> dict:
+    """Normalize a stored group summary without invoking the LLM again."""
+    empty = {"overview": "", "demands": [], "actions": [], "todos": []}
+    if value in (None, ""):
+        return empty
+    if isinstance(value, dict):
+        payload = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return empty
+        fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+        try:
+            payload = json.loads(fenced)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {**empty, "overview": text}
+    if not isinstance(payload, dict):
+        return {**empty, "overview": str(payload).strip()}
+
+    def normalized_list(raw: Any) -> List[str]:
+        values = raw if isinstance(raw, list) else ([raw] if raw not in (None, "") else [])
+        return [str(item).strip() for item in values if str(item).strip()]
+
+    return {
+        "overview": str(payload.get("overview") or "").strip(),
+        "demands": normalized_list(payload.get("demands")),
+        "actions": normalized_list(payload.get("actions")),
+        "todos": normalized_list(payload.get("todos")),
+    }
 
 
 def parse_members(value: Any) -> List[str]:
@@ -263,17 +329,59 @@ def chat_msgtime(row: dict) -> Optional[datetime]:
 
 def chat_text(row: dict) -> str:
     raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
-    return first_nonempty(
+    value = first_nonempty(
         _field_value_case_insensitive(raw, "content", "text", "msg", "message", "msgContent"),
         row_get(row, "content", "text", "message", default=""),
     )
+    # qx_chat.content is inconsistent in production: some rows store plain text,
+    # while others store a JSON string such as {"content": "..."}.
+    for _ in range(2):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            break
+        if isinstance(parsed, dict):
+            value = first_nonempty(
+                _field_value_case_insensitive(parsed, "content", "text", "msg", "message"),
+                value,
+            )
+        elif isinstance(parsed, str):
+            value = parsed
+        else:
+            break
+    return value
 
 
 def chat_sender(row: dict) -> str:
     raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
+    userid = chat_sender_userid(row)
+    roomid = str(row_get(row, "roomid", default="") or "")
+    value = first_nonempty(
+        _field_value_case_insensitive(raw, "sender_name", "truename", "fromName", "name"),
+        row_get(row, "sender_name", "truename", default=""),
+    )
+    return safe_sender_name(value, userid, roomid)
+
+
+def chat_sender_userid(row: dict) -> str:
+    raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
     return first_nonempty(
-        _field_value_case_insensitive(raw, "sender_name", "sender", "from", "fromName", "name"),
-        row_get(row, "sender_name", "sender", "from", default=""),
+        _field_value_case_insensitive(raw, "from_userid", "fromUserId", "from"),
+        row_get(row, "from_userid", "from", default=""),
+    )
+
+
+def chat_sender_role(row: dict) -> str:
+    raw = parse_json_object(row_get(row, "raw_json", "rawJson", default=None))
+    userid = chat_sender_userid(row)
+    members_value = row_get(row, "members", default=None) or raw.get("members")
+    members = parse_members_payload(members_value)
+    return infer_sender_role(
+        from_userid=userid,
+        roomid=str(row_get(row, "roomid", default="") or ""),
+        sender_job=first_nonempty(raw.get("job"), row_get(row, "job", default="")),
+        sender_position=first_nonempty(raw.get("position"), row_get(row, "position", default="")),
+        member=members.get(userid),
     )
 
 
@@ -331,50 +439,166 @@ def _chunked(values: List[str], size: int = 50) -> Iterable[List[str]]:
         yield values[index:index + size]
 
 
+def _load_persisted_lims_cache() -> None:
+    """Load the last successful LIMS snapshot from the persistent logs volume."""
+    global _lims_cache_loaded
+    with _lims_cache_lock:
+        if _lims_cache_loaded:
+            return
+        _lims_cache_loaded = True
+        try:
+            payload = json.loads(LIMS_CACHE_FILE.read_text(encoding="utf-8"))
+            saved_at = float(payload.get("saved_at") or 0)
+            records = payload.get("records") or {}
+            if not isinstance(records, dict):
+                return
+            for raw_code, raw_rows in records.items():
+                code = str(raw_code).upper()
+                rows = raw_rows if isinstance(raw_rows, list) else []
+                _lims_stale[code] = rows
+                if saved_at:
+                    _lims_cache[code] = (saved_at, copy.deepcopy(rows))
+            logger.info(
+                "lims.cache.loaded path={} codes={} age_seconds={:.0f}",
+                LIMS_CACHE_FILE, len(records), max(0, time.time() - saved_at),
+            )
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning("lims.cache.load_failed path={} error={}", LIMS_CACHE_FILE, exc)
+
+
+def _persist_lims_cache() -> None:
+    """Atomically persist successful LIMS records for restart/outage fallback."""
+    with _lims_cache_lock:
+        snapshot = copy.deepcopy(_lims_stale)
+    if not snapshot:
+        return
+    try:
+        LIMS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = LIMS_CACHE_FILE.with_suffix(LIMS_CACHE_FILE.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps({"saved_at": time.time(), "records": snapshot}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, LIMS_CACHE_FILE)
+    except Exception as exc:
+        logger.warning("lims.cache.persist_failed path={} error={}", LIMS_CACHE_FILE, exc)
+
+
 def fetch_lims_base_data(project_codes: List[str]) -> Tuple[Dict[str, List[dict]], dict]:
     """Fetch LIMS project data using POST /unionLims/base_data/ with projectCode body."""
-    if not project_codes:
+    requested_codes = sorted({str(code).upper() for code in project_codes if code})
+    if not requested_codes:
         return {}, {"available": True, "requests": 0, "records": 0, "errors": 0}
 
     import httpx
     from config.settings import settings
 
-    records_by_code: Dict[str, List[dict]] = defaultdict(list)
-    stats = {"available": False, "requests": 0, "records": 0, "errors": 0}
-    url = lims_base_data_url()
-    timeout = settings.LIMS_API_TIMEOUT
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            for batch in _chunked(project_codes):
-                stats["requests"] += 1
-                try:
-                    response = client.post(
-                        url,
-                        json=[{"projectCode": code} for code in batch],
-                        headers={"Accept": "application/json"},
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                    if payload.get("status") is False:
+    _load_persisted_lims_cache()
+    now = time.time()
+    records_by_code: Dict[str, List[dict]] = {}
+    with _lims_cache_lock:
+        for code in requested_codes:
+            cached = _lims_cache.get(code)
+            if cached and now - cached[0] < LIMS_CACHE_TTL_SECONDS:
+                records_by_code[code] = copy.deepcopy(cached[1])
+
+    missing_codes = [code for code in requested_codes if code not in records_by_code]
+    stats = {
+        "available": not missing_codes,
+        "requests": 0,
+        "records": sum(len(rows) for rows in records_by_code.values()),
+        "errors": 0,
+        "cache_hits": len(records_by_code),
+        "stale_hits": 0,
+    }
+    if not missing_codes:
+        return records_by_code, stats
+
+    # Serialize refreshes inside a worker. A second request rechecks the cache
+    # after the first one completes instead of sending the same LIMS batches.
+    with _lims_refresh_lock:
+        now = time.time()
+        with _lims_cache_lock:
+            for code in list(missing_codes):
+                cached = _lims_cache.get(code)
+                if cached and now - cached[0] < LIMS_CACHE_TTL_SECONDS:
+                    records_by_code[code] = copy.deepcopy(cached[1])
+                    stats["cache_hits"] += 1
+        missing_codes = [code for code in requested_codes if code not in records_by_code]
+        if not missing_codes:
+            stats["available"] = True
+            stats["records"] = sum(len(rows) for rows in records_by_code.values())
+            return records_by_code, stats
+
+        url = lims_base_data_url()
+        configured_timeout = max(0.5, float(settings.LIMS_API_TIMEOUT))
+        deadline = time.monotonic() + min(configured_timeout, LIMS_REQUEST_BUDGET_SECONDS)
+        try:
+            with httpx.Client() as client:
+                for batch in _chunked(missing_codes):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.25:
                         stats["errors"] += 1
-                        logger.warning("lims.base_data.status_false message={}", payload.get("message"))
-                        continue
-                    for item in payload.get("data") or []:
-                        code = str(item.get("projectCode") or "").upper()
-                        if code:
-                            records_by_code[code].append(item)
-                            stats["records"] += 1
-                    stats["available"] = True
-                except Exception as exc:
-                    stats["errors"] += 1
-                    logger.warning("lims.base_data.batch_failed size={} error={}", len(batch), exc)
-    except Exception as exc:
-        logger.warning("lims.base_data.unavailable url={} error={}", url, exc)
-    return dict(records_by_code), stats
+                        logger.warning(
+                            "lims.base_data.budget_exhausted pending_codes={} budget_seconds={}",
+                            len(missing_codes), LIMS_REQUEST_BUDGET_SECONDS,
+                        )
+                        break
+                    stats["requests"] += 1
+                    try:
+                        response = client.post(
+                            url,
+                            json=[{"projectCode": code} for code in batch],
+                            headers={"Accept": "application/json"},
+                            timeout=max(0.5, min(configured_timeout, remaining)),
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+                        if payload.get("status") is False:
+                            stats["errors"] += 1
+                            logger.warning("lims.base_data.status_false message={}", payload.get("message"))
+                            continue
+                        batch_records: Dict[str, List[dict]] = {code: [] for code in batch}
+                        for item in payload.get("data") or []:
+                            code = str(item.get("projectCode") or "").upper()
+                            if code in batch_records:
+                                batch_records[code].append(item)
+                        cached_at = time.time()
+                        with _lims_cache_lock:
+                            for code, rows in batch_records.items():
+                                _lims_cache[code] = (cached_at, copy.deepcopy(rows))
+                                _lims_stale[code] = copy.deepcopy(rows)
+                        _persist_lims_cache()
+                        records_by_code.update(batch_records)
+                        stats["available"] = True
+                    except Exception as exc:
+                        stats["errors"] += 1
+                        logger.warning("lims.base_data.batch_failed size={} error={}", len(batch), exc)
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.warning("lims.base_data.unavailable url={} error={}", url, exc)
+
+        # A transient LIMS failure must not make an otherwise cached dashboard
+        # unavailable. Use the last successful record for only the failed codes.
+        with _lims_cache_lock:
+            for code in missing_codes:
+                if code not in records_by_code and code in _lims_stale:
+                    records_by_code[code] = copy.deepcopy(_lims_stale[code])
+                    stats["stale_hits"] += 1
+
+    stats["records"] = sum(len(rows) for rows in records_by_code.values())
+    stats["available"] = stats["available"] or bool(records_by_code)
+    return records_by_code, stats
 
 
-def normalize_lims_api_record(item: dict, code: str) -> dict:
+def normalize_lims_api_record(item: dict, code: str, mapping_snapshot: Optional[dict] = None) -> dict:
     members = parse_members(item.get("members"))
+    owner = aftersaler_mapping.resolve_final_aftersaler(
+        item.get("productBigSortThree"), item.get("orgName"), item.get("afterSaler"),
+        mapping_snapshot,
+    )
     return {
         "project_code": item.get("projectCode") or code,
         "customer_name": item.get("customerName") or "",
@@ -386,7 +610,11 @@ def normalize_lims_api_record(item: dict, code: str) -> dict:
         "category_l2": item.get("productBigSortTwo") or "",
         "category_l3": item.get("productBigSortThree") or "",
         "work_unit": item.get("workUnit") or "",
-        "raw_aftersaler": item.get("afterSaler") or "",
+        "raw_aftersaler": owner["raw_aftersaler"],
+        "final_aftersaler": owner["final_aftersaler"],
+        "aftersaler_source": owner["aftersaler_source"],
+        "mapping_rule_id": owner["mapping_rule_id"],
+        "mapping_conflict": owner["mapping_conflict"],
         "lims_members": members,
         "group_id": item.get("groupId") or "",
         "active_day": extract_lims_active_day(item),
@@ -401,11 +629,13 @@ def _dimensions_from_lims_api(
     group_codes: Dict[str, List[str]],
     records_by_code: Dict[str, List[dict]],
     stats: dict,
+    mapping_snapshot: Optional[dict] = None,
 ) -> Tuple[Dict[str, dict], dict]:
     dimensions: Dict[str, dict] = {}
     aftersaler_group_count = product_project_count = matched_product_count = 0
     groups_with_lims_link = groups_with_region = groups_with_key_account = 0
     groups_with_raw_aftersaler = groups_with_lims_members = 0
+    mapping_matches = mapping_fallbacks = mapping_conflicts = 0
 
     for group_name, codes_for_group in group_codes.items():
         projects = []
@@ -417,7 +647,7 @@ def _dimensions_from_lims_api(
 
         for code in codes_for_group:
             for raw in records_by_code.get(code.upper(), []):
-                item = normalize_lims_api_record(raw, code)
+                item = normalize_lims_api_record(raw, code, mapping_snapshot)
                 has_lims_link = True
                 if item["product_name"]:
                     product_project_count += 1
@@ -431,8 +661,14 @@ def _dimensions_from_lims_api(
                 raw_after = item["raw_aftersaler"]
                 if raw_after:
                     raw_aftersalers.add(raw_after)
-                    aftersalers.add(raw_after)
+                    aftersalers.add(item["final_aftersaler"] or raw_after)
                     has_raw_aftersaler = True
+                    if item["mapping_conflict"]:
+                        mapping_conflicts += 1
+                    elif item["aftersaler_source"] == "mapping":
+                        mapping_matches += 1
+                    else:
+                        mapping_fallbacks += 1
                 lims_members = set(item["lims_members"])
                 if lims_members:
                     has_lims_members = True
@@ -482,6 +718,16 @@ def _dimensions_from_lims_api(
         "lims_api_requests": stats.get("requests", 0),
         "lims_api_records": stats.get("records", 0),
         "lims_api_errors": stats.get("errors", 0),
+        "lims_api_cache_hits": stats.get("cache_hits", 0),
+        "lims_api_stale_hits": stats.get("stale_hits", 0),
+        "mapping_available": bool(mapping_snapshot and mapping_snapshot.get("available")),
+        "mapping_version_id": (mapping_snapshot or {}).get("version_id"),
+        "mapping_effective_month": (mapping_snapshot or {}).get("effective_month"),
+        "mapping_revision": (mapping_snapshot or {}).get("revision", 0),
+        "mapping_reason": (mapping_snapshot or {}).get("reason", "not_loaded"),
+        "mapping_matched_records": mapping_matches,
+        "mapping_fallback_records": mapping_fallbacks,
+        "mapping_conflict_records": mapping_conflicts,
     }
     return dimensions, quality
 
@@ -525,6 +771,19 @@ def _quality_from_dimensions(dimensions: Dict[str, dict], base_quality: dict) ->
         ),
         "groups_with_raw_aftersaler": sum(1 for dim in dimensions.values() if dim.get("raw_aftersalers")),
         "groups_with_lims_members": sum(1 for dim in dimensions.values() if dim.get("chat_members")),
+        "mapping_matched_records": sum(
+            1 for dim in dimensions.values() for project in dim.get("projects", [])
+            if project.get("aftersaler_source") == "mapping"
+        ),
+        "mapping_fallback_records": sum(
+            1 for dim in dimensions.values() for project in dim.get("projects", [])
+            if project.get("raw_aftersaler") and project.get("aftersaler_source") != "mapping"
+            and not project.get("mapping_conflict")
+        ),
+        "mapping_conflict_records": sum(
+            1 for dim in dimensions.values() for project in dim.get("projects", [])
+            if project.get("mapping_conflict")
+        ),
     }
 
 
@@ -606,10 +865,17 @@ def _latest_rows(conn, start: date, end: date) -> Tuple[List[dict], int]:
     raw_count_rows = _query(
         conn,
         "analysis.raw_count",
-        "SELECT groupName FROM qx_analysis_result WHERE CREATEDTIME >= %s AND CREATEDTIME < %s",
+        """SELECT groupName, COUNT(*) AS count
+           FROM qx_analysis_result
+           WHERE CREATEDTIME >= %s AND CREATEDTIME < %s
+           GROUP BY groupName""",
         params,
     )
-    raw_count = sum(1 for row in raw_count_rows if is_focus_group_name(row.get("groupName", "")))
+    raw_count = sum(
+        int(row.get("count") or 1)
+        for row in raw_count_rows
+        if is_focus_group_name(row.get("groupName", ""))
+    )
     return rows, raw_count
 
 
@@ -634,7 +900,9 @@ def _raw_analysis_count(
     return sum(int(row.get("total") or 0) for row in rows)
 
 
-def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
+def _load_dimensions(
+    conn, rows: List[dict], mapping_snapshot: Optional[dict] = None,
+) -> Tuple[Dict[str, dict], dict]:
     group_codes = {row["groupName"]: extract_project_codes(row.get("groupName", "")) for row in rows}
     codes = sorted({code for values in group_codes.values() for code in values})
     if not codes:
@@ -655,11 +923,18 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
                     "groups_with_raw_aftersaler": 0,
                     "groups_with_lims_members": 0,
                     "lims_source": "none",
+                    "mapping_available": bool(mapping_snapshot and mapping_snapshot.get("available")),
+                    "mapping_version_id": (mapping_snapshot or {}).get("version_id"),
+                    "mapping_effective_month": (mapping_snapshot or {}).get("effective_month"),
+                    "mapping_revision": (mapping_snapshot or {}).get("revision", 0),
+                    "mapping_reason": (mapping_snapshot or {}).get("reason", "not_loaded"),
                 }
 
     lims_records_by_code, lims_stats = fetch_lims_base_data(codes)
     if lims_stats.get("available") and lims_records_by_code:
-        return _dimensions_from_lims_api(group_codes, lims_records_by_code, lims_stats)
+        return _dimensions_from_lims_api(
+            group_codes, lims_records_by_code, lims_stats, mapping_snapshot,
+        )
 
     logger.warning(
         "dashboard.dimension.lims_unavailable_no_business_fallback requested_codes={} lims_available={} lims_records={} lims_errors={}",
@@ -701,6 +976,16 @@ def _load_dimensions(conn, rows: List[dict]) -> Tuple[Dict[str, dict], dict]:
         "lims_api_requests": lims_stats.get("requests", 0),
         "lims_api_records": lims_stats.get("records", 0),
         "lims_api_errors": lims_stats.get("errors", 0),
+        "lims_api_cache_hits": lims_stats.get("cache_hits", 0),
+        "lims_api_stale_hits": lims_stats.get("stale_hits", 0),
+        "mapping_available": bool(mapping_snapshot and mapping_snapshot.get("available")),
+        "mapping_version_id": (mapping_snapshot or {}).get("version_id"),
+        "mapping_effective_month": (mapping_snapshot or {}).get("effective_month"),
+        "mapping_revision": (mapping_snapshot or {}).get("revision", 0),
+        "mapping_reason": (mapping_snapshot or {}).get("reason", "not_loaded"),
+        "mapping_matched_records": 0,
+        "mapping_fallback_records": 0,
+        "mapping_conflict_records": 0,
     }
     return dimensions, quality
 
@@ -743,6 +1028,121 @@ def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str
     return groups
 
 
+def _build_top_message_customers(
+    groups: Dict[str, dict], total_messages: int, limit: int = 5,
+) -> dict:
+    """Rank unambiguously attributed work units by scoped group message volume."""
+    customers: Dict[str, dict] = {}
+    attributed_messages = 0
+    for group_name, group in groups.items():
+        dimension = group.get("dimension") or {}
+        projects = dimension.get("projects") or []
+        work_units = {
+            str(project.get("work_unit") or "").strip()
+            for project in projects
+            if str(project.get("work_unit") or "").strip()
+        }
+        # A group is counted only when it maps to exactly one customer unit.
+        if len(work_units) != 1:
+            continue
+        customer_unit = next(iter(work_units))
+        message_count = max(0, int(group.get("messages") or 0))
+        attributed_messages += message_count
+        customer = customers.setdefault(customer_unit, {
+            "customer_unit": customer_unit,
+            "customer_names": set(),
+            "message_count": 0,
+            "high_frequency": Counter(),
+            "groups": [],
+        })
+        customer["message_count"] += message_count
+        customer["high_frequency"].update(group.get("high_freq") or Counter())
+        customer["customer_names"].update({
+            str(project.get("customer_name") or "").strip()
+            for project in projects
+            if str(project.get("work_unit") or "").strip() == customer_unit
+            and str(project.get("customer_name") or "").strip()
+        })
+
+        summary_row = next(
+            (
+                row for row in reversed(group.get("rows") or [])
+                if str(row.get("coreInfoSummary") or "").strip()
+            ),
+            None,
+        )
+        project_codes = sorted({
+            str(project.get("project_code") or "").strip()
+            for project in projects if str(project.get("project_code") or "").strip()
+        })
+        product_categories = sorted({
+            str(project.get("category_l2") or "").strip()
+            for project in projects if str(project.get("category_l2") or "").strip()
+        })
+        customer["groups"].append({
+            "group_name": group_name,
+            "message_count": message_count,
+            "percentage_of_customer": 0.0,
+            "latest_analysis_time": (
+                str(summary_row.get("CREATEDTIME"))[:19].replace("T", " ")
+                if summary_row else ""
+            ),
+            "summary": parse_core_summary(
+                summary_row.get("coreInfoSummary") if summary_row else None
+            ),
+            "high_frequency_top5": [
+                {"word": word, "count": count}
+                for word, count in (group.get("high_freq") or Counter()).most_common(5)
+            ],
+            "project_codes": project_codes,
+            "product_categories": product_categories,
+            "aftersalers": sorted({
+                str(value).strip()
+                for value in dimension.get("aftersalers", []) if str(value).strip()
+            }),
+        })
+
+    ranked = sorted(
+        customers.values(),
+        key=lambda item: (
+            -item["message_count"], -len(item["groups"]), item["customer_unit"]
+        ),
+    )[:max(0, limit)]
+    items = []
+    for rank, customer in enumerate(ranked, 1):
+        customer_total = customer["message_count"]
+        group_items = sorted(
+            customer["groups"], key=lambda item: (-item["message_count"], item["group_name"])
+        )
+        for group_item in group_items:
+            group_item["percentage_of_customer"] = _ratio(
+                group_item["message_count"], customer_total
+            )
+        items.append({
+            "rank": rank,
+            "customer_unit": customer["customer_unit"],
+            "customer_names": sorted(customer["customer_names"]),
+            "message_count": customer_total,
+            "percentage_of_all": _ratio(customer_total, total_messages),
+            "group_count": len(group_items),
+            "high_frequency_top5": [
+                {"word": word, "count": count}
+                for word, count in customer["high_frequency"].most_common(5)
+            ],
+            "groups": group_items,
+        })
+    top5_messages = sum(item["message_count"] for item in items)
+    return {
+        "limit": max(0, limit),
+        "total_messages": total_messages,
+        "attributed_messages": attributed_messages,
+        "top5_messages": top5_messages,
+        "coverage_percentage": _ratio(top5_messages, total_messages),
+        "attribution_percentage": _ratio(attributed_messages, total_messages),
+        "items": items,
+    }
+
+
 def _ratio(value: int, total: int) -> float:
     return round(value / total * 100, 1) if total else 0.0
 
@@ -765,6 +1165,26 @@ def _dimension_matches(
     return bool(_matching_projects(dimension, region, category, key_account, aftersaler))
 
 
+def _dimension_matches_or_degrades(
+    dimension: dict,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> bool:
+    if _dimension_matches(dimension, region, aftersaler, category, key_account):
+        return True
+    # If LIMS is temporarily unavailable, keep project-code groups visible when
+    # no LIMS-dependent filter is requested. The response quality metadata still
+    # marks these dimensions as unavailable, but the dashboard/detail does not
+    # collapse to an empty result.
+    return bool(
+        dimension.get("dimension_source") == "lims_unavailable"
+        and dimension.get("codes")
+        and not any((region, aftersaler, category, key_account))
+    )
+
+
 def _matching_projects(
     dimension: dict,
     region: str = "",
@@ -782,7 +1202,10 @@ def _matching_projects(
         and (not category or project.get("category_l2") == category)
         and (not region or project.get("region") == region)
         and (not key_account or project.get("key_account") == key_account)
-        and (not aftersaler or project.get("raw_aftersaler") == aftersaler)
+        and (
+            not aftersaler
+            or (project.get("final_aftersaler") or project.get("raw_aftersaler")) == aftersaler
+        )
     ]
 
 
@@ -796,6 +1219,12 @@ def _scope_dimension(
     """Copy a dimension and remove projects outside the shared dashboard scope."""
     scoped = copy.deepcopy(dimension)
     projects = _matching_projects(dimension, region, category, key_account, aftersaler)
+    if (
+        not projects
+        and dimension.get("dimension_source") == "lims_unavailable"
+        and not any((region, category, key_account, aftersaler))
+    ):
+        return scoped
     scoped["projects"] = projects
     scoped["codes"] = sorted({
         str(project.get("project_code") or "").upper()
@@ -806,11 +1235,13 @@ def _scope_dimension(
         project.get("region") for project in projects if project.get("region")
     })
     scoped["aftersalers"] = sorted({
-        project.get("raw_aftersaler")
+        project.get("final_aftersaler") or project.get("raw_aftersaler")
         for project in projects
-        if project.get("raw_aftersaler")
+        if project.get("final_aftersaler") or project.get("raw_aftersaler")
     })
-    scoped["raw_aftersalers"] = list(scoped["aftersalers"])
+    scoped["raw_aftersalers"] = sorted({
+        project.get("raw_aftersaler") for project in projects if project.get("raw_aftersaler")
+    })
     return scoped
 
 
@@ -915,11 +1346,12 @@ def _build_overview(
 ) -> dict:
     with database("dashboard.overview") as conn:
         rows, raw_count = _latest_rows(conn, start, end)
-        dimensions, quality = _load_dimensions(conn, rows)
+        mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
+        dimensions, quality = _load_dimensions(conn, rows, mapping_snapshot)
         base_dimensions = {
             group_name: _scope_dimension(dim)
             for group_name, dim in dimensions.items()
-            if _dimension_matches(dim)
+            if _dimension_matches_or_degrades(dim)
         }
         filter_options = {
             "regions": sorted({value for dim in base_dimensions.values() for value in dim.get("regions", [])}),
@@ -940,7 +1372,7 @@ def _build_overview(
         allowed_groups = {
             group_name
             for group_name, dim in dimensions.items()
-            if _dimension_matches(dim, region, aftersaler, category, key_account)
+            if _dimension_matches_or_degrades(dim, region, aftersaler, category, key_account)
         }
         rows = [row for row in rows if row["groupName"] in allowed_groups]
         dimensions = {
@@ -955,8 +1387,12 @@ def _build_overview(
         scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
         raw_count = _raw_analysis_count(conn, start, end, scoped_group_names)
         group_rows = _query_group_rows(conn, scoped_group_names)
-        chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
+        audit_start = start - timedelta(days=2)
+        audit_end = end + timedelta(days=1)
+        audit_chat_rows = _query_chat_rows(conn, group_rows, audit_start, audit_end)
+        chat_rows = _filter_chat_rows_by_period(audit_chat_rows, start, end)
         chat_rows_by_group = _chat_rows_by_group_name(group_rows, chat_rows)
+        audit_raw_messages = _raw_messages_by_group(group_rows, audit_chat_rows)
 
     _filter_region = region
     _filter_aftersaler = aftersaler
@@ -964,7 +1400,8 @@ def _build_overview(
     _filter_key_account = key_account
     total_groups = len(groups)
     total_messages = sum(item["messages"] for item in groups.values())
-    missed_groups = sum(1 for item in groups.values() if item["missed_days"])
+    unanswered_summary = _reconciled_unanswered_summary(rows, audit_raw_messages)
+    missed_groups = len(unanswered_summary["groups"])
     daily: Dict[str, dict] = defaultdict(lambda: {"messages": 0, "groups": set(), "missed": 0})
     customer_good = customer_bad = employee_positive = employee_negative = 0
     words = Counter()
@@ -992,7 +1429,8 @@ def _build_overview(
         day = str(row.get("CREATEDTIME"))[:10]
         daily[day]["messages"] += int(row.get("messageToDayCount") or 0)
         daily[day]["groups"].add(row["groupName"])
-        daily[day]["missed"] += 1 if str(row.get("isMissedMessage")) == "1" else 0
+    for day, group_names in unanswered_summary["daily_groups"].items():
+        daily[day]["missed"] = len(group_names)
 
     for group_name, item in groups.items():
         customer_good += item["customer_good"]
@@ -1053,7 +1491,7 @@ def _build_overview(
                     "key_account": project.get("key_account") or "",
                     "region": project.get("region") or "",
                     "sales_person": project.get("sales_person") or "",
-                    "aftersaler": project.get("raw_aftersaler") or "",
+                    "aftersaler": project.get("final_aftersaler") or project.get("raw_aftersaler") or "",
                     "groups": set(),
                     "message_count": 0,
                     "active_days": [],
@@ -1141,6 +1579,7 @@ def _build_overview(
             "active_day": max(value.get("active_days", []) or [0]),
         })
     account_items.sort(key=lambda value: (-value["group_count"], -value["project_count"], value["key_account"]))
+    top_message_customers = _build_top_message_customers(groups, total_messages)
     attention_items = []
     status_order = {status: index for index, status in enumerate(PROJECT_ATTENTION_STATUSES)}
     for value in attention_projects.values():
@@ -1217,7 +1656,14 @@ def _build_overview(
             "short_active_ratio": _ratio(sum(1 for value in durations.values() if value <= 30), len(durations)),
         },
         "service_quality": {
-            "unanswered": {"total_groups": total_groups, "missed_groups": missed_groups, "answered_groups": total_groups - missed_groups, "missed_rate": _ratio(missed_groups, total_groups)},
+            "unanswered": {
+                "total_groups": total_groups,
+                "missed_groups": missed_groups,
+                "answered_groups": max(0, total_groups - missed_groups),
+                "missed_rate": _ratio(missed_groups, total_groups),
+                "review_groups": len(unanswered_summary["review_groups"]),
+                "definition": "截至统计截止仍未发现员工回复、且能匹配到原始客户消息的待回复群。",
+            },
             "sentiment": {"customer_good": customer_good, "customer_bad": customer_bad, "employee_positive": employee_positive, "employee_negative": employee_negative},
         },
         "communication": {
@@ -1253,6 +1699,7 @@ def _build_overview(
             ],
             "product_hierarchy": product_hierarchy,
             "key_accounts": account_items,
+            "top_message_customers": top_message_customers,
         },
         "project_attention": {
             "target_statuses": list(PROJECT_ATTENTION_STATUSES),
@@ -1296,7 +1743,23 @@ def _build_overview(
             "lims_api_requests": quality.get("lims_api_requests", 0),
             "lims_api_records": quality.get("lims_api_records", 0),
             "lims_api_errors": quality.get("lims_api_errors", 0),
-            "note": "业务维度仅来源于 POST /unionLims/base_data/，请求体 [{projectCode: 项目号}]。看板仅统计产品二级分类为常规转录组、表观组学、微生物的项目；售后人员取接口 afterSaler 字段，销售区域取 orgName，重点客户取 keyAccount，活跃周期取 activeDay/activellay；接口不可用或产品不在限定范围时不纳入统计。",
+            "lims_api_cache_hits": quality.get("lims_api_cache_hits", 0),
+            "lims_api_stale_hits": quality.get("lims_api_stale_hits", 0),
+            "mapping_available": quality.get("mapping_available", False),
+            "mapping_version_id": quality.get("mapping_version_id"),
+            "mapping_effective_month": quality.get("mapping_effective_month"),
+            "mapping_revision": quality.get("mapping_revision", 0),
+            "mapping_reason": quality.get("mapping_reason", "unknown"),
+            "mapping_matched_records": quality.get("mapping_matched_records", 0),
+            "mapping_fallback_records": quality.get("mapping_fallback_records", 0),
+            "mapping_conflict_records": quality.get("mapping_conflict_records", 0),
+            "mapping_match_rate": _ratio(
+                quality.get("mapping_matched_records", 0),
+                quality.get("mapping_matched_records", 0)
+                + quality.get("mapping_fallback_records", 0)
+                + quality.get("mapping_conflict_records", 0),
+            ),
+            "note": "业务维度仅来源于 POST /unionLims/base_data/。售后人员优先按 productBigSortThree + orgName + afterSaler 对应表确定，未命中或配置不可用时回退 afterSaler；销售区域取 orgName，重点客户取 keyAccount，活跃周期取 activeDay/activellay。",
         },
     }
 
@@ -1320,6 +1783,28 @@ def get_overview(
             result = copy.deepcopy(cached[1])
             result["meta"]["cache"] = "hit"
             return result
+        inflight = _overview_inflight.get(key)
+        if inflight is None:
+            inflight = threading.Event()
+            _overview_inflight[key] = inflight
+            is_builder = True
+        else:
+            is_builder = False
+    if not is_builder:
+        inflight.wait(timeout=35)
+        with _cache_lock:
+            completed = _cache.get(key)
+            stale = _last_success.get(key)
+        if completed:
+            result = copy.deepcopy(completed[1])
+            result["meta"]["cache"] = "coalesced"
+            return result
+        if stale:
+            result = copy.deepcopy(stale)
+            result["meta"]["stale"] = True
+            result["meta"]["stale_reason"] = "refresh_incomplete"
+            return result
+        raise TimeoutError("dashboard overview refresh did not complete")
     try:
         result = _build_overview(
             start, end, normalized_period,
@@ -1341,9 +1826,14 @@ def get_overview(
             result["meta"]["stale_reason"] = type(exc).__name__
             return result
         raise
+    finally:
+        with _cache_lock:
+            event = _overview_inflight.pop(key, None)
+            if event:
+                event.set()
 
 
-def get_evidence(
+def _build_evidence(
     metric: str,
     period: str = "month",
     start_date: Optional[str] = None,
@@ -1360,20 +1850,26 @@ def get_evidence(
     start, end, normalized_period = resolve_period(period, start_date, end_date)
     with database("dashboard.evidence") as conn:
         rows, _ = _latest_rows(conn, start, end)
-        dimensions, _ = _load_dimensions(conn, rows)
+        mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
+        dimensions, _ = _load_dimensions(conn, rows, mapping_snapshot)
         dimensions = {
             group_name: _scope_dimension(dim, region, category, key_account, aftersaler)
             for group_name, dim in dimensions.items()
-            if _dimension_matches(dim, region, aftersaler, category, key_account)
+            if _dimension_matches_or_degrades(dim, region, aftersaler, category, key_account)
         }
         allowed_groups = [
             row.get("groupName") for row in rows
             if row.get("groupName") in dimensions
         ]
         group_rows = _query_group_rows(conn, sorted(set(allowed_groups)))
-        chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
-        raw_messages = _raw_messages_by_group(group_rows, chat_rows)
+        audit_chat_rows = _query_chat_rows(
+            conn, group_rows, start - timedelta(days=2), end + timedelta(days=1)
+        )
+        raw_messages = _raw_messages_by_group(group_rows, audit_chat_rows)
     items = []
+    unanswered_items: Dict[str, dict] = {}
+    verification_counts = Counter()
+    seen_unanswered = set()
     metric = metric.lower()
     for row in reversed(rows):
         group_name = row.get("groupName") or ""
@@ -1408,30 +1904,40 @@ def get_evidence(
         if search and search.lower() not in (group_name + " " + str(content) + " " + str(row.get("member") or "")).lower():
             continue
         group_raw_messages = raw_messages.get(group_name, [])
-        display_messages = _evidence_messages(metric, content, keyword or "", missed_messages, group_raw_messages)
-        # 先计算兜底时间（始终计算一次，供后面补全每条 message 使用）
-        row_fallback_time = ""
         analysis_dt = parse_msg_datetime(row.get("CREATEDTIME"))
-        if analysis_dt:
-            row_fallback_time = analysis_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        msg_times = [
-            item["msgtime"] for item in display_messages if item.get("msgtime")
-        ] or [
-            item["msgtime"] for item in group_raw_messages if item.get("msgtime")
-        ][:1]
-        if not msg_times and row_fallback_time:
-            msg_times = [row_fallback_time]
-        # 兜底也要补到每条 message 上，否则前端逐条渲染时仍会显示"无原始时间"。
-        # 注意：即使 group_raw_messages 里有时间戳，但纯文本格式的漏回消息
-        # 往往无法通过 msgid/content 匹配到 qx_chat 中具体那一行，导致
-        # display_messages 里所有 msgtime 都为空，此时也要补上 CREATEDTIME。
-        if row_fallback_time:
-            for msg in display_messages:
-                if not msg.get("msgtime"):
-                    msg["msgtime"] = row_fallback_time
-        items.append({
+        if metric == "unanswered":
+            evaluated = _evaluate_unanswered_messages(
+                missed_messages, group_raw_messages, analysis_dt
+            )
+            for message in evaluated:
+                verification_counts[message.get("verification_status") or "unverified"] += 1
+            display_messages = []
+            for message in evaluated:
+                if message.get("verification_status") != "unanswered":
+                    continue
+                identity = (
+                    group_name,
+                    str(message.get("msgid") or "").strip()
+                    or "|".join((
+                        str(message.get("sender_userid") or message.get("sender_name") or "").strip(),
+                        _normalize_chat_content(str(message.get("content") or "")),
+                        str(message.get("msgtime") or "").strip(),
+                    )),
+                )
+                if identity in seen_unanswered:
+                    continue
+                seen_unanswered.add(identity)
+                display_messages.append(message)
+            if not display_messages:
+                continue
+        else:
+            display_messages = _evidence_messages(
+                metric, content, keyword or "", missed_messages, group_raw_messages
+            )
+        msg_times = [item["msgtime"] for item in display_messages if item.get("msgtime")]
+        evidence_item = {
             "id": row.get("id"), "group_name": group_name,
+            "analysis_time": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
             "analysis_date": str(row.get("CREATEDTIME"))[:19].replace("T", " "),
             "msg_times": msg_times,
             "messages": display_messages,
@@ -1439,7 +1945,21 @@ def get_evidence(
             "content": content, "core_summary": row.get("coreInfoSummary") or "",
             "project_codes": dim.get("codes", []), "projects": dim.get("projects", []),
             "aftersalers": dim.get("aftersalers", []),
-        })
+        }
+        if metric == "unanswered":
+            existing = unanswered_items.get(group_name)
+            if existing:
+                existing["messages"].extend(display_messages)
+                existing["msg_times"].extend(msg_times)
+                if evidence_item["analysis_time"] > existing["analysis_time"]:
+                    existing["analysis_time"] = evidence_item["analysis_time"]
+                    existing["analysis_date"] = evidence_item["analysis_date"]
+            else:
+                unanswered_items[group_name] = evidence_item
+        else:
+            items.append(evidence_item)
+    if metric == "unanswered":
+        items = list(unanswered_items.values())
     total = len(items)
     start_index = (page - 1) * page_size
     return {
@@ -1447,8 +1967,70 @@ def get_evidence(
         "start_date": start.isoformat(), "end_date": end.isoformat(),
         "total": total, "page": page, "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size),
+        "definition": ({
+            "unit": "一条明细是一条能匹配到 qx_chat 原始记录、由客户发送且截至统计截止仍未发现员工后续回复的消息。",
+            "message_time": "消息发送时间来自 qx_chat.msgtime，是客户原消息的发送时间。",
+            "analysis_time": "分析时间来自 qx_analysis_result.CREATEDTIME，是系统执行分析的批次时间，不是消息发送时间。",
+            "sender": "发送人姓名仅取原始姓名字段；from/roomid 只用于身份核验，不作为姓名展示。",
+            "deduplication": "同一 msgid，或同一发送人、正文和原始发送时间，只展示一次。",
+        } if metric == "unanswered" else {}),
+        "verification": dict(verification_counts) if metric == "unanswered" else {},
         "items": items[start_index:start_index + page_size],
     }
+
+
+def get_evidence(
+    metric: str,
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    keyword: Optional[str] = None,
+    search: Optional[str] = None,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict:
+    key = json.dumps(
+        [metric, period, start_date, end_date, keyword, search, region, aftersaler,
+         category, key_account, page, page_size],
+        ensure_ascii=False,
+    )
+    now = time.time()
+    with _cache_lock:
+        cached = _evidence_cache.get(key)
+        if cached and now - cached[0] < EVIDENCE_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1])
+        inflight = _evidence_inflight.get(key)
+        if inflight is None:
+            inflight = threading.Event()
+            _evidence_inflight[key] = inflight
+            is_builder = True
+        else:
+            is_builder = False
+    if not is_builder:
+        inflight.wait(timeout=35)
+        with _cache_lock:
+            completed = _evidence_cache.get(key)
+        if completed:
+            return copy.deepcopy(completed[1])
+        raise TimeoutError("dashboard evidence refresh did not complete")
+    try:
+        result = _build_evidence(
+            metric=metric, period=period, start_date=start_date, end_date=end_date,
+            keyword=keyword, search=search, region=region, aftersaler=aftersaler,
+            category=category, key_account=key_account, page=page, page_size=page_size,
+        )
+        with _cache_lock:
+            _evidence_cache[key] = (time.time(), copy.deepcopy(result))
+        return result
+    finally:
+        with _cache_lock:
+            event = _evidence_inflight.pop(key, None)
+            if event:
+                event.set()
 
 
 # Compatibility helpers for existing callers.
@@ -1523,8 +2105,12 @@ def _parse_missed_text(text: str) -> List[dict]:
             messages.append({
                 "msgid": "",
                 "sender_name": "",
+                "sender_userid": "",
+                "sender_role": "未知",
+                "roomid": "",
                 "content": stripped,
                 "msgtime": "",
+                "time_source": "unavailable",
             })
         return messages
 
@@ -1536,8 +2122,12 @@ def _parse_missed_text(text: str) -> List[dict]:
             messages.append({
                 "msgid": "",
                 "sender_name": "",
+                "sender_userid": "",
+                "sender_role": "未知",
+                "roomid": "",
                 "content": prefix,
                 "msgtime": "",
+                "time_source": "unavailable",
             })
 
     # 2) 解析 sender:content 对
@@ -1557,8 +2147,12 @@ def _parse_missed_text(text: str) -> List[dict]:
         messages.append({
             "msgid": "",
             "sender_name": sender,
+            "sender_userid": "",
+            "sender_role": "未知",
+            "roomid": "",
             "content": content,
             "msgtime": "",
+            "time_source": "unavailable",
         })
 
     return messages
@@ -1636,11 +2230,28 @@ def _extract_missed_messages(missed_list_json: Any) -> List[dict]:
                     or item.get("createTime") or item.get("createtime")
                     or ""
                 )
+                sender_userid = first_nonempty(
+                    item.get("sender_userid"), item.get("from_userid"),
+                    item.get("fromUserId"), item.get("from"),
+                )
+                roomid = first_nonempty(item.get("roomid"), item.get("roomId"))
+                sender_name = safe_sender_name(
+                    first_nonempty(
+                        item.get("sender_name"), item.get("sender"),
+                        item.get("truename"), item.get("fromName"),
+                    ),
+                    sender_userid,
+                    roomid,
+                )
                 messages.append({
                     "msgid": item.get("msgid") or item.get("id") or "",
-                    "sender_name": item.get("sender_name") or item.get("sender") or item.get("from") or "",
+                    "sender_name": sender_name,
+                    "sender_userid": sender_userid,
+                    "sender_role": item.get("sender_role") or item.get("role") or "未知",
+                    "roomid": roomid,
                     "content": item.get("content") or item.get("text") or item.get("message") or "",
                     "msgtime": str(msgtime) if msgtime else "",
+                    "time_source": "analysis_payload" if msgtime else "unavailable",
                 })
             if messages:
                 return messages
@@ -1656,8 +2267,12 @@ def _extract_missed_messages(missed_list_json: Any) -> List[dict]:
     return [{
         "msgid": "",
         "sender_name": "",
+        "sender_userid": "",
+        "sender_role": "未知",
+        "roomid": "",
         "content": text,
         "msgtime": "",
+        "time_source": "unavailable",
     }]
 
 
@@ -1671,16 +2286,35 @@ def _display_chat_message(row: dict) -> dict:
     return {
         "msgid": chat_msgid(row),
         "sender_name": chat_sender(row),
+        "sender_userid": chat_sender_userid(row),
+        "sender_role": chat_sender_role(row),
+        "roomid": str(row_get(row, "roomid", default="") or ""),
         "content": chat_text(row),
         "msgtime": msg_time.strftime("%Y-%m-%d %H:%M:%S") if msg_time else "",
+        "time_source": "original_message" if msg_time else "unavailable",
     }
 
 
 def _raw_messages_by_group(group_rows: List[dict], chat_rows: List[dict]) -> Dict[str, List[dict]]:
     grouped = _chat_rows_by_group_name(group_rows, chat_rows)
+    members_by_room = {
+        str(row.get("chat_id") or "").strip(): (
+            row.get("member_list_json")
+            or parse_json_object(row.get("completeData")).get("member_list")
+            or []
+        )
+        for row in group_rows
+        if str(row.get("chat_id") or "").strip()
+    }
     result = {}
     for group_name, rows in grouped.items():
-        messages = [_display_chat_message(row) for row in rows]
+        messages = []
+        for row in rows:
+            enriched = dict(row)
+            roomid = str(row.get("roomid") or "").strip()
+            if not enriched.get("members") and members_by_room.get(roomid):
+                enriched["members"] = members_by_room[roomid]
+            messages.append(_display_chat_message(enriched))
         messages.sort(key=lambda item: item.get("msgtime") or "")
         result[group_name] = messages
     return result
@@ -1693,38 +2327,215 @@ def _normalize_chat_content(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _match_raw_message(message: dict, raw_messages: List[dict]) -> dict:
+def _match_raw_message(
+    message: dict,
+    raw_messages: List[dict],
+    used_indices: Optional[set] = None,
+) -> dict:
+    """Match one analysis candidate to one original chat row.
+
+    Matching by sender alone is deliberately forbidden: it previously copied the
+    timestamp of an unrelated message and made room/user ids look like senders.
+    """
+    used_indices = used_indices if used_indices is not None else set()
     msgid = str(message.get("msgid") or "").strip()
     content = str(message.get("content") or "").strip()
     sender = str(message.get("sender_name") or "").strip()
     norm_content = _normalize_chat_content(content)
-    for raw in raw_messages:
+    candidates = []
+    for index, raw in enumerate(raw_messages):
+        if index in used_indices:
+            continue
         if msgid and msgid == str(raw.get("msgid") or "").strip():
-            return {**message, **{k: v for k, v in raw.items() if v}}
-    if content:
+            candidates.append((1000, index, raw, "msgid"))
+            continue
+        norm_raw = _normalize_chat_content(str(raw.get("content") or ""))
+        if not norm_content or not norm_raw:
+            continue
+        raw_sender = str(raw.get("sender_name") or "").strip()
+        sender_bonus = 20 if sender and sender != "未知发送人" and sender == raw_sender else 0
+        if norm_content == norm_raw:
+            candidates.append((500 + sender_bonus, index, raw, "exact_content"))
+            continue
+        shorter, longer = sorted((norm_content, norm_raw), key=len)
+        if len(shorter) >= 8 and shorter in longer and len(shorter) / len(longer) >= 0.75:
+            candidates.append((300 + sender_bonus + int(100 * len(shorter) / len(longer)), index, raw, "content_fragment"))
+    if not candidates:
+        return {**message, "match_status": "unverified"}
+    _, index, raw, match_method = max(candidates, key=lambda item: (item[0], -item[1]))
+    used_indices.add(index)
+    return {
+        **message,
+        **{key: value for key, value in raw.items() if value not in (None, "")},
+        "match_status": "matched",
+        "match_method": match_method,
+        "raw_index": index,
+    }
+
+
+def _deduplicate_missed_messages(messages: List[dict]) -> List[dict]:
+    result = []
+    seen = set()
+    for message in messages:
+        key = str(message.get("msgid") or "").strip()
+        if not key:
+            key = "|".join((
+                str(message.get("sender_name") or "").strip(),
+                _normalize_chat_content(str(message.get("content") or "")),
+                str(message.get("msgtime") or "").strip(),
+            ))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(message)
+    return result
+
+
+def _is_actionable_missed_content(value: str) -> bool:
+    raw_text = str(value or "")
+    if "引用/回复消息" in raw_text or raw_text.lstrip().startswith(("「", "\"")):
+        parts = re.split(r"\n\s*(?:-\s*){5,}\n", raw_text)
+        if len(parts) > 1:
+            raw_text = parts[-1]
+    text = _normalize_chat_content(raw_text).strip(" ,，。!！~～")
+    if not text:
+        return False
+    without_mentions = re.sub(r"@[\w\u4e00-\u9fff ._-]+", "", text).strip(" ,，。!！")
+    if not without_mentions:
+        return False
+    if re.fullmatch(r"[+\d\s()-]{6,}", without_mentions):
+        return False
+    if re.fullmatch(
+        r"(?:(?:好的?|好滴|收到|谢谢|感谢|辛苦(?:了)?|麻烦了|知道了|ok|已加|我?加你了|[嗯哦哈]+|1)(?:[，,、\s]+)?)+",
+        without_mentions,
+        re.I,
+    ):
+        return False
+    if re.fullmatch(r"(?:\[[^\]]+\]|[\W_])+", without_mentions):
+        return False
+    # Historical rows only become *confirmed* unanswered evidence when the text
+    # contains an explicit question, request, error, complaint, or progress cue.
+    # Declarative context is retained in the source table but is not promoted to
+    # a dashboard alert without stronger evidence.
+    return bool(re.search(
+        r"[?？]|(?:吗|么|呢|是吧|对吧|怎么|如何|为什么|能否|能不能|可不可以|请问|麻烦|帮忙|帮我|协助|需要|希望|想问|想要|哪里|在哪|是否|有没有|什么时候|何时|进度|报错|错误|失败|异常|不对|打不开|无法|还没|未收到|催|尽快|链接|下载|制作|补送|沟通一下)",
+        without_mentions,
+        re.I,
+    ))
+
+
+def _evaluate_unanswered_messages(
+    missed_messages: List[dict],
+    raw_messages: List[dict],
+    analysis_time: Optional[datetime],
+) -> List[dict]:
+    """Reconcile stored model output against the original timeline."""
+    used_indices: set = set()
+    matched = [
+        _match_raw_message(message, raw_messages, used_indices)
+        for message in _deduplicate_missed_messages(missed_messages)
+    ]
+    evaluated = []
+    for message in matched:
+        result = dict(message)
+        result.pop("raw_index", None)
+        if not _is_actionable_missed_content(str(result.get("content") or "")):
+            result["verification_status"] = "no_action_needed"
+            evaluated.append(result)
+            continue
+        if result.get("match_status") != "matched":
+            result["verification_status"] = "unverified"
+            evaluated.append(result)
+            continue
+        if result.get("sender_role") != "客户":
+            result["verification_status"] = "invalid_sender"
+            evaluated.append(result)
+            continue
+        sent_at = parse_msg_datetime(result.get("msgtime"))
+        if not sent_at:
+            result["verification_status"] = "unverified"
+            evaluated.append(result)
+            continue
+        later_replies = []
         for raw in raw_messages:
-            raw_content = str(raw.get("content") or "")
-            if content in raw_content or raw_content in content:
-                return {**message, **{k: v for k, v in raw.items() if v}}
-            # 空白字符可能在不同来源间出现差异（如 `"... \n 1呢"` vs `"...\n 1呢"`），
-            # 标准化后再次比较
-            norm_raw = _normalize_chat_content(raw_content)
-            if norm_content and norm_raw and (
-                norm_content in norm_raw or norm_raw in norm_content
-            ):
-                return {**message, **{k: v for k, v in raw.items() if v}}
-    # 兜底：按 sender_name 选最近一条消息作为时间戳参考（处理纯文本漏回消息
-    # 没有 msgid / 文本片段的边界场景），仅复制 msgtime
-    if sender:
-        for raw in raw_messages:
-            if str(raw.get("sender_name") or "").strip() == sender and raw.get("msgtime"):
-                return {**message, "msgtime": raw["msgtime"]}
-    return message
+            reply_at = parse_msg_datetime(raw.get("msgtime"))
+            if raw.get("sender_role") in {"员工", "售后", "销售"} and reply_at and reply_at > sent_at:
+                later_replies.append((reply_at, raw))
+        if later_replies:
+            reply_at, reply = min(later_replies, key=lambda item: item[0])
+            result.update({
+                "verification_status": (
+                    "answered_before_analysis"
+                    if analysis_time and reply_at <= analysis_time
+                    else "answered_later"
+                ),
+                "reply_time": reply_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "reply_sender_name": reply.get("sender_name") or "未知员工",
+            })
+        else:
+            result["verification_status"] = "unanswered"
+        if analysis_time:
+            result["analysis_time"] = analysis_time.strftime("%Y-%m-%d %H:%M:%S")
+            result["waiting_minutes"] = max(0, int((analysis_time - sent_at).total_seconds() // 60))
+        evaluated.append(result)
+    return evaluated
+
+
+def _reconciled_unanswered_summary(rows: List[dict], raw_messages_by_group: Dict[str, List[dict]]) -> dict:
+    groups = set()
+    review_groups = set()
+    daily_groups: Dict[str, set] = defaultdict(set)
+    seen = set()
+    status_counts = Counter()
+    for row in rows:
+        if str(row.get("isMissedMessage")) != "1":
+            continue
+        group_name = str(row.get("groupName") or "").strip()
+        if not group_name:
+            continue
+        analysis_time = parse_msg_datetime(row.get("CREATEDTIME"))
+        evaluated = _evaluate_unanswered_messages(
+            _extract_missed_messages(row.get("missedMessageList")),
+            raw_messages_by_group.get(group_name, []),
+            analysis_time,
+        )
+        for message in evaluated:
+            identity = (
+                group_name,
+                str(message.get("msgid") or "").strip()
+                or "|".join((
+                    str(message.get("sender_userid") or message.get("sender_name") or "").strip(),
+                    _normalize_chat_content(str(message.get("content") or "")),
+                    str(message.get("msgtime") or "").strip(),
+                )),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            status = str(message.get("verification_status") or "unverified")
+            status_counts[status] += 1
+            if status == "unanswered":
+                groups.add(group_name)
+                day = (analysis_time.strftime("%Y-%m-%d") if analysis_time else "")
+                if day:
+                    daily_groups[day].add(group_name)
+            elif status == "unverified":
+                review_groups.add(group_name)
+    return {
+        "groups": groups,
+        "review_groups": review_groups,
+        "daily_groups": daily_groups,
+        "status_counts": dict(status_counts),
+    }
 
 
 def _evidence_messages(metric: str, content: str, keyword: str, missed_messages: List[dict], raw_messages: List[dict]) -> List[dict]:
     if metric == "unanswered":
-        return [_match_raw_message(message, raw_messages) for message in missed_messages]
+        used_indices: set = set()
+        return [
+            _match_raw_message(message, raw_messages, used_indices)
+            for message in _deduplicate_missed_messages(missed_messages)
+        ]
     if metric == "highfreq" and keyword:
         lowered = keyword.lower()
         return [
@@ -1811,7 +2622,7 @@ def get_verification_stats(
         raw_rows = scope["raw_rows"]
         dimensions = scope["dimensions"]
         group_rows = _query_group_rows(conn, scope["group_names"])
-        chat_rows = _query_chat_rows(conn, group_rows)
+        chat_rows = _query_chat_rows(conn, group_rows, start, end)
 
     lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
 
@@ -1966,6 +2777,50 @@ def get_verification_stats(
     }
 
 
+def get_aftersaler_mapping_preview(
+    version_id: int,
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> dict:
+    """Preview a selected mapping version against LIMS records in the dashboard range."""
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    with database("dashboard.mapping_preview") as conn:
+        rows, _ = _latest_rows(conn, start, end)
+    project_codes = sorted({
+        code for row in rows for code in extract_project_codes(row.get("groupName", ""))
+    })
+    records_by_code, lims_stats = fetch_lims_base_data(project_codes)
+    snapshot = aftersaler_mapping.get_mapping_snapshot_by_version(version_id)
+    scoped_records = []
+    for records in records_by_code.values():
+        for record in records:
+            normalized = normalize_lims_api_record(record, record.get("projectCode") or "", snapshot)
+            if normalized.get("category_l2") not in ALLOWED_PRODUCT_L2:
+                continue
+            if category and normalized.get("category_l2") != category:
+                continue
+            if region and normalized.get("region") != region:
+                continue
+            if key_account and normalized.get("key_account") != key_account:
+                continue
+            if aftersaler and normalized.get("final_aftersaler") != aftersaler:
+                continue
+            scoped_records.append(record)
+    result = aftersaler_mapping.preview_records(scoped_records, snapshot)
+    result.update({
+        "period": {"start": start.isoformat(), "end": end.isoformat(), "normalized": normalized_period},
+        "project_codes": len(project_codes),
+        "lims_api_records": lims_stats.get("records", 0),
+        "lims_api_errors": lims_stats.get("errors", 0),
+    })
+    return result
+
+
 def get_unanswered_summary() -> dict:
     return get_overview("year")["service_quality"]["unanswered"]
 
@@ -2000,11 +2855,12 @@ def _current_dashboard_scope(
     key_account: str = "",
 ) -> dict:
     latest_rows, raw_count = _latest_rows(conn, start, end)
-    dimensions, quality = _load_dimensions(conn, latest_rows)
+    mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
+    dimensions, quality = _load_dimensions(conn, latest_rows, mapping_snapshot)
     allowed_groups = {
         group_name
         for group_name, dim in dimensions.items()
-        if _dimension_matches(dim, region, aftersaler, category, key_account)
+        if _dimension_matches_or_degrades(dim, region, aftersaler, category, key_account)
     }
     latest_rows = [row for row in latest_rows if row.get("groupName") in allowed_groups]
     dimensions = {
@@ -2052,7 +2908,12 @@ def _query_group_rows(conn, group_names: List[str]) -> List[dict]:
     )
 
 
-def _query_chat_rows(conn, group_rows: List[dict]) -> List[dict]:
+def _query_chat_rows(
+    conn,
+    group_rows: List[dict],
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+) -> List[dict]:
     room_ids = sorted({
         str(row.get("chat_id") or "").strip()
         for row in group_rows
@@ -2061,11 +2922,18 @@ def _query_chat_rows(conn, group_rows: List[dict]) -> List[dict]:
     if not room_ids:
         return []
     rows_by_key: Dict[str, dict] = {}
+    sql = "SELECT * FROM qx_chat WHERE roomid IN ({placeholders})"
+    suffix_params: List[Any] = []
+    if start is not None and end is not None:
+        sql += " AND msgtime >= %s AND msgtime < %s"
+        suffix_params = [start.isoformat(), (end + timedelta(days=1)).isoformat()]
+    sql += " ORDER BY msgtime"
     for row in _query_by_chunks(
         conn,
         "raw.qx_chat",
-        "SELECT * FROM qx_chat WHERE roomid IN ({placeholders}) ORDER BY msgtime",
+        sql,
         room_ids,
+        suffix_params=suffix_params,
     ):
         key = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
         rows_by_key[key] = row
@@ -2088,7 +2956,9 @@ def _query_qx_raw_scope(
 ) -> dict:
     scope = _current_dashboard_scope(conn, start, end, region, aftersaler, category, key_account)
     group_rows = _query_group_rows(conn, scope["group_names"])
-    chat_rows = _filter_chat_rows_by_period(_query_chat_rows(conn, group_rows), start, end)
+    chat_rows = _filter_chat_rows_by_period(
+        _query_chat_rows(conn, group_rows, start, end), start, end
+    )
     return {
         **scope,
         "group_rows": group_rows,
@@ -2147,6 +3017,7 @@ def get_export_csv(
     with database("dashboard.export") as conn:
         scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
         project_codes = scope["project_codes"]
+        mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
 
     lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
     lims_rows = []
@@ -2154,6 +3025,10 @@ def get_export_csv(
         for record in records:
             row = {"_requested_project_code": requested_code}
             row.update(record)
+            normalized = normalize_lims_api_record(record, requested_code, mapping_snapshot)
+            row["LIMS原始售后"] = normalized.get("raw_aftersaler") or ""
+            row["最终售后"] = normalized.get("final_aftersaler") or ""
+            row["售后确定来源"] = normalized.get("aftersaler_source") or "lims_fallback"
             lims_rows.append(row)
 
     output = io.StringIO()
@@ -2237,6 +3112,44 @@ def _cross_rows(items: List[dict]) -> List[dict]:
     ]
 
 
+def _top_customer_export_rows(data: dict) -> Tuple[List[dict], List[dict]]:
+    customer_rows: List[dict] = []
+    group_rows: List[dict] = []
+    for customer in data.get("items") or []:
+        customer_rows.append({
+            "排名": customer.get("rank"),
+            "客户单位": customer.get("customer_unit"),
+            "客户名称": "、".join(customer.get("customer_names") or []),
+            "消息数": customer.get("message_count"),
+            "全部消息占比(%)": customer.get("percentage_of_all"),
+            "群聊数": customer.get("group_count"),
+            "高频问题Top5": "；".join(
+                f"{item.get('word')}({item.get('count')})"
+                for item in customer.get("high_frequency_top5") or []
+            ),
+        })
+        for group in customer.get("groups") or []:
+            summary = group.get("summary") or {}
+            group_rows.append({
+                "排名": customer.get("rank"),
+                "客户单位": customer.get("customer_unit"),
+                "群聊名称": group.get("group_name"),
+                "消息数": group.get("message_count"),
+                "客户内消息占比(%)": group.get("percentage_of_customer"),
+                "群聊概览": summary.get("overview"),
+                "客户诉求": "；".join(summary.get("demands") or []),
+                "高频问题Top5": "；".join(
+                    f"{item.get('word')}({item.get('count')})"
+                    for item in group.get("high_frequency_top5") or []
+                ),
+                "项目号": "、".join(group.get("project_codes") or []),
+                "产品分类": "、".join(group.get("product_categories") or []),
+                "售后员": "、".join(group.get("aftersalers") or []),
+                "概览更新时间": group.get("latest_analysis_time"),
+            })
+    return customer_rows, group_rows
+
+
 def get_export_excel(
     period: str = "month",
     start_date: Optional[str] = None,
@@ -2263,12 +3176,13 @@ def get_export_excel(
     with database("dashboard.export") as conn:
         scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
         project_codes = scope["project_codes"]
+        mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
 
     lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
     lims_rows = []
     for requested_code, records in sorted(lims_records_by_code.items()):
         for record in records:
-            normalized = normalize_lims_api_record(record, requested_code)
+            normalized = normalize_lims_api_record(record, requested_code, mapping_snapshot)
             if normalized.get("category_l2") not in ALLOWED_PRODUCT_L2:
                 continue
             if category and normalized.get("category_l2") != category:
@@ -2277,10 +3191,13 @@ def get_export_excel(
                 continue
             if key_account and normalized.get("key_account") != key_account:
                 continue
-            if aftersaler and normalized.get("raw_aftersaler") != aftersaler:
+            if aftersaler and normalized.get("final_aftersaler") != aftersaler:
                 continue
             row = {"_requested_project_code": requested_code}
             row.update(record)
+            row["LIMS原始售后"] = normalized.get("raw_aftersaler") or ""
+            row["最终售后"] = normalized.get("final_aftersaler") or ""
+            row["售后确定来源"] = normalized.get("aftersaler_source") or "lims_fallback"
             lims_rows.append(row)
 
     workbook = Workbook()
@@ -2319,6 +3236,11 @@ def get_export_excel(
     _write_excel_sheet(workbook, "售后人员分布", overview["business"]["aftersalers"])
     _write_excel_sheet(workbook, "产品分类", overview["business"]["product_categories"])
     _write_excel_sheet(workbook, "重点客户", overview["business"]["key_accounts"])
+    top_customer_rows, top_customer_group_rows = _top_customer_export_rows(
+        overview["business"].get("top_message_customers") or {}
+    )
+    _write_excel_sheet(workbook, "消息Top5客户", top_customer_rows)
+    _write_excel_sheet(workbook, "Top5客户群聊", top_customer_group_rows)
     _write_excel_sheet(workbook, "项目状态关注", overview["project_attention"]["items"])
     _write_excel_sheet(workbook, "交叉分析-销售", _cross_rows(overview["cross_analysis"]["region_sales"]))
     _write_excel_sheet(workbook, "交叉分析-售后", _cross_rows(overview["cross_analysis"]["region_after"]))
