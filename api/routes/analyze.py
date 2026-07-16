@@ -20,7 +20,6 @@ from models.response import (
     BatchResponseData,
     RoomAnalysisResult,
     UnansweredResult,
-    UnansweredDetail,
     MemberInfo,
 )
 from services import (
@@ -42,12 +41,25 @@ highfreq_analyzer = HighFreqAnalyzer()
 unanswered_analyzer = UnansweredAnalyzer()
 
 
+def _attach_room_members(messages: List[dict], members) -> List[dict]:
+    """Make room-level member metadata available to sender-role normalization."""
+    if not members:
+        return messages
+    for message in messages:
+        if not message.get("members"):
+            message["members"] = members
+    return messages
+
+
 @router.post("/chat/analyze", response_model=AnalyzeResponse)
 async def analyze_chat(request: AnalyzeRequest):
     logger.info(f"收到分析请求: room_id={request.room_id}, messages={len(request.messages)}")
     
     try:
-        messages_dict = [msg.model_dump(by_alias=True) for msg in request.messages]
+        messages_dict = _attach_room_members(
+            [msg.model_dump(by_alias=True) for msg in request.messages],
+            request.members,
+        )
         normalized = await asyncio.to_thread(preprocessor.process, messages_dict)
         
         members_list = []
@@ -182,12 +194,7 @@ async def analyze_chat(request: AnalyzeRequest):
             if AnalysisType.UNANSWERED in analysis_types:
                 try:
                     result = await asyncio.to_thread(unanswered_analyzer.analyze, normalized)
-                    return UnansweredResult(
-                        is_missed=result["is_missed"],
-                        risk_level=result["risk_level"],
-                        missed_messages=[UnansweredDetail(**m) for m in result["missed_messages"]],
-                        suggested_action=result["suggested_action"],
-                    )
+                    return UnansweredResult(**result)
                 except Exception as e:
                     logger.error(f"漏回分析失败: {e}")
                     return None
@@ -254,7 +261,10 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest, raw_request: Request)
     async def analyze_single_room(room: RoomData) -> RoomAnalysisResult:
         async with semaphore:
             try:
-                messages_dict = [msg.model_dump(by_alias=True) for msg in room.messages]
+                messages_dict = _attach_room_members(
+                    [msg.model_dump(by_alias=True) for msg in room.messages],
+                    room.members,
+                )
                 normalized = await asyncio.to_thread(preprocessor.process, messages_dict)
                 
                 if not normalized:
@@ -320,12 +330,7 @@ async def batch_analyze_chat(request: BatchAnalyzeRequest, raw_request: Request)
                     if AnalysisType.UNANSWERED in analysis_types:
                         try:
                             result = await asyncio.to_thread(unanswered_analyzer.analyze, normalized)
-                            return UnansweredResult(
-                                is_missed=result["is_missed"],
-                                risk_level=result["risk_level"],
-                                missed_messages=[UnansweredDetail(**m) for m in result["missed_messages"]],
-                                suggested_action=result["suggested_action"],
-                            )
+                            return UnansweredResult(**result)
                         except Exception as e:
                             logger.error(f"群 {room.room_id} 漏回分析失败: {e}")
                             return None

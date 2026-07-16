@@ -196,6 +196,7 @@ server {
 | LLM_MODEL_SENTIMENT | 情感分析模型 | gpt-4o-mini |
 | LLM_MODEL_SUMMARY | 摘要生成模型 | gpt-4o |
 | LIMS_API_BASE | LIMS API 地址 | - |
+| DASHBOARD_ADMIN_KEY | 售后对应表维护口令；为空时维护接口禁用 | - |
 | QXCHAT_API_BASE | 企微群聊 API 地址 | - |
 | SERVICE_HOST | 服务监听地址 | 0.0.0.0 |
 | SERVICE_PORT | 服务监听端口 | 8000 |
