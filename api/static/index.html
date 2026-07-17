@@ -1215,11 +1215,62 @@
     }
 
     .board-section {
-      position: relative
+      position: relative;
+      user-select: text
     }
 
-    .board-section[draggable=true] .section-head {
-      cursor: grab
+    .section-drag-handle {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      margin-left: 8px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--surface-2);
+      color: var(--muted);
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+      transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease
+    }
+
+    .section-drag-handle:hover {
+      border-color: var(--brand2);
+      background: var(--hover-bg);
+      color: var(--brand)
+    }
+
+    .section-drag-handle:active {
+      cursor: grabbing;
+      transform: scale(.96)
+    }
+
+    .section-drag-handle:focus-visible {
+      outline: 3px solid var(--brand2);
+      outline-offset: 2px
+    }
+
+    .section-drag-handle-icon {
+      font-size: 19px;
+      line-height: 1;
+      letter-spacing: -2px;
+      transform: translateX(-1px)
+    }
+
+    .sr-only {
+      position: absolute !important;
+      width: 1px !important;
+      height: 1px !important;
+      padding: 0 !important;
+      margin: -1px !important;
+      overflow: hidden !important;
+      clip: rect(0, 0, 0, 0) !important;
+      white-space: nowrap !important;
+      border: 0 !important
     }
 
     .board-section.dragging {
@@ -1230,6 +1281,21 @@
       outline: 2px dashed rgba(23, 107, 91, .35);
       outline-offset: 4px;
       border-radius: var(--radius)
+    }
+
+    @media(max-width:760px) {
+      .board-section>.section-head {
+        padding-right: 46px
+      }
+
+      .section-drag-handle {
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 40px;
+        height: 40px;
+        margin: 0
+      }
     }
 
     .info-tip {
@@ -1731,7 +1797,7 @@
     }
 
     .top-group-table {
-      min-width: 720px;
+      min-width: 960px;
       font-size: 11px
     }
 
@@ -1756,76 +1822,16 @@
       font-weight: 700
     }
 
-    .top-group-toggle {
-      position: relative;
-      width: 100%;
-      min-height: 44px;
-      padding: 6px 24px 6px 0;
-      border: 0;
-      background: transparent;
+    .top-group-name {
+      display: block;
       color: var(--text);
-      text-align: left;
-      font: inherit;
       font-weight: 600;
-      cursor: pointer;
       overflow-wrap: anywhere
     }
 
-    .top-group-toggle::after {
-      content: '';
-      position: absolute;
-      top: 50%;
-      right: 7px;
-      width: 7px;
-      height: 7px;
-      border-right: 2px solid var(--brand);
-      border-bottom: 2px solid var(--brand);
-      transform: translateY(-65%) rotate(45deg);
-      transition: transform .18s ease
-    }
-
-    .top-group-toggle[aria-expanded="true"]::after {
-      transform: translateY(-25%) rotate(225deg)
-    }
-
-    .top-group-toggle:hover {
-      color: var(--brand)
-    }
-
-    .top-group-toggle:focus-visible,
     .tab:focus-visible {
       outline: 3px solid rgba(35, 130, 112, .36);
       outline-offset: 2px
-    }
-
-    .top-group-detail-row[hidden] {
-      display: none
-    }
-
-    .top-group-detail-row td {
-      padding: 0;
-      background: var(--surface-2)
-    }
-
-    .top-group-detail {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px 18px;
-      padding: 12px 16px 14px 70px;
-      border-bottom: 1px solid var(--line)
-    }
-
-    .top-group-detail div {
-      min-width: 0;
-      overflow-wrap: anywhere
-    }
-
-    .top-group-detail strong {
-      display: block;
-      margin-bottom: 2px;
-      color: var(--muted);
-      font-size: 10px;
-      font-weight: 500
     }
 
     .top-group-table .muted {
@@ -1889,23 +1895,249 @@
         color: var(--muted)
       }
 
+      .top-group-row .aftersalers,
+      .top-group-row .categories,
       .top-group-row .topics {
-        grid-column: 2 / 4
+        grid-column: 1 / 4;
+        padding-left: 12px
       }
 
-      .top-group-detail-row {
-        display: block
+      .top-group-row .aftersalers::before,
+      .top-group-row .categories::before,
+      .top-group-row .topics::before {
+        color: var(--muted);
+        font-size: 10px
       }
 
-      .top-group-detail-row td {
-        display: block
+      .top-group-row .aftersalers::before {
+        content: '售后人员：'
       }
 
-      .top-group-detail {
-        grid-template-columns: 1fr;
-        padding: 10px 12px;
+      .top-group-row .categories::before {
+        content: '产品分类：'
+      }
+
+      .top-group-row .topics::before {
+        content: '高频问题：'
+      }
+    }
+
+    .project-year-summary {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2)
+    }
+
+    .project-year-stat {
+      min-width: 0;
+      padding: 9px 11px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface)
+    }
+
+    .project-year-stat span,
+    .project-year-stat small {
+      display: block;
+      color: var(--muted);
+      font-size: 10px
+    }
+
+    .project-year-stat strong {
+      display: block;
+      margin: 2px 0;
+      color: var(--text);
+      font-size: 20px;
+      font-variant-numeric: tabular-nums
+    }
+
+    .project-year-body {
+      display: grid;
+      grid-template-columns: minmax(300px, .8fr) minmax(0, 1.7fr);
+      min-height: 340px
+    }
+
+    .project-year-chart {
+      height: 340px;
+      border-right: 1px solid var(--line)
+    }
+
+    .project-year-detail {
+      min-width: 0
+    }
+
+    .project-year-tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 58px;
+      padding: 8px 12px;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line)
+    }
+
+    .project-year-tab {
+      min-width: 76px;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 5px 10px;
+      background: var(--surface);
+      color: var(--muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background .18s, border-color .18s, color .18s
+    }
+
+    .project-year-tab strong,
+    .project-year-tab small {
+      display: block
+    }
+
+    .project-year-tab strong {
+      color: var(--text);
+      font-size: 12px
+    }
+
+    .project-year-tab small {
+      font-size: 10px
+    }
+
+    .project-year-tab:hover,
+    .project-year-tab[aria-selected="true"] {
+      border-color: var(--brand2);
+      background: var(--green-soft);
+      color: var(--brand)
+    }
+
+    .project-year-tab[aria-selected="true"] strong {
+      color: var(--brand)
+    }
+
+    .project-year-tab:focus-visible {
+      outline: 3px solid rgba(35, 130, 112, .36);
+      outline-offset: 2px
+    }
+
+    .project-year-table-wrap {
+      max-height: 282px
+    }
+
+    .project-year-table {
+      min-width: 930px;
+      font-size: 11px
+    }
+
+    .project-year-table td {
+      vertical-align: top
+    }
+
+    .project-year-project strong,
+    .project-year-project small {
+      display: block
+    }
+
+    .project-year-project small,
+    .project-year-source {
+      color: var(--muted);
+      font-size: 10px
+    }
+
+    .project-year-empty {
+      padding: 28px 14px;
+      color: var(--muted);
+      text-align: center
+    }
+
+    @media(max-width:960px) {
+      .project-year-summary {
+        grid-template-columns: repeat(3, minmax(0, 1fr))
+      }
+
+      .project-year-body {
+        grid-template-columns: 1fr
+      }
+
+      .project-year-chart {
+        height: 280px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line)
+      }
+    }
+
+    @media(max-width:760px) {
+      .project-year-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        padding: 10px
+      }
+
+      .project-year-stat:last-child {
+        grid-column: span 2
+      }
+
+      .project-year-chart {
+        height: 250px
+      }
+
+      .project-year-tabs {
+        min-height: 60px;
+        padding: 8px 10px
+      }
+
+      .project-year-tab {
+        min-height: 44px
+      }
+
+      .project-year-table-wrap {
+        max-height: 430px;
+        padding: 8px
+      }
+
+      .project-year-table {
+        display: block;
+        min-width: 0
+      }
+
+      .project-year-table thead {
+        display: none
+      }
+
+      .project-year-table tbody {
+        display: grid;
+        gap: 8px
+      }
+
+      .project-year-row {
+        display: block;
         border: 1px solid var(--line);
-        border-radius: 6px
+        border-radius: 6px;
+        background: var(--surface);
+        overflow: hidden
+      }
+
+      .project-year-row td {
+        display: grid;
+        grid-template-columns: 82px minmax(0, 1fr);
+        gap: 8px;
+        padding: 7px 10px;
+        border-bottom: 1px solid var(--line)
+      }
+
+      .project-year-row td:last-child {
+        border-bottom: 0
+      }
+
+      .project-year-row td::before {
+        content: attr(data-label);
+        color: var(--muted);
+        font-size: 10px
+      }
+
+      .project-year-empty {
+        display: block
       }
     }
 
@@ -2015,6 +2247,59 @@
       border-radius: 6px;
       padding: 0 10px;
       background: var(--surface)
+    }
+
+    .mapping-password-field {
+      position: relative;
+      display: block;
+      margin-bottom: 10px
+    }
+
+    .mapping-unlock-card .mapping-password-field input {
+      margin-bottom: 0;
+      padding-right: 52px
+    }
+
+    .mapping-password-toggle {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 44px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border: 0;
+      border-left: 1px solid var(--line);
+      border-radius: 0 6px 6px 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer
+    }
+
+    .mapping-password-toggle:hover {
+      color: var(--brand);
+      background: var(--hover-bg)
+    }
+
+    .mapping-password-toggle:focus-visible {
+      z-index: 1;
+      outline: 3px solid rgba(35, 130, 112, .3);
+      outline-offset: 1px
+    }
+
+    .mapping-password-toggle svg {
+      width: 19px;
+      height: 19px;
+      pointer-events: none
+    }
+
+    .mapping-password-toggle .eye-off,
+    .mapping-password-toggle[aria-pressed="true"] .eye-open {
+      display: none
+    }
+
+    .mapping-password-toggle[aria-pressed="true"] .eye-off {
+      display: block
     }
 
     .mapping-manager {
@@ -2324,6 +2609,36 @@
             </table>
           </div>
         </article>
+        <article class="panel span-12" id="projectYearPanel">
+          <div class="panel-head">
+            <div class="panel-title">
+              <h3>服务项目年份分布</h3>
+              <small id="projectYearNote">按唯一项目号统计项目所属年份</small>
+            </div>
+          </div>
+          <div class="project-year-summary" id="projectYearSummary"></div>
+          <div class="project-year-body">
+            <div id="projectYearChart" class="project-year-chart" role="img" aria-label="服务项目年份分布图"></div>
+            <div class="project-year-detail">
+              <div class="project-year-tabs" id="projectYearTabs" role="tablist" aria-label="选择项目年份"></div>
+              <div class="table-wrap project-year-table-wrap" id="projectYearTablePanel" role="tabpanel">
+                <table class="project-year-table">
+                  <thead>
+                    <tr>
+                      <th>项目号</th>
+                      <th>项目 / 产品</th>
+                      <th>客户</th>
+                      <th>销售区域</th>
+                      <th>售后人员</th>
+                      <th>关联群聊</th>
+                    </tr>
+                  </thead>
+                  <tbody id="projectYearRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </article>
       </section>
       <div class="section-head">
         <div class="section-title">
@@ -2453,7 +2768,21 @@
           <h3>管理员验证</h3>
           <p>对应表包含真实人员信息。口令只保存在当前浏览器会话中。</p>
           <label for="mappingAdminKey">管理员口令</label>
-          <input id="mappingAdminKey" type="password" autocomplete="current-password" required>
+          <span class="mapping-password-field">
+            <input id="mappingAdminKey" type="password" autocomplete="current-password" required>
+            <button class="mapping-password-toggle" id="mappingAdminKeyToggle" type="button" aria-label="显示管理员口令" aria-controls="mappingAdminKey" aria-pressed="false" title="显示管理员口令">
+              <svg class="eye-open" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2.1 12s3.6-7 9.9-7 9.9 7 9.9 7-3.6 7-9.9 7-9.9-7-9.9-7Z"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+              <svg class="eye-off" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m3 3 18 18"></path>
+                <path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"></path>
+                <path d="M9.9 4.2A10.7 10.7 0 0 1 12 4c6.3 0 9.9 8 9.9 8a18.4 18.4 0 0 1-2.5 3.8"></path>
+                <path d="M6.2 6.2C3.5 8 2.1 12 2.1 12s3.6 8 9.9 8a9.8 9.8 0 0 0 4.1-.9"></path>
+              </svg>
+            </button>
+          </span>
           <button class="btn primary" type="submit">验证并进入</button>
           <div class="mapping-error" id="mappingUnlockError" role="alert"></div>
         </form>
@@ -2502,7 +2831,7 @@
   <script>
     (function () {
       'use strict';
-      var state = { data: null, charts: [], trendView: 'daily', commData: null, period: 'month', start: '', end: '', region: '', aftersaler: '', category: '', keyAccount: '', metric: '', keyword: '', evidencePage: 1, evidencePages: 1, cross: 'region_sales', attentionStatus: 'all', theme: 'day', afterMetrics: ['project_count', 'group_count', 'message_count'], mappingVersions: [], mappingRules: [], mappingAdminKey: '' };
+      var state = { data: null, charts: [], trendView: 'daily', commData: null, period: 'month', start: '', end: '', region: '', aftersaler: '', category: '', keyAccount: '', metric: '', keyword: '', evidencePage: 1, evidencePages: 1, cross: 'region_sales', attentionStatus: 'all', projectYear: '', theme: 'day', afterMetrics: ['project_count', 'group_count', 'message_count'], mappingVersions: [], mappingRules: [], mappingAdminKey: '' };
       var colors = {};
       function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim() }
       function refreshThemeColors() { colors = { green: cssVar('--chart-green') || '#176b5b', green2: cssVar('--chart-green2') || '#48a58f', blue: cssVar('--chart-blue') || '#2c67a4', cyan: cssVar('--chart-cyan') || '#168394', amber: cssVar('--chart-amber') || '#b86b12', red: cssVar('--chart-red') || '#b6382f', gray: cssVar('--chart-gray') || '#c9d1cf', blueSoft: cssVar('--chart-blue-soft') || 'rgba(44,103,164,.10)', greenSoft: cssVar('--chart-green-soft') || 'rgba(23,107,91,.55)', tooltip: cssVar('--tooltip-bg') || '#17201f' } }
@@ -2513,7 +2842,7 @@
       function query(extra) { var p = new URLSearchParams({ period: state.period }); if (state.period === 'custom') { p.set('start_date', state.start); p.set('end_date', state.end) } if (state.region) p.set('region', state.region); if (state.aftersaler) p.set('aftersaler', state.aftersaler); if (state.category) p.set('category', state.category); if (state.keyAccount) p.set('key_account', state.keyAccount); Object.keys(extra || {}).forEach(function (k) { if (extra[k] !== '' && extra[k] != null) p.set(k, extra[k]) }); return p.toString() }
       function pdfFileName(title) { var range = state.data && state.data.meta ? (state.data.meta.start_date + '_' + state.data.meta.end_date) : new Date().toISOString().slice(0, 10); return String(title || '看板模块').replace(/[\\/:*?"<>|\s]+/g, '_') + '_' + range + '.pdf' }
       async function exportModulePdf(target, title, button) { if (!target || !window.html2canvas || !window.jspdf || !window.jspdf.jsPDF) { throw new Error('PDF 导出组件未加载，请刷新页面后重试。') } var textNode = button.querySelector('.pdf-export-text'), iconNode = button.querySelector('.pdf-export-icon'), oldText = textNode ? textNode.textContent : '', oldAria = button.getAttribute('aria-label'), expanded = [], scrollNodes = Array.prototype.slice.call(target.querySelectorAll('.table-wrap,.chart-scroll,.period-table-wrap')); button.disabled = true; if (textNode) { textNode.textContent = '生成中…' } else { button.textContent = '生成中…' } if (iconNode) { iconNode.style.display = 'none' } try { var qualityBody = target.querySelector('#qualityBody'); if (qualityBody && getComputedStyle(qualityBody).display === 'none') { expanded.push([qualityBody, qualityBody.getAttribute('style')]); qualityBody.style.display = 'block' } scrollNodes.forEach(function (node) { expanded.push([node, node.getAttribute('style')]); node.style.maxHeight = 'none'; node.style.overflow = 'visible' }); expanded.push([target, target.getAttribute('style')]); target.style.overflow = 'visible'; await new Promise(function (resolve) { setTimeout(resolve, 100) }); var rect = target.getBoundingClientRect(), scale = Math.max(1, Math.min(2, 10000 / Math.max(rect.width, rect.height))); var canvas = await window.html2canvas(target, { scale: scale, backgroundColor: cssVar('--surface') || '#ffffff', useCORS: true, logging: false, scrollX: -window.scrollX, scrollY: -window.scrollY, ignoreElements: function (node) { return node.classList && node.classList.contains('pdf-export-btn') } }); var jsPDF = window.jspdf.jsPDF, orientation = canvas.width > canvas.height ? 'landscape' : 'portrait', pdf = new jsPDF({ orientation: orientation, unit: 'mm', format: 'a4', compress: true }), pageWidth = pdf.internal.pageSize.getWidth(), pageHeight = pdf.internal.pageSize.getHeight(), margin = 8, imageWidth = pageWidth - margin * 2, imageHeight = canvas.height * imageWidth / canvas.width, usableHeight = pageHeight - margin * 2, data = canvas.toDataURL('image/jpeg', .92), offset = 0; pdf.addImage(data, 'JPEG', margin, margin, imageWidth, imageHeight, undefined, 'FAST'); while (imageHeight - offset > usableHeight) { offset += usableHeight; if (imageHeight - offset <= 0) break; pdf.addPage(); pdf.addImage(data, 'JPEG', margin, margin - offset, imageWidth, imageHeight, undefined, 'FAST') } var blob = pdf.output('blob'), url = URL.createObjectURL(blob), link = document.createElement('a'); link.href = url; link.download = pdfFileName(title); link.style.display = 'none'; document.body.appendChild(link); link.click(); link.remove(); setTimeout(function () { URL.revokeObjectURL(url) }, 30000) } finally { for (var i = expanded.length - 1; i >= 0; i--) { var node = expanded[i][0], style = expanded[i][1]; if (style == null) node.removeAttribute('style'); else node.setAttribute('style', style) } button.disabled = false; if (textNode) { textNode.textContent = oldText; button.setAttribute('aria-label', oldAria || '') } else { button.textContent = oldText } if (iconNode) { iconNode.style.display = '' } state.charts.forEach(function (c) { c.resize() }) } }
-      function installPdfExportButtons() { function add(target, head, title) { if (!target || !head || head.querySelector('.pdf-export-btn')) return; var button = document.createElement('button'); button.type = 'button'; button.className = 'pdf-export-btn'; var icon = document.createElement('span'); icon.className = 'pdf-export-icon'; icon.setAttribute('aria-hidden', 'true'); icon.textContent = '📄'; var text = document.createElement('span'); text.className = 'pdf-export-text'; text.textContent = 'PDF'; button.appendChild(icon); button.appendChild(text); var fullLabel = '导出“' + title + '”为 PDF'; button.setAttribute('aria-label', fullLabel); button.title = fullLabel; button.setAttribute('data-html2canvas-ignore', 'true'); button.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); exportModulePdf(target, title, button).catch(function (error) { el('notice').className = 'notice show'; el('notice').textContent = 'PDF 导出失败：' + error.message }) }); head.appendChild(button) } document.querySelectorAll('.panel').forEach(function (panel) { var head = panel.querySelector('.panel-head'), title = head && head.querySelector('h3') ? head.querySelector('h3').textContent.trim() : '看板模块'; add(panel, head, title) }); var kpis = el('kpis'), summaryHead = kpis && kpis.parentElement ? kpis.parentElement.querySelector('.section-head') : null; add(kpis, summaryHead, '经营摘要') }
+      function installPdfExportButtons() { function add(target, head, title) { if (!target || !head || head.querySelector('.pdf-export-btn')) return; var button = document.createElement('button'); button.type = 'button'; button.className = 'pdf-export-btn'; var icon = document.createElement('span'); icon.className = 'pdf-export-icon'; icon.setAttribute('aria-hidden', 'true'); icon.textContent = '📄'; var text = document.createElement('span'); text.className = 'pdf-export-text'; text.textContent = 'PDF'; button.appendChild(icon); button.appendChild(text); var fullLabel = '导出“' + title + '”为 PDF'; button.setAttribute('aria-label', fullLabel); button.title = fullLabel; button.setAttribute('data-html2canvas-ignore', 'true'); button.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); exportModulePdf(target, title, button).catch(function (error) { el('notice').className = 'notice show'; el('notice').textContent = 'PDF 导出失败：' + error.message }) }); var dragHandle = head.querySelector('.section-drag-handle'); if (dragHandle) head.insertBefore(button, dragHandle); else head.appendChild(button) } document.querySelectorAll('.panel').forEach(function (panel) { var head = panel.querySelector('.panel-head'), title = head && head.querySelector('h3') ? head.querySelector('h3').textContent.trim() : '看板模块'; add(panel, head, title) }); var kpis = el('kpis'), summaryHead = kpis && kpis.parentElement ? kpis.parentElement.querySelector('.section-head') : null; add(kpis, summaryHead, '经营摘要') }
       async function api(path, extra) { var c = new AbortController(), id = 'web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7), timer = setTimeout(function () { c.abort() }, 45000); try { var r = await fetch(path + '?' + query(extra), { signal: c.signal, headers: { 'X-Request-ID': id, 'Accept': 'application/json' } }); id = r.headers.get('X-Request-ID') || id; var body = await r.text(), j; if (!body.trim()) throw new Error('服务器未返回完整数据（HTTP ' + r.status + '），请稍后重试。'); try { j = JSON.parse(body) } catch (parseError) { throw new Error('服务器返回了无法解析的数据（HTTP ' + r.status + '），请联系管理员检查网关和应用日志。') } if (!r.ok || j.code !== 0) throw new Error(j.detail || j.message || ('HTTP ' + r.status)); return j.data } catch (e) { if (e.name === 'AbortError') e.userMessage = '查询超过 45 秒，服务器仍未完成处理，请稍后重试。'; e.requestId = id; throw e } finally { clearTimeout(timer) } }
       async function mappingApi(path, options) {
         options = options || {}; var params = new URLSearchParams(), values = options.params || {};
@@ -2527,8 +2856,9 @@
       }
       function mappingRangeParams(extra) { var p = { period: state.period, region: state.region, aftersaler: state.aftersaler, category: state.category, key_account: state.keyAccount }; if (state.period === 'custom') { p.start_date = state.start; p.end_date = state.end } Object.keys(extra || {}).forEach(function (key) { p[key] = extra[key] }); return p }
       function setMappingError(message, unlock) { el(unlock ? 'mappingUnlockError' : 'mappingError').textContent = message || '' }
-      function openMappingManager() { el('mappingMask').classList.add('open'); document.body.classList.add('mapping-open'); state.mappingAdminKey = (function () { try { return sessionStorage.getItem('dashboard-admin-key') || '' } catch (e) { return '' } })(); if (state.mappingAdminKey) { unlockMappingManager() } else { el('mappingUnlock').hidden = false; el('mappingManager').hidden = true; setTimeout(function () { el('mappingAdminKey').focus() }, 30) } }
-      function closeMappingManager() { el('mappingMask').classList.remove('open'); document.body.classList.remove('mapping-open'); closeMappingEditor(); setMappingError(''); setMappingError('', true) }
+      function setAdminKeyVisibility(visible) { var input = el('mappingAdminKey'), toggle = el('mappingAdminKeyToggle'), label = visible ? '隐藏管理员口令' : '显示管理员口令'; input.type = visible ? 'text' : 'password'; toggle.setAttribute('aria-pressed', visible ? 'true' : 'false'); toggle.setAttribute('aria-label', label); toggle.title = label }
+      function openMappingManager() { setAdminKeyVisibility(false); el('mappingMask').classList.add('open'); document.body.classList.add('mapping-open'); state.mappingAdminKey = (function () { try { return sessionStorage.getItem('dashboard-admin-key') || '' } catch (e) { return '' } })(); if (state.mappingAdminKey) { unlockMappingManager() } else { el('mappingUnlock').hidden = false; el('mappingManager').hidden = true; setTimeout(function () { el('mappingAdminKey').focus() }, 30) } }
+      function closeMappingManager() { setAdminKeyVisibility(false); el('mappingMask').classList.remove('open'); document.body.classList.remove('mapping-open'); closeMappingEditor(); setMappingError(''); setMappingError('', true) }
       async function unlockMappingManager() { setMappingError('', true); try { await loadMappingVersions(); el('mappingUnlock').hidden = true; el('mappingManager').hidden = false; el('mappingSearch').focus(); return true } catch (error) { el('mappingUnlock').hidden = false; el('mappingManager').hidden = true; setMappingError(error.message, true); return false } }
       async function loadMappingVersions(preferredId) {
         state.mappingVersions = await mappingApi('/api/v1/dashboard/aftersaler-mapping/versions');
@@ -2571,17 +2901,45 @@
         var w = (d.communication.high_frequency || []).slice(0, 15), wo = base(); wo.grid.left = 150; wo.xAxis = { type: 'value' }; wo.yAxis = { type: 'category', inverse: true, data: w.map(function (x) { return x.word }) }; wo.series = [{ type: 'bar', data: w.map(function (x) { return x.count }), itemStyle: { color: colors.blue }, label: { show: true, position: 'right' } }]; chart('wordChart', wo, function (p) { openEvidence('highfreq', p.name, '“' + p.name + '”涉及群聊') })
       }
       function topGroupPills(values) { return (values || []).map(function (item) { return '<span class="pill">' + esc(item.word) + ' ' + fmt(item.count) + '</span>' }).join('') || '<span class="muted">暂无高频问题</span>' }
+      function topGroupTags(values, fallback) { return (values || []).map(function (value) { return '<span class="pill">' + esc(value) + '</span>' }).join('') || '<span class="muted">' + esc(fallback) + '</span>' }
       function renderTopMessageGroups(d) {
         var data = d.communication.top_message_groups || { limit: 5, actual_count: 0, total_groups: 0, total_messages: 0, top5_messages: 0, coverage_percentage: 0, items: [] }, items = data.items || [], trendNode = el('trendChart');
         disposeChart('periodChartContainer'); disposeChart('trendChart'); trendNode.classList.remove('period-mode'); trendNode.classList.add('top-group-mode'); trendNode.setAttribute('aria-label', '消息量 Top 5 群聊');
         if (!items.length) { trendNode.innerHTML = '<div class="top-group-empty"><strong>暂无群聊消息数据</strong><br>请调整日期或筛选条件后重试。</div>'; return }
         var summary = '<div class="top-group-summary"><div class="top-group-stat"><span>Top 5 消息数</span><strong>' + fmt(data.top5_messages) + ' / ' + fmt(data.total_messages) + '</strong><small>当前筛选范围全部工作消息</small></div><div class="top-group-stat"><span>Top 5 消息占比</span><strong>' + pct(data.coverage_percentage) + '</strong><small>按群聊周期消息数降序</small></div><div class="top-group-stat"><span>参与排名群聊</span><strong>' + fmt(data.actual_count) + ' / ' + fmt(data.total_groups) + '</strong><small>' + (data.total_groups < (data.limit || 5) ? '当前范围不足 5 个群聊' : '展示消息量最高的 5 个群聊') + '</small></div></div>';
         var rows = items.map(function (group, index) {
-          var detailId = 'topGroupDetail' + index, triggerId = 'topGroupTrigger' + index, expanded = index === 0;
-          var projects = (group.project_codes || []).join('、') || '未关联项目号', customers = (group.customer_units || []).join('、') || '未关联客户单位', names = (group.customer_names || []).join('、') || '未关联客户名称', products = (group.product_categories || []).join('、') || '未关联产品分类', aftersalers = (group.aftersalers || []).join('、') || '未关联售后人员';
-          return '<tr class="top-group-row"><td class="rank"><span class="top-group-rank">' + fmt(group.rank || index + 1) + '</span></td><td class="group-name"><button type="button" class="top-group-toggle" id="' + triggerId + '" data-top-group-toggle aria-expanded="' + (expanded ? 'true' : 'false') + '" aria-controls="' + detailId + '">' + esc(group.group_name) + '</button></td><td class="num messages">' + fmt(group.message_count) + '</td><td class="num percentage">' + pct(group.percentage_of_all) + '</td><td class="num days">' + fmt(group.active_days) + '</td><td class="topics">' + topGroupPills(group.high_frequency_top5) + '</td></tr><tr class="top-group-detail-row" id="' + detailId + '" aria-labelledby="' + triggerId + '" ' + (expanded ? '' : 'hidden') + '><td colspan="6"><div class="top-group-detail"><div><strong>项目号</strong>' + esc(projects) + '</div><div><strong>客户单位</strong>' + esc(customers) + '</div><div><strong>客户名称</strong>' + esc(names) + '</div><div><strong>产品分类</strong>' + esc(products) + '</div><div><strong>售后人员</strong>' + esc(aftersalers) + '</div><div><strong>高频问题</strong>' + topGroupPills(group.high_frequency_top5) + '</div></div></td></tr>';
+          return '<tr class="top-group-row"><td class="rank"><span class="top-group-rank">' + fmt(group.rank || index + 1) + '</span></td><td class="group-name"><span class="top-group-name">' + esc(group.group_name) + '</span></td><td class="num messages">' + fmt(group.message_count) + '</td><td class="num percentage">' + pct(group.percentage_of_all) + '</td><td class="num days">' + fmt(group.active_days) + '</td><td class="aftersalers">' + topGroupTags(group.aftersalers, '未关联售后人员') + '</td><td class="categories">' + topGroupTags(group.product_categories, '未关联产品分类') + '</td><td class="topics">' + topGroupPills(group.high_frequency_top5) + '</td></tr>';
         }).join('');
-        trendNode.innerHTML = summary + '<div class="top-group-table-wrap"><table class="top-group-table"><thead><tr><th class="rank">排名</th><th>群聊名称</th><th class="num">消息数</th><th class="num">占全部消息</th><th class="num">活跃天数</th><th>高频问题</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+        trendNode.innerHTML = summary + '<div class="top-group-table-wrap"><table class="top-group-table"><thead><tr><th class="rank">排名</th><th>群聊名称</th><th class="num">消息数</th><th class="num">占全部消息</th><th class="num">活跃天数</th><th>售后人员</th><th>产品分类</th><th>高频问题</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+      }
+      function projectYearKey(item) { return item && item.year != null ? String(item.year) : 'unknown' }
+      function projectYearSourceLabel(source) { return source === 'project_code' ? '项目号年份' : (source === 'lims_start_time' ? 'LIMS开始时间' : '未识别') }
+      function renderProjectYearRows(data) {
+        var items = data.items || [], selected = items.find(function (item) { return projectYearKey(item) === state.projectYear });
+        if (!selected) { selected = items.find(function (item) { return Number(item.year) === Number(data.current_year) }) || items[0] || null; state.projectYear = selected ? projectYearKey(selected) : '' }
+        el('projectYearTabs').innerHTML = items.map(function (item, index) { var key = projectYearKey(item), active = selected && key === projectYearKey(selected), id = 'projectYearTab' + index; return '<button type="button" class="project-year-tab" id="' + id + '" role="tab" data-project-year="' + esc(key) + '" aria-selected="' + (active ? 'true' : 'false') + '" aria-controls="projectYearTablePanel" tabindex="' + (active ? '0' : '-1') + '"><strong>' + esc(item.label) + '</strong><small>' + fmt(item.project_count) + ' 个项目 · ' + pct(item.percentage) + '</small></button>' }).join('');
+        var panel = el('projectYearTablePanel'), selectedIndex = selected ? items.indexOf(selected) : -1; if (selectedIndex >= 0) panel.setAttribute('aria-labelledby', 'projectYearTab' + selectedIndex); else panel.removeAttribute('aria-labelledby');
+        var projects = selected ? (selected.projects || []) : [];
+        el('projectYearRows').innerHTML = projects.length ? projects.map(function (project) {
+          var projectNames = (project.project_names || []).join('、') || '未返回项目或产品名称', categories = (project.product_categories || []).join('、') || '未返回产品分类';
+          var workUnits = (project.work_units || []).join('、') || '未返回客户单位', customerNames = (project.customer_names || []).join('、') || '未返回客户名称';
+          var groups = (project.group_names || []), groupText = groups.slice(0, 3).join('、') || '未关联群聊'; if (groups.length > 3) groupText += ' 等 ' + fmt(groups.length) + ' 个群';
+          var source = projectYearSourceLabel(project.year_source), start = project.start_time ? ' · ' + esc(project.start_time) : '';
+          return '<tr class="project-year-row"><td data-label="项目号"><div class="project-year-project"><strong>' + esc(project.project_code || '-') + '</strong><small class="project-year-source">' + esc(source) + start + '</small></div></td><td data-label="项目 / 产品"><div class="project-year-project"><strong>' + esc(projectNames) + '</strong><small>' + esc(categories) + '</small></div></td><td data-label="客户"><div class="project-year-project"><strong>' + esc(workUnits) + '</strong><small>' + esc(customerNames) + '</small></div></td><td data-label="销售区域">' + topGroupTags(project.regions, '未关联区域') + '</td><td data-label="售后人员">' + topGroupTags(project.aftersalers, '未关联售后人员') + '</td><td data-label="关联群聊" title="' + esc(groups.join('、')) + '"><div class="project-year-project"><strong>' + esc(groupText) + '</strong><small>' + fmt(project.group_count || groups.length) + ' 个群聊</small></div></td></tr>';
+        }).join('') : '<tr><td class="project-year-empty" colspan="6">当前筛选范围暂无可展示的项目年份明细</td></tr>';
+      }
+      function renderProjectYearDistribution(d) {
+        var data = d.business.project_year_distribution || { current_year: new Date().getFullYear(), total_projects: 0, recognized_projects: 0, unknown_projects: 0, coverage_percentage: 0, current_year_projects: 0, previous_year_projects: 0, older_projects: 0, source_priority: ['project_code', 'lims_start_time'], items: [] };
+        var previousYear = Number(data.current_year || new Date().getFullYear()) - 1;
+        var stats = [['项目总数', data.total_projects, '当前筛选范围唯一项目号'], ['今年（' + data.current_year + '）', data.current_year_projects, '自然当前年'], ['去年（' + previousYear + '）', data.previous_year_projects, '自然上一年'], ['历史项目', data.older_projects, '早于 ' + previousYear + ' 年'], ['年份识别覆盖率', pct(data.coverage_percentage), '未识别 ' + fmt(data.unknown_projects) + ' 个']];
+        el('projectYearSummary').innerHTML = stats.map(function (item) { return '<div class="project-year-stat"><span>' + esc(item[0]) + '</span><strong>' + (typeof item[1] === 'number' ? fmt(item[1]) : esc(item[1])) + '</strong><small>' + esc(item[2]) + '</small></div>' }).join('');
+        el('projectYearNote').textContent = '项目号年份优先，异常时回退 LIMS startTime；当前识别 ' + fmt(data.recognized_projects) + ' / ' + fmt(data.total_projects);
+        var items = data.items || [], chartNode = el('projectYearChart');
+        if (!items.length) { disposeChart('projectYearChart'); chartNode.innerHTML = '<div class="project-year-empty"><strong>暂无项目年份数据</strong><br>请调整日期或业务筛选条件后重试。</div>'; el('projectYearTabs').innerHTML = ''; el('projectYearRows').innerHTML = '<tr><td class="project-year-empty" colspan="6">当前筛选范围暂无服务项目</td></tr>'; return }
+        chartNode.innerHTML = '';
+        var option = base(); option.grid.left = 105; option.grid.right = 92; option.grid.top = 26; option.grid.bottom = 32; option.xAxis = { type: 'value', name: '项目数', minInterval: 1 }; option.yAxis = { type: 'category', inverse: true, data: items.map(function (item) { return item.label }), axisLabel: { fontSize: 10 } }; option.series = [{ type: 'bar', barMaxWidth: 22, data: items.map(function (item) { return item.project_count }), itemStyle: { color: function (params) { var item = items[params.dataIndex]; return item.year == null ? colors.gray : (Number(item.year) === Number(data.current_year) ? colors.green : colors.blue) } }, label: { show: true, position: 'right', formatter: function (params) { var item = items[params.dataIndex] || {}; return fmt(params.value) + ' (' + pct(item.percentage) + ')' } } }];
+        chart('projectYearChart', option, function (params) { var item = items[params.dataIndex]; if (!item) return; state.projectYear = projectYearKey(item); renderProjectYearRows(data) });
+        renderProjectYearRows(data)
       }
       function renderBusiness(d) {
         var r = d.business.regions.slice(0, 12), ro = base();
@@ -2605,14 +2963,104 @@
         po.series = [{ name: '项目数', type: 'bar', data: p.map(function (x) { return metricValue(x, 'project_count') }), itemStyle: { color: colors.cyan }, label: { show: true, position: 'right', formatter: function (params) { return fmtWithPct(params.value || 0, productTotals.project_count) } } }, { name: '群聊数', type: 'bar', data: p.map(function (x) { return metricValue(x, 'group_count') }), itemStyle: { color: colors.green2 }, label: { show: true, position: 'right', formatter: function (params) { return fmtWithPct(params.value || 0, productTotals.group_count) } } }, { name: '消息数', type: 'bar', data: p.map(function (x) { return metricValue(x, 'message_count') }), itemStyle: { color: colors.amber }, label: { show: true, position: 'right', formatter: function (params) { return fmtWithPct(params.value || 0, productTotals.message_count) } } }];
         chart('productChart', po); renderProductTree(d.business.product_hierarchy || []);
         var accounts = d.business.key_accounts.slice(0, 30);
-        el('accountRows').innerHTML = accounts.length ? accounts.map(function (x) { var words = (x.high_frequency_top5 || []).map(function (v) { return '<span class="pill">' + esc(v.word) + ' ' + fmt(v.count) + '</span>' }).join('') || '-'; return '<tr><td>' + esc(x.work_unit || '未返回客户单位') + '</td><td>' + esc(x.customer_name || '') + '</td><td class="num">' + fmt(x.group_count || 0) + '</td><td class="num">' + fmt(x.message_count || 0) + '</td><td class="num">' + fmt(x.project_count || 0) + '</td><td>' + ((x.category_l3 || []).map(function (v) { return '<span class="pill">' + esc(v) + '</span>' }).join('') || '-') + '</td><td>' + words + '</td><td class="num">' + fmtActiveDay(x.active_day) + '</td><td>' + ((x.aftersalers || []).map(function (v) { return '<span class="pill">' + esc(v) + '</span>' }).join('') || '-') + '</td></tr>' }).join('') : '<tr><td colspan="9">当前周期没有匹配的重点客户</td></tr>'
+        el('accountRows').innerHTML = accounts.length ? accounts.map(function (x) { var words = (x.high_frequency_top5 || []).map(function (v) { return '<span class="pill">' + esc(v.word) + ' ' + fmt(v.count) + '</span>' }).join('') || '-'; return '<tr><td>' + esc(x.work_unit || '未返回客户单位') + '</td><td>' + esc(x.customer_name || '') + '</td><td class="num">' + fmt(x.group_count || 0) + '</td><td class="num">' + fmt(x.message_count || 0) + '</td><td class="num">' + fmt(x.project_count || 0) + '</td><td>' + ((x.category_l3 || []).map(function (v) { return '<span class="pill">' + esc(v) + '</span>' }).join('') || '-') + '</td><td>' + words + '</td><td class="num">' + fmtActiveDay(x.active_day) + '</td><td>' + ((x.aftersalers || []).map(function (v) { return '<span class="pill">' + esc(v) + '</span>' }).join('') || '-') + '</td></tr>' }).join('') : '<tr><td colspan="9">当前周期没有匹配的重点客户</td></tr>';
+        renderProjectYearDistribution(d)
       }
       function attentionClass(status) { return status === '暂不交付' ? 'hold' : 'problem' }
       function renderProjectAttention(d) { var data = d.project_attention || { summary: [], items: [], total_projects: 0, all_projects: 0 }, summary = data.summary || [], summaryByStatus = {}; summary.forEach(function (item) { summaryByStatus[item.status] = item }); var tabs = [{ key: 'all', label: '全部 ' + fmt(data.total_projects || 0) }, { key: '问题项目', label: '问题项目 ' + fmt((summaryByStatus['问题项目'] || {}).project_count || 0) }, { key: '暂不交付', label: '暂不交付 ' + fmt((summaryByStatus['暂不交付'] || {}).project_count || 0) }]; el('attentionTabs').innerHTML = tabs.map(function (tab) { return '<button class="tab ' + (state.attentionStatus === tab.key ? 'active' : '') + '" data-attention-status="' + esc(tab.key) + '">' + esc(tab.label) + '</button>' }).join(''); var denominator = data.all_projects || data.total_projects || 0; el('attentionOverview').innerHTML = ['问题项目', '暂不交付'].map(function (status) { var item = summaryByStatus[status] || {}; var projectPct = denominator > 0 ? (item.project_count || 0) / denominator * 100 : 0; return '<div class="attention-card ' + attentionClass(status) + '"><strong>' + esc(status) + '</strong><span class="center stat-project"><b>' + fmt(item.project_count || 0) + '<small>(' + pct(projectPct) + ')</small></b>项目数</span><span class="center"><b>' + fmt(item.group_count || 0) + '</b>群聊数</span><span class="center"><b>' + fmt(item.message_count || 0) + '</b>消息数</span></div>' }).join(''); var items = (data.items || []).filter(function (item) { return state.attentionStatus === 'all' || item.status === state.attentionStatus }); el('attentionRows').innerHTML = items.length ? items.map(function (item) { var product = '<div class="attention-product">' + esc(item.project_name || '未返回产品名称') + '<small>' + esc([item.category_l2, item.category_l3].filter(Boolean).join(' / ') || '未分类') + '</small></div>', groups = (item.group_names || []).slice(0, 3).join('、') || fmt(item.group_count || 0) + ' 个群'; return '<tr><td><span class="status-badge ' + attentionClass(item.status) + '">' + esc(item.status) + '</span></td><td class="num attention-code">' + esc(item.project_code || '-') + '</td><td>' + product + '</td><td>' + esc(item.region || '未关联区域') + '</td><td>' + esc(item.sales_person || '未分配销售') + '</td><td>' + esc(item.aftersaler || '未关联售后') + '</td><td title="' + esc((item.group_names || []).join('、')) + '">' + esc(groups) + '</td><td class="num">' + fmt(item.message_count || 0) + '</td><td class="num">' + fmtActiveDay(item.active_day) + '</td></tr>' }).join('') : '<tr><td colspan="9">当前筛选范围没有“' + esc(state.attentionStatus === 'all' ? '问题项目”或“暂不交付' : state.attentionStatus) + '”记录，可调整顶部筛选条件后重试。</td></tr>' }
       function renderCross() { var rows = state.data.cross_analysis[state.cross] || []; el('crossRows').innerHTML = rows.length ? rows.map(function (row) { var values = (row.items || []).slice(0, 5), label = state.cross === 'region_product' ? 'category' : 'name'; return '<tr><td>' + esc(row.region) + '</td><td>' + values.map(function (x) { var percent = x.percentage != null ? x.percentage : ((row.group_count || 0) > 0 ? (x.count || 0) / (row.group_count || 0) * 100 : 0); return '<span class="pill">' + esc(x[label]) + ' ' + fmt(x.count) + ' / ' + pct(percent) + '</span>' }).join('') + '</td><td class="num">' + fmt(row.group_count || 0) + '</td><td class="num">' + fmt(row.message_count || 0) + '</td></tr>' }).join('') : '<tr><td colspan="4">暂无关联数据</td></tr>' }
       function renderQuality(d) { var q = d.data_quality, mappingLabel = q.mapping_available ? ((q.mapping_effective_month || '-') + ' · v' + fmt(q.mapping_revision || 0)) : '不可用，已回退LIMS', items = [['LIMS来源', q.lims_source || '-'], ['最终售后版本', mappingLabel], ['最终售后命中率', pct(q.mapping_match_rate || 0)], ['LIMS项目命中率', pct(q.project_match_rate)], ['LIMS区域字段覆盖率', pct(q.region_link_rate)], ['最终售后字段覆盖率', pct(q.aftersaler_coverage_rate || q.aftersaler_confirmation_rate)], ['未提取项目号群', fmt(q.groups_without_project_code || 0)], ['LIMS未返回项目号', fmt(q.unmatched_project_codes || 0)], ['完全无LIMS关联群', fmt(q.groups_without_lims_link || 0)], ['重复记录已剔除', q.duplicate_rows_removed + ' 条']]; el('quality').innerHTML = items.map(function (x) { return '<div class="quality-item"><span>' + x[0] + '</span><strong>' + x[1] + '</strong></div>' }).join(''); el('qualityNote').textContent = '项目编号 ' + fmt(q.matched_project_codes) + ' / ' + fmt(q.project_codes) + ' 已命中；最终售后对应表命中 ' + fmt(q.mapping_matched_records || 0) + ' 条，回退 LIMS ' + fmt(q.mapping_fallback_records || 0) + ' 条，冲突 ' + fmt(q.mapping_conflict_records || 0) + ' 条；群名未提取项目号 ' + fmt(q.groups_without_project_code || 0) + ' 个；LIMS未返回项目号 ' + fmt(q.unmatched_project_codes || 0) + ' 个；完全无LIMS关联群 ' + fmt(q.groups_without_lims_link || 0) + ' 个；LIMS关联群 ' + fmt(q.groups_with_lims_link || 0) + ' 个；LIMS API请求 ' + fmt(q.lims_api_requests || 0) + ' 次，返回记录 ' + fmt(q.lims_api_records || 0) + ' 条，错误 ' + fmt(q.lims_api_errors || 0) + ' 次。' + (q.note || '') }
       function fillSelect(id, values, placeholder, current) { var node = el(id); node.innerHTML = '<option value="">' + placeholder + '</option>' + values.map(function (v) { return '<option value="' + esc(v) + '" ' + (v === current ? 'selected' : '') + '>' + esc(v) + '</option>' }).join('') }
-      function setupDraggableSections() { var dash = el('dashboard'); if (!dash || dash.dataset.dragReady) return; dash.dataset.dragReady = '1'; var node = dash.firstElementChild; while (node) { if (node.classList && node.classList.contains('section-head')) { var wrap = document.createElement('div'); wrap.className = 'board-section'; wrap.draggable = true; dash.insertBefore(wrap, node); wrap.appendChild(node); node = wrap.nextElementSibling; while (node && !(node.classList && node.classList.contains('section-head')) && !(node.classList && node.classList.contains('footer'))) { var next = node.nextElementSibling; wrap.appendChild(node); node = next } } else { node = node.nextElementSibling } } var dragged = null; dash.addEventListener('dragstart', function (e) { var item = e.target.closest('.board-section'); if (!item) return; dragged = item; item.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move' }); dash.addEventListener('dragend', function () { dash.querySelectorAll('.board-section').forEach(function (x) { x.classList.remove('dragging', 'drag-over') }); dragged = null; state.charts.forEach(function (c) { c.resize() }) }); dash.addEventListener('dragover', function (e) { if (!dragged) return; e.preventDefault(); var target = e.target.closest('.board-section'); dash.querySelectorAll('.board-section.drag-over').forEach(function (x) { if (x !== target) x.classList.remove('drag-over') }); if (!target || target === dragged) return; target.classList.add('drag-over'); var rect = target.getBoundingClientRect(), after = e.clientY > rect.top + rect.height / 2; dash.insertBefore(dragged, after ? target.nextSibling : target) }) }
+      function setupDraggableSections() {
+        var dash = el('dashboard');
+        if (!dash || dash.dataset.dragReady) return;
+        dash.dataset.dragReady = '1';
+        var node = dash.firstElementChild;
+        while (node) {
+          if (node.classList && node.classList.contains('section-head')) {
+            var wrap = document.createElement('div'), head = node, titleNode = head.querySelector('h2');
+            wrap.className = 'board-section';
+            dash.insertBefore(wrap, node);
+            wrap.appendChild(node);
+            node = wrap.nextElementSibling;
+            while (node && !(node.classList && node.classList.contains('section-head')) && !(node.classList && node.classList.contains('footer'))) {
+              var next = node.nextElementSibling;
+              wrap.appendChild(node);
+              node = next
+            }
+            var sectionTitle = titleNode ? titleNode.textContent.trim() : '看板模块';
+            var handle = document.createElement('button'), handleIcon = document.createElement('span');
+            handle.type = 'button';
+            handle.className = 'section-drag-handle';
+            handle.draggable = true;
+            handle.setAttribute('aria-label', '调整“' + sectionTitle + '”的位置');
+            handle.setAttribute('aria-describedby', 'sectionDragHelp');
+            handle.title = '拖动调整位置；按 Alt + 上下方向键移动';
+            handle.setAttribute('data-html2canvas-ignore', 'true');
+            handleIcon.className = 'section-drag-handle-icon';
+            handleIcon.setAttribute('aria-hidden', 'true');
+            handleIcon.textContent = '⠿';
+            handle.appendChild(handleIcon);
+            head.appendChild(handle)
+          } else {
+            node = node.nextElementSibling
+          }
+        }
+        var live = document.createElement('div'), help = document.createElement('span');
+        live.className = 'sr-only';
+        live.setAttribute('aria-live', 'polite');
+        live.setAttribute('aria-atomic', 'true');
+        live.id = 'sectionDragStatus';
+        help.className = 'sr-only';
+        help.id = 'sectionDragHelp';
+        help.textContent = '拖动此按钮调整模块位置，或按住 Alt 后使用上、下方向键移动。';
+        dash.appendChild(live);
+        dash.appendChild(help);
+        var dragged = null;
+        function finishMove(item) {
+          var sections = Array.prototype.slice.call(dash.querySelectorAll('.board-section'));
+          var index = sections.indexOf(item), heading = item.querySelector('.section-head h2');
+          live.textContent = '已将“' + (heading ? heading.textContent.trim() : '看板模块') + '”移动到第 ' + (index + 1) + ' 位。';
+          requestAnimationFrame(function () { state.charts.forEach(function (c) { c.resize() }) })
+        }
+        dash.addEventListener('dragstart', function (e) {
+          var handle = e.target.closest('.section-drag-handle');
+          if (!handle) return;
+          var item = handle.closest('.board-section');
+          if (!item) return;
+          dragged = item;
+          item.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', handle.getAttribute('aria-label') || '调整看板模块位置')
+        });
+        dash.addEventListener('dragend', function () {
+          if (dragged) finishMove(dragged);
+          dash.querySelectorAll('.board-section').forEach(function (x) { x.classList.remove('dragging', 'drag-over') });
+          dragged = null
+        });
+        dash.addEventListener('dragover', function (e) {
+          if (!dragged) return;
+          e.preventDefault();
+          var target = e.target.closest('.board-section');
+          dash.querySelectorAll('.board-section.drag-over').forEach(function (x) { if (x !== target) x.classList.remove('drag-over') });
+          if (!target || target === dragged) return;
+          target.classList.add('drag-over');
+          var rect = target.getBoundingClientRect(), after = e.clientY > rect.top + rect.height / 2;
+          dash.insertBefore(dragged, after ? target.nextSibling : target)
+        });
+        dash.addEventListener('keydown', function (e) {
+          var handle = e.target.closest('.section-drag-handle');
+          if (!handle || !e.altKey || ['ArrowUp', 'ArrowDown'].indexOf(e.key) < 0) return;
+          var item = handle.closest('.board-section'), sections = Array.prototype.slice.call(dash.querySelectorAll('.board-section'));
+          var index = sections.indexOf(item), targetIndex = e.key === 'ArrowUp' ? index - 1 : index + 1;
+          if (targetIndex < 0 || targetIndex >= sections.length) return;
+          e.preventDefault();
+          if (e.key === 'ArrowUp') dash.insertBefore(item, sections[targetIndex]);
+          else dash.insertBefore(item, sections[targetIndex].nextSibling);
+          handle.focus();
+          finishMove(item)
+        })
+      }
       function render(d) { state.data = d; var f = d.meta.filter_options || {}; fillSelect('regionFilter', f.regions || [], '全部区域', state.region); fillSelect('afterFilter', f.aftersalers || [], '全部售后', state.aftersaler); fillSelect('productFilter', f.categories || [], '全部产品', state.category); fillSelect('accountFilter', f.key_accounts || [], '全部客户', state.keyAccount); el('loadingState').hidden = true; el('dashboard').hidden = false; setupDraggableSections(); installPdfExportButtons(); updateAfterMetricButtons(); renderKpis(d); renderService(d); renderCommunication(d); renderBusiness(d); renderProjectAttention(d); renderCross(); renderQuality(d); el('rangeText').textContent = '统计范围：' + d.meta.start_date + ' 至 ' + d.meta.end_date; el('updatedText').textContent = '最近汇总：' + correctedGeneratedAt(d.meta.generated_at) + (d.meta.cache === 'hit' ? ' · 已缓存' : ''); el('notice').className = 'notice' + (d.meta.stale ? ' show' : ''); el('notice').textContent = d.meta.stale ? '数据库暂时不可用，当前展示最近一次成功结果。' : ''; el('statusDot').className = 'dot ok'; el('statusText').textContent = d.meta.stale ? '数据可能延迟' : '数据已更新'; requestAnimationFrame(function () { state.charts.forEach(function (c) { c.resize() }) }) }
       async function load(refresh) { el('dashboard').hidden = true; el('loadingState').hidden = false; el('loadingState').innerHTML = '<div class="spinner"></div><strong>正在汇总客户服务数据</strong><p>系统正在读取每日分析结果并关联项目、客户、产品和服务人员。</p>'; el('statusDot').className = 'dot'; el('statusText').textContent = '正在查询'; try { render(await api('/api/v1/dashboard/overview', refresh ? { refresh: 'true' } : {})) } catch (e) { showError(e) } }
       var metricNames = { unanswered: '待回复消息明细', customer_negative: '客户负向明细', employee_negative: '服务负向明细', highfreq: '高频主题明细' };
@@ -2654,7 +3102,8 @@
       el('mappingBtn').addEventListener('click', openMappingManager);
       el('mappingClose').addEventListener('click', closeMappingManager);
       el('mappingMask').addEventListener('click', function (e) { if (e.target === this) closeMappingManager() });
-      el('mappingUnlockForm').addEventListener('submit', async function (e) { e.preventDefault(); state.mappingAdminKey = el('mappingAdminKey').value; if (await unlockMappingManager()) { try { sessionStorage.setItem('dashboard-admin-key', state.mappingAdminKey) } catch (error) { } el('mappingAdminKey').value = '' } });
+      el('mappingAdminKeyToggle').addEventListener('click', function () { setAdminKeyVisibility(this.getAttribute('aria-pressed') !== 'true') });
+      el('mappingUnlockForm').addEventListener('submit', async function (e) { e.preventDefault(); state.mappingAdminKey = el('mappingAdminKey').value; if (await unlockMappingManager()) { try { sessionStorage.setItem('dashboard-admin-key', state.mappingAdminKey) } catch (error) { } el('mappingAdminKey').value = ''; setAdminKeyVisibility(false) } });
       el('mappingVersion').addEventListener('change', function () { closeMappingEditor(); el('mappingStats').hidden = true; loadMappingRules().catch(function (error) { setMappingError(error.message) }) });
       el('mappingSearch').addEventListener('input', renderMappingRules);
       el('mappingNewVersion').addEventListener('click', function () { createMappingVersion().catch(function (error) { setMappingError(error.message) }) });
@@ -2666,12 +3115,27 @@
       el('period').addEventListener('change', function () { document.querySelectorAll('.custom-field').forEach(function (x) { x.hidden = el('period').value !== 'custom' }) }); el('applyBtn').addEventListener('click', function () { state.period = el('period').value; state.start = el('startDate').value; state.end = el('endDate').value; state.region = el('regionFilter').value; state.aftersaler = el('afterFilter').value; state.category = el('productFilter').value; state.keyAccount = el('accountFilter').value; if (state.period === 'custom' && (!state.start || !state.end)) { el('notice').className = 'notice show'; el('notice').textContent = '请选择完整的开始和结束日期。'; return } load(false) }); el('refreshBtn').addEventListener('click', function () { load(true) }); el('verifyBtn').addEventListener('click', async function () { var p = el('verifyPanel'), b = el('verifyBody'); p.style.display = ''; b.innerHTML = '<div class="state"><div class="spinner"></div><strong>正在验证数据...</strong></div>'; try { var d = await api('/api/v1/dashboard/verify', {}); renderVerifyResult(d, b) } catch (e) { b.innerHTML = '<div class="state"><strong>验证失败</strong><p>' + esc(e.message) + '</p></div>' } }); el('exportBtn').addEventListener('click', function () { var p = new URLSearchParams({ period: state.period }); if (state.period === 'custom') { p.set('start_date', state.start); p.set('end_date', state.end) } if (state.region) p.set('region', state.region); if (state.aftersaler) p.set('aftersaler', state.aftersaler); if (state.category) p.set('category', state.category); if (state.keyAccount) p.set('key_account', state.keyAccount); window.open('/api/v1/dashboard/export?' + p.toString(), '_blank') }); el('themePicker').addEventListener('change', function () { setTheme(this.value) }); el('qualityToggle').addEventListener('click', function () { var body = el('qualityBody'), icon = el('qualityExpandIcon'); var shown = body.style.display !== 'none'; body.style.display = shown ? 'none' : 'block'; icon.textContent = shown ? '\u25b6 \u5c55\u5f00' : '\u25bc \u6298\u53e0' }); document.addEventListener('click', function (e) { var metric = e.target.closest('[data-metric]'); if (metric) openEvidence(metric.dataset.metric, '', metricNames[metric.dataset.metric]); var attention = e.target.closest('[data-attention-status]'); if (attention) { state.attentionStatus = attention.dataset.attentionStatus; renderProjectAttention(state.data) } var tab = e.target.closest('[data-cross]'); if (tab) { document.querySelectorAll('[data-cross]').forEach(function (x) { x.classList.remove('active') }); tab.classList.add('active'); state.cross = tab.dataset.cross; renderCross() } }); el('closeDrawer').addEventListener('click', function () { el('drawerMask').className = 'drawer-mask' }); document.addEventListener('click', function (e) { var tab = e.target.closest('[data-trend]'); if (tab) { document.querySelectorAll('[data-trend]').forEach(function (x) { x.classList.toggle('active', x === tab); x.setAttribute('aria-selected', x === tab ? 'true' : 'false') }); tab.classList.add('active'); state.trendView = tab.dataset.trend; if (state.commData) renderCommunication(state.commData) } }); el('drawerMask').addEventListener('click', function (e) { if (e.target === this) this.className = 'drawer-mask' }); el('evidenceSearchBtn').addEventListener('click', function () { state.evidencePage = 1; loadEvidence() }); el('prevPage').addEventListener('click', function () { if (state.evidencePage > 1) { state.evidencePage--; loadEvidence() } }); el('nextPage').addEventListener('click', function () { if (state.evidencePage < state.evidencePages) { state.evidencePage++; loadEvidence() } }); window.addEventListener('resize', function () { state.charts.forEach(function (c) { c.resize() }) }); document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { el('drawerMask').className = 'drawer-mask'; closeMappingManager() } }); setTheme((function () { try { return localStorage.getItem('dashboard-theme') || 'day' } catch (e) { return 'day' } })()); load(false);
 
       document.addEventListener('click', function (e) {
-        var trigger = e.target.closest('[data-top-group-toggle]');
-        if (!trigger) return;
-        var details = el(trigger.getAttribute('aria-controls'));
-        var expanded = trigger.getAttribute('aria-expanded') === 'true';
-        trigger.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-        if (details) details.hidden = expanded;
+        var tab = e.target.closest('[data-project-year]');
+        if (!tab || !state.data) return;
+        state.projectYear = tab.dataset.projectYear;
+        renderProjectYearRows(state.data.business.project_year_distribution || { items: [] });
+      });
+
+      document.addEventListener('keydown', function (e) {
+        var current = e.target.closest('[data-project-year]');
+        if (!current || ['ArrowLeft', 'ArrowRight', 'Home', 'End'].indexOf(e.key) < 0) return;
+        var tabs = Array.prototype.slice.call(document.querySelectorAll('[data-project-year]'));
+        var index = tabs.indexOf(current), next = index;
+        if (e.key === 'Home') next = 0;
+        else if (e.key === 'End') next = tabs.length - 1;
+        else if (e.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+        else next = (index + 1) % tabs.length;
+        var nextKey = tabs[next].dataset.projectYear;
+        e.preventDefault();
+        state.projectYear = nextKey;
+        renderProjectYearRows(state.data.business.project_year_distribution || { items: [] });
+        var updated = document.querySelector('[data-project-year="' + nextKey + '"]');
+        if (updated) updated.focus();
       });
 
       document.addEventListener('keydown', function (e) {

@@ -206,6 +206,82 @@ class DashboardParsingTests(unittest.TestCase):
             "coverage_percentage": 0.0, "items": [],
         })
 
+    def test_project_year_parsing_prefers_code_and_normalizes_lims_start_time(self):
+        self.assertEqual(db_dashboard.extract_project_code_year("LC-P2026001"), 2026)
+        self.assertEqual(db_dashboard.extract_project_code_year("lc-sp20250102003"), 2025)
+        self.assertIsNone(db_dashboard.extract_project_code_year("LC-P12345"))
+        self.assertIsNone(db_dashboard.extract_project_code_year("VIP2026001"))
+        self.assertEqual(
+            db_dashboard.parse_lims_start_date("2024-03-02 10:30:00"),
+            date(2024, 3, 2),
+        )
+        self.assertEqual(
+            db_dashboard.parse_lims_start_date("开始于2023年7月9日"),
+            date(2023, 7, 9),
+        )
+        self.assertIsNone(db_dashboard.parse_lims_start_date("未知"))
+
+    def test_project_year_distribution_deduplicates_and_falls_back_to_earliest_start(self):
+        groups = {
+            "群A": {"dimension": {
+                "codes": ["LC-P2026001", "LC-P12345", "LC-P42"],
+                "aftersalers": ["张三"],
+                "projects": [
+                    {
+                        "project_code": "LC-P2026001", "start_time": "2024-01-01",
+                        "product_name": "项目甲", "customer_name": "客户甲",
+                        "work_unit": "单位甲", "category_l2": "常规转录组",
+                        "category_l3": "mRNA", "region": "华东",
+                        "final_aftersaler": "张三",
+                    },
+                    {"project_code": "LC-P12345", "start_time": "2025-06-01"},
+                ],
+            }},
+            "群B": {"dimension": {
+                "codes": ["LC-P12345", "LC-SP2025001"],
+                "projects": [
+                    {"project_code": "LC-P12345", "start_time": "2024-03-02"},
+                    {"project_code": "LC-SP2025001", "start_time": "2023-01-01"},
+                ],
+            }},
+        }
+
+        result = db_dashboard._build_project_year_distribution(groups, current_year=2026)
+
+        self.assertEqual(result["total_projects"], 4)
+        self.assertEqual(result["recognized_projects"], 3)
+        self.assertEqual(result["unknown_projects"], 1)
+        self.assertEqual(result["coverage_percentage"], 75.0)
+        self.assertEqual(result["current_year_projects"], 1)
+        self.assertEqual(result["previous_year_projects"], 1)
+        self.assertEqual(result["older_projects"], 1)
+        self.assertEqual([item["year"] for item in result["items"]], [2026, 2025, 2024, None])
+        projects = {
+            project["project_code"]: project
+            for item in result["items"]
+            for project in item["projects"]
+        }
+        self.assertEqual(projects["LC-P2026001"]["year_source"], "project_code")
+        self.assertEqual(projects["LC-P12345"]["year"], 2024)
+        self.assertEqual(projects["LC-P12345"]["year_source"], "lims_start_time")
+        self.assertEqual(projects["LC-P12345"]["start_time"], "2024-03-02")
+        self.assertEqual(projects["LC-P12345"]["group_count"], 2)
+        self.assertEqual(projects["LC-P42"]["year_source"], "unknown")
+
+    def test_project_year_distribution_returns_stable_empty_shape(self):
+        self.assertEqual(db_dashboard._build_project_year_distribution({}, 2026), {
+            "current_year": 2026,
+            "total_projects": 0,
+            "recognized_projects": 0,
+            "unknown_projects": 0,
+            "coverage_percentage": 0.0,
+            "current_year_projects": 0,
+            "previous_year_projects": 0,
+            "older_projects": 0,
+            "source_priority": ["project_code", "lims_start_time"],
+            "items": [],
+        })
+
     def test_overview_applies_product_scope_to_topics_accounts_and_cross_analysis(self):
         rows = [
             {
@@ -343,6 +419,20 @@ class DashboardParsingTests(unittest.TestCase):
                 "aftersalers": [{"name": "张三", "group_count": 1}],
                 "product_categories": [{"category": "常规转录组", "project_count": 1}],
                 "key_accounts": [{"key_account": "重点客户甲", "project_count": 1}],
+                "project_year_distribution": {
+                    "items": [{
+                        "year": 2026, "label": "今年（2026）", "project_count": 1,
+                        "percentage": 100, "group_count": 1,
+                        "projects": [{
+                            "project_code": "LC-P2026001", "year": 2026,
+                            "year_source": "project_code", "start_time": "2026-01-02",
+                            "project_names": ["RNA"], "customer_names": ["客户甲"],
+                            "work_units": ["单位甲"], "product_categories": ["常规转录组"],
+                            "regions": ["华东"], "aftersalers": ["张三"],
+                            "group_count": 1, "group_names": ["允许产品群"],
+                        }],
+                    }],
+                },
             },
             "project_attention": {
                 "target_statuses": ["问题项目", "暂不交付"],
@@ -388,12 +478,14 @@ class DashboardParsingTests(unittest.TestCase):
         workbook = load_workbook(BytesIO(content), read_only=True)
         self.assertTrue({
             "导出说明", "经营摘要", "高频关注主题", "重点客户", "消息Top5群聊",
-            "项目状态关注", "服务质量",
+            "项目年份分布", "项目年份明细", "项目状态关注", "服务质量",
             "analysis原始数据", "group原始数据", "chat原始数据", "LIMS原始数据",
         }.issubset(set(workbook.sheetnames)))
         self.assertEqual(workbook["高频关注主题"]["A2"].value, "转录")
         self.assertEqual(workbook["消息Top5群聊"]["B2"].value, "允许产品群")
         self.assertEqual(workbook["消息Top5群聊"]["G2"].value, "LC-P1")
+        self.assertEqual(workbook["项目年份分布"]["A2"].value, 2026)
+        self.assertEqual(workbook["项目年份明细"]["C2"].value, "LC-P2026001")
         self.assertEqual(workbook["项目状态关注"]["A2"].value, "问题项目")
         self.assertEqual(workbook["LIMS原始数据"]["B2"].value, "LC-P1")
 
