@@ -155,75 +155,55 @@ class DashboardParsingTests(unittest.TestCase):
             dimension, region="华南", aftersaler="张三", category="微生物", key_account="客户乙"
         ))
 
-    def test_parse_core_summary_normalizes_json_and_plain_text(self):
-        parsed = db_dashboard.parse_core_summary(json.dumps({
-            "overview": "讨论交付进度", "demands": ["确认交付时间"],
-            "actions": "已安排复核", "todos": None,
-        }, ensure_ascii=False))
-        self.assertEqual(parsed["overview"], "讨论交付进度")
-        self.assertEqual(parsed["demands"], ["确认交付时间"])
-        self.assertEqual(parsed["actions"], ["已安排复核"])
-        self.assertEqual(parsed["todos"], [])
-        self.assertEqual(db_dashboard.parse_core_summary("无法解析的摘要")["overview"], "无法解析的摘要")
-
-    def test_top_message_customers_uses_unambiguous_work_unit_and_all_message_denominator(self):
-        def group(name, messages, projects, words=None, rows=None):
+    def test_top_message_groups_ranks_all_groups_without_requiring_lims_customer_data(self):
+        def group(name, messages, days, words=None, dimension=None):
             return {
-                "group_name": name, "messages": messages,
-                "high_freq": Counter(words or {}), "rows": rows or [],
-                "dimension": {"projects": projects, "aftersalers": ["张三"]},
+                "group_name": name, "messages": messages, "dates": set(days),
+                "high_freq": Counter(words or {}), "rows": [],
+                "dimension": dimension or {},
             }
 
         groups = {
-            "乙客户群": group("乙客户群", 50, [{
-                "project_code": "LC-P2", "work_unit": "单位乙",
-                "customer_name": "客户乙", "category_l2": "微生物",
-            }], {"进度": 3}),
-            "甲客户群一": group("甲客户群一", 40, [
-                {"project_code": "LC-P1", "work_unit": "单位甲", "customer_name": "客户甲", "category_l2": "常规转录组"},
-                {"project_code": "LC-P3", "work_unit": "单位甲", "customer_name": "客户甲", "category_l2": "表观组学"},
-            ], {"交付": 2}, [
-                {"CREATEDTIME": "2026-07-01 10:00:00", "coreInfoSummary": "旧摘要"},
-                {"CREATEDTIME": "2026-07-02 10:00:00", "coreInfoSummary": json.dumps({"overview": "最新摘要", "demands": ["确认结果"]}, ensure_ascii=False)},
-            ]),
-            "甲客户群二": group("甲客户群二", 20, [{
-                "project_code": "LC-P4", "work_unit": "单位甲",
-                "customer_name": "客户甲二", "category_l2": "常规转录组",
-            }], {"交付": 4}),
-            "无单位群": group("无单位群", 10, [{"project_code": "LC-P5", "work_unit": ""}]),
-            "多单位群": group("多单位群", 10, [
-                {"project_code": "LC-P6", "work_unit": "单位丙"},
-                {"project_code": "LC-P7", "work_unit": "单位丁"},
-            ]),
+            "无客户字段群": group("无客户字段群", 50, ["2026-07-01", "2026-07-02"], {"进度": 3}),
+            "客户群一": group("客户群一", 40, ["2026-07-01"], {"交付": 2}, {
+                "codes": ["LC-P1"], "aftersalers": ["张三"],
+                "projects": [{
+                    "project_code": "LC-P1", "work_unit": "单位甲",
+                    "customer_name": "客户甲", "category_l2": "常规转录组",
+                }],
+            }),
+            "客户群二": group("客户群二", 30, ["2026-07-01"]),
+            "客户群三": group("客户群三", 20, ["2026-07-01"]),
+            "客户群四": group("客户群四", 10, ["2026-07-01"]),
+            "未进入前五群": group("未进入前五群", 5, ["2026-07-01"]),
         }
 
-        result = db_dashboard._build_top_message_customers(groups, 130)
+        result = db_dashboard._build_top_message_groups(groups, 155)
 
-        self.assertEqual([item["customer_unit"] for item in result["items"]], ["单位甲", "单位乙"])
-        self.assertEqual(result["attributed_messages"], 110)
-        self.assertEqual(result["top5_messages"], 110)
-        self.assertEqual(result["coverage_percentage"], 84.6)
-        self.assertEqual(result["attribution_percentage"], 84.6)
-        first = result["items"][0]
-        self.assertEqual(first["message_count"], 60)
-        self.assertEqual(first["group_count"], 2)
-        self.assertEqual(first["high_frequency_top5"][0], {"word": "交付", "count": 6})
-        self.assertEqual(first["groups"][0]["summary"]["overview"], "最新摘要")
-        self.assertEqual(first["groups"][0]["percentage_of_customer"], 66.7)
+        self.assertEqual(result["actual_count"], 5)
+        self.assertEqual(result["total_groups"], 6)
+        self.assertEqual(result["top5_messages"], 150)
+        self.assertEqual(result["coverage_percentage"], 96.8)
+        self.assertEqual(result["items"][0]["group_name"], "无客户字段群")
+        self.assertEqual(result["items"][0]["active_days"], 2)
+        self.assertEqual(result["items"][0]["high_frequency_top5"][0], {"word": "进度", "count": 3})
+        self.assertEqual(result["items"][1]["customer_units"], ["单位甲"])
+        self.assertNotIn("summary", result["items"][1])
 
-    def test_top_message_customers_tie_breaks_by_group_count_then_name(self):
+    def test_top_message_groups_tie_breaks_by_active_days_then_name(self):
         groups = {
-            "B群": {"messages": 10, "high_freq": Counter(), "rows": [], "dimension": {"projects": [{"work_unit": "Unit B"}]}},
-            "A群": {"messages": 10, "high_freq": Counter(), "rows": [], "dimension": {"projects": [{"work_unit": "Unit A"}]}},
+            "B群": {"messages": 10, "dates": {"2026-07-01"}, "high_freq": Counter(), "dimension": {}},
+            "C群": {"messages": 10, "dates": {"2026-07-01", "2026-07-02"}, "high_freq": Counter(), "dimension": {}},
+            "A群": {"messages": 10, "dates": {"2026-07-01"}, "high_freq": Counter(), "dimension": {}},
         }
-        result = db_dashboard._build_top_message_customers(groups, 20)
-        self.assertEqual([item["customer_unit"] for item in result["items"]], ["Unit A", "Unit B"])
+        result = db_dashboard._build_top_message_groups(groups, 30)
+        self.assertEqual([item["group_name"] for item in result["items"]], ["C群", "A群", "B群"])
 
-    def test_top_message_customers_returns_stable_empty_shape(self):
-        self.assertEqual(db_dashboard._build_top_message_customers({}, 0), {
-            "limit": 5, "total_messages": 0, "attributed_messages": 0,
-            "top5_messages": 0, "coverage_percentage": 0.0,
-            "attribution_percentage": 0.0, "items": [],
+    def test_top_message_groups_returns_stable_empty_shape(self):
+        self.assertEqual(db_dashboard._build_top_message_groups({}, 0), {
+            "limit": 5, "actual_count": 0, "total_groups": 0,
+            "total_messages": 0, "top5_messages": 0,
+            "coverage_percentage": 0.0, "items": [],
         })
 
     def test_overview_applies_product_scope_to_topics_accounts_and_cross_analysis(self):
@@ -307,11 +287,14 @@ class DashboardParsingTests(unittest.TestCase):
             ["重点客户甲"],
         )
         self.assertEqual(
-            result["business"]["top_message_customers"]["items"][0]["customer_unit"],
-            "单位甲",
+            result["communication"]["top_message_groups"]["items"][0]["group_name"],
+            "允许产品群",
         )
-        self.assertEqual(result["business"]["top_message_customers"]["coverage_percentage"], 100.0)
-        self.assertEqual(microbe_result["business"]["top_message_customers"]["items"], [])
+        self.assertEqual(result["communication"]["top_message_groups"]["coverage_percentage"], 100.0)
+        self.assertEqual(
+            microbe_result["communication"]["top_message_groups"]["items"][0]["group_name"],
+            "允许产品群",
+        )
         self.assertEqual(
             [item["region"] for item in result["cross_analysis"]["region_sales"]],
             ["华东"],
@@ -344,28 +327,22 @@ class DashboardParsingTests(unittest.TestCase):
                 "trend": [{"date": "2026-07-08", "messages": 10, "groups": 1, "missed": 0}],
                 "high_frequency": [{"word": "转录", "count": 3}],
                 "active_duration": [{"range": "8-30天", "label": "短期服务", "count": 1, "percentage": 100}],
+                "top_message_groups": {
+                    "items": [{
+                        "rank": 1, "group_name": "允许产品群", "message_count": 10,
+                        "percentage_of_all": 100, "active_days": 1,
+                        "high_frequency_top5": [{"word": "转录", "count": 3}],
+                        "project_codes": ["LC-P1"], "customer_units": ["单位甲"],
+                        "customer_names": ["客户甲"], "product_categories": ["常规转录组"],
+                        "aftersalers": ["张三"],
+                    }],
+                },
             },
             "business": {
                 "regions": [{"region": "华东", "group_count": 1}],
                 "aftersalers": [{"name": "张三", "group_count": 1}],
                 "product_categories": [{"category": "常规转录组", "project_count": 1}],
                 "key_accounts": [{"key_account": "重点客户甲", "project_count": 1}],
-                "top_message_customers": {
-                    "items": [{
-                        "rank": 1, "customer_unit": "单位甲",
-                        "customer_names": ["客户甲"], "message_count": 10,
-                        "percentage_of_all": 100, "group_count": 1,
-                        "high_frequency_top5": [{"word": "转录", "count": 3}],
-                        "groups": [{
-                            "group_name": "允许产品群", "message_count": 10,
-                            "percentage_of_customer": 100,
-                            "summary": {"overview": "讨论转录结果", "demands": ["确认结果"]},
-                            "high_frequency_top5": [{"word": "转录", "count": 3}],
-                            "project_codes": ["LC-P1"], "product_categories": ["常规转录组"],
-                            "aftersalers": ["张三"], "latest_analysis_time": "2026-07-08 10:00:00",
-                        }],
-                    }],
-                },
             },
             "project_attention": {
                 "target_statuses": ["问题项目", "暂不交付"],
@@ -410,13 +387,13 @@ class DashboardParsingTests(unittest.TestCase):
 
         workbook = load_workbook(BytesIO(content), read_only=True)
         self.assertTrue({
-            "导出说明", "经营摘要", "高频关注主题", "重点客户", "消息Top5客户",
-            "Top5客户群聊", "项目状态关注", "服务质量",
+            "导出说明", "经营摘要", "高频关注主题", "重点客户", "消息Top5群聊",
+            "项目状态关注", "服务质量",
             "analysis原始数据", "group原始数据", "chat原始数据", "LIMS原始数据",
         }.issubset(set(workbook.sheetnames)))
         self.assertEqual(workbook["高频关注主题"]["A2"].value, "转录")
-        self.assertEqual(workbook["消息Top5客户"]["B2"].value, "单位甲")
-        self.assertEqual(workbook["Top5客户群聊"]["C2"].value, "允许产品群")
+        self.assertEqual(workbook["消息Top5群聊"]["B2"].value, "允许产品群")
+        self.assertEqual(workbook["消息Top5群聊"]["G2"].value, "LC-P1")
         self.assertEqual(workbook["项目状态关注"]["A2"].value, "问题项目")
         self.assertEqual(workbook["LIMS原始数据"]["B2"].value, "LC-P1")
 
