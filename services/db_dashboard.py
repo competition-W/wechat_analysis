@@ -225,37 +225,6 @@ def parse_high_freq(value: Any) -> List[dict]:
     ]
 
 
-def parse_core_summary(value: Any) -> dict:
-    """Normalize a stored group summary without invoking the LLM again."""
-    empty = {"overview": "", "demands": [], "actions": [], "todos": []}
-    if value in (None, ""):
-        return empty
-    if isinstance(value, dict):
-        payload = value
-    else:
-        text = str(value).strip()
-        if not text:
-            return empty
-        fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
-        try:
-            payload = json.loads(fenced)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return {**empty, "overview": text}
-    if not isinstance(payload, dict):
-        return {**empty, "overview": str(payload).strip()}
-
-    def normalized_list(raw: Any) -> List[str]:
-        values = raw if isinstance(raw, list) else ([raw] if raw not in (None, "") else [])
-        return [str(item).strip() for item in values if str(item).strip()]
-
-    return {
-        "overview": str(payload.get("overview") or "").strip(),
-        "demands": normalized_list(payload.get("demands")),
-        "actions": normalized_list(payload.get("actions")),
-        "todos": normalized_list(payload.get("todos")),
-    }
-
-
 def parse_members(value: Any) -> List[str]:
     if not value:
         return []
@@ -1028,118 +997,78 @@ def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str
     return groups
 
 
-def _build_top_message_customers(
+def _build_top_message_groups(
     groups: Dict[str, dict], total_messages: int, limit: int = 5,
 ) -> dict:
-    """Rank unambiguously attributed work units by scoped group message volume."""
-    customers: Dict[str, dict] = {}
-    attributed_messages = 0
+    """Rank scoped group chats by period message volume without requiring LIMS data."""
+    items: List[dict] = []
     for group_name, group in groups.items():
         dimension = group.get("dimension") or {}
         projects = dimension.get("projects") or []
-        work_units = {
-            str(project.get("work_unit") or "").strip()
-            for project in projects
-            if str(project.get("work_unit") or "").strip()
+        project_codes = {
+            str(value).strip().upper()
+            for value in dimension.get("codes", [])
+            if str(value).strip()
         }
-        # A group is counted only when it maps to exactly one customer unit.
-        if len(work_units) != 1:
-            continue
-        customer_unit = next(iter(work_units))
-        message_count = max(0, int(group.get("messages") or 0))
-        attributed_messages += message_count
-        customer = customers.setdefault(customer_unit, {
-            "customer_unit": customer_unit,
-            "customer_names": set(),
-            "message_count": 0,
-            "high_frequency": Counter(),
-            "groups": [],
-        })
-        customer["message_count"] += message_count
-        customer["high_frequency"].update(group.get("high_freq") or Counter())
-        customer["customer_names"].update({
-            str(project.get("customer_name") or "").strip()
+        project_codes.update({
+            str(project.get("project_code") or "").strip().upper()
             for project in projects
-            if str(project.get("work_unit") or "").strip() == customer_unit
-            and str(project.get("customer_name") or "").strip()
+            if str(project.get("project_code") or "").strip()
         })
+        if not project_codes:
+            project_codes.update(extract_project_codes(group_name))
 
-        summary_row = next(
-            (
-                row for row in reversed(group.get("rows") or [])
-                if str(row.get("coreInfoSummary") or "").strip()
-            ),
-            None,
-        )
-        project_codes = sorted({
-            str(project.get("project_code") or "").strip()
-            for project in projects if str(project.get("project_code") or "").strip()
-        })
-        product_categories = sorted({
-            str(project.get("category_l2") or "").strip()
-            for project in projects if str(project.get("category_l2") or "").strip()
-        })
-        customer["groups"].append({
+        items.append({
             "group_name": group_name,
-            "message_count": message_count,
-            "percentage_of_customer": 0.0,
-            "latest_analysis_time": (
-                str(summary_row.get("CREATEDTIME"))[:19].replace("T", " ")
-                if summary_row else ""
-            ),
-            "summary": parse_core_summary(
-                summary_row.get("coreInfoSummary") if summary_row else None
-            ),
+            "message_count": max(0, int(group.get("messages") or 0)),
+            "percentage_of_all": 0.0,
+            "active_days": len(group.get("dates") or set()),
             "high_frequency_top5": [
                 {"word": word, "count": count}
                 for word, count in (group.get("high_freq") or Counter()).most_common(5)
             ],
-            "project_codes": project_codes,
-            "product_categories": product_categories,
+            "project_codes": sorted(project_codes),
+            "customer_units": sorted({
+                str(project.get("work_unit") or "").strip()
+                for project in projects
+                if str(project.get("work_unit") or "").strip()
+            }),
+            "customer_names": sorted({
+                str(project.get("customer_name") or "").strip()
+                for project in projects
+                if str(project.get("customer_name") or "").strip()
+            }),
+            "product_categories": sorted({
+                str(project.get("category_l2") or "").strip()
+                for project in projects
+                if str(project.get("category_l2") or "").strip()
+            }),
             "aftersalers": sorted({
                 str(value).strip()
-                for value in dimension.get("aftersalers", []) if str(value).strip()
+                for value in dimension.get("aftersalers", [])
+                if str(value).strip()
             }),
         })
 
     ranked = sorted(
-        customers.values(),
+        items,
         key=lambda item: (
-            -item["message_count"], -len(item["groups"]), item["customer_unit"]
+            -item["message_count"], -item["active_days"], item["group_name"]
         ),
     )[:max(0, limit)]
-    items = []
-    for rank, customer in enumerate(ranked, 1):
-        customer_total = customer["message_count"]
-        group_items = sorted(
-            customer["groups"], key=lambda item: (-item["message_count"], item["group_name"])
-        )
-        for group_item in group_items:
-            group_item["percentage_of_customer"] = _ratio(
-                group_item["message_count"], customer_total
-            )
-        items.append({
-            "rank": rank,
-            "customer_unit": customer["customer_unit"],
-            "customer_names": sorted(customer["customer_names"]),
-            "message_count": customer_total,
-            "percentage_of_all": _ratio(customer_total, total_messages),
-            "group_count": len(group_items),
-            "high_frequency_top5": [
-                {"word": word, "count": count}
-                for word, count in customer["high_frequency"].most_common(5)
-            ],
-            "groups": group_items,
-        })
-    top5_messages = sum(item["message_count"] for item in items)
+    for rank, item in enumerate(ranked, 1):
+        item["rank"] = rank
+        item["percentage_of_all"] = _ratio(item["message_count"], total_messages)
+
+    top5_messages = sum(item["message_count"] for item in ranked)
     return {
         "limit": max(0, limit),
+        "actual_count": len(ranked),
+        "total_groups": len(groups),
         "total_messages": total_messages,
-        "attributed_messages": attributed_messages,
         "top5_messages": top5_messages,
         "coverage_percentage": _ratio(top5_messages, total_messages),
-        "attribution_percentage": _ratio(attributed_messages, total_messages),
-        "items": items,
+        "items": ranked,
     }
 
 
@@ -1579,7 +1508,7 @@ def _build_overview(
             "active_day": max(value.get("active_days", []) or [0]),
         })
     account_items.sort(key=lambda value: (-value["group_count"], -value["project_count"], value["key_account"]))
-    top_message_customers = _build_top_message_customers(groups, total_messages)
+    top_message_groups = _build_top_message_groups(groups, total_messages)
     attention_items = []
     status_order = {status: index for index, status in enumerate(PROJECT_ATTENTION_STATUSES)}
     for value in attention_projects.values():
@@ -1671,6 +1600,7 @@ def _build_overview(
             "high_frequency": [{"word": word, "count": count} for word, count in words.most_common(20)],
             "active_duration": duration_items,
             "time_period_breakdown": _time_period_breakdown(groups, dimensions, chat_rows_by_group),
+            "top_message_groups": top_message_groups,
         },
         "business": {
             "aftersalers": [
@@ -1699,7 +1629,6 @@ def _build_overview(
             ],
             "product_hierarchy": product_hierarchy,
             "key_accounts": account_items,
-            "top_message_customers": top_message_customers,
         },
         "project_attention": {
             "target_statuses": list(PROJECT_ATTENTION_STATUSES),
@@ -3112,42 +3041,26 @@ def _cross_rows(items: List[dict]) -> List[dict]:
     ]
 
 
-def _top_customer_export_rows(data: dict) -> Tuple[List[dict], List[dict]]:
-    customer_rows: List[dict] = []
-    group_rows: List[dict] = []
-    for customer in data.get("items") or []:
-        customer_rows.append({
-            "排名": customer.get("rank"),
-            "客户单位": customer.get("customer_unit"),
-            "客户名称": "、".join(customer.get("customer_names") or []),
-            "消息数": customer.get("message_count"),
-            "全部消息占比(%)": customer.get("percentage_of_all"),
-            "群聊数": customer.get("group_count"),
+def _top_message_group_export_rows(data: dict) -> List[dict]:
+    return [
+        {
+            "排名": group.get("rank"),
+            "群聊名称": group.get("group_name"),
+            "消息数": group.get("message_count"),
+            "全部消息占比(%)": group.get("percentage_of_all"),
+            "活跃天数": group.get("active_days"),
             "高频问题Top5": "；".join(
                 f"{item.get('word')}({item.get('count')})"
-                for item in customer.get("high_frequency_top5") or []
+                for item in group.get("high_frequency_top5") or []
             ),
-        })
-        for group in customer.get("groups") or []:
-            summary = group.get("summary") or {}
-            group_rows.append({
-                "排名": customer.get("rank"),
-                "客户单位": customer.get("customer_unit"),
-                "群聊名称": group.get("group_name"),
-                "消息数": group.get("message_count"),
-                "客户内消息占比(%)": group.get("percentage_of_customer"),
-                "群聊概览": summary.get("overview"),
-                "客户诉求": "；".join(summary.get("demands") or []),
-                "高频问题Top5": "；".join(
-                    f"{item.get('word')}({item.get('count')})"
-                    for item in group.get("high_frequency_top5") or []
-                ),
-                "项目号": "、".join(group.get("project_codes") or []),
-                "产品分类": "、".join(group.get("product_categories") or []),
-                "售后员": "、".join(group.get("aftersalers") or []),
-                "概览更新时间": group.get("latest_analysis_time"),
-            })
-    return customer_rows, group_rows
+            "项目号": "、".join(group.get("project_codes") or []),
+            "客户单位": "、".join(group.get("customer_units") or []),
+            "客户名称": "、".join(group.get("customer_names") or []),
+            "产品分类": "、".join(group.get("product_categories") or []),
+            "售后员": "、".join(group.get("aftersalers") or []),
+        }
+        for group in data.get("items") or []
+    ]
 
 
 def get_export_excel(
@@ -3236,11 +3149,13 @@ def get_export_excel(
     _write_excel_sheet(workbook, "售后人员分布", overview["business"]["aftersalers"])
     _write_excel_sheet(workbook, "产品分类", overview["business"]["product_categories"])
     _write_excel_sheet(workbook, "重点客户", overview["business"]["key_accounts"])
-    top_customer_rows, top_customer_group_rows = _top_customer_export_rows(
-        overview["business"].get("top_message_customers") or {}
+    _write_excel_sheet(
+        workbook,
+        "消息Top5群聊",
+        _top_message_group_export_rows(
+            overview["communication"].get("top_message_groups") or {}
+        ),
     )
-    _write_excel_sheet(workbook, "消息Top5客户", top_customer_rows)
-    _write_excel_sheet(workbook, "Top5客户群聊", top_customer_group_rows)
     _write_excel_sheet(workbook, "项目状态关注", overview["project_attention"]["items"])
     _write_excel_sheet(workbook, "交叉分析-销售", _cross_rows(overview["cross_analysis"]["region_sales"]))
     _write_excel_sheet(workbook, "交叉分析-售后", _cross_rows(overview["cross_analysis"]["region_after"]))
