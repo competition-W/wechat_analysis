@@ -529,6 +529,45 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(item["weekend"]["count"], 1)
         self.assertIn("不包含周末", result["after_hours"])
 
+    def test_multi_aftersaler_group_counts_only_each_owners_messages(self):
+        messages = [
+            {"raw_json": json.dumps({"from": "WuZhihao", "truename": "吴志浩", "msgtime": "2026-07-06 09:00:00"}, ensure_ascii=False)},
+            {"raw_json": json.dumps({"from": "YangJiajun", "truename": "杨嘉俊", "msgtime": "2026-07-06 13:00:00"}, ensure_ascii=False)},
+            {"raw_json": json.dumps({"from": "wmCustomer001", "truename": "吴志浩", "msgtime": "2026-07-06 14:00:00"}, ensure_ascii=False)},
+            {"raw_json": json.dumps({"from": "OtherEmployee", "truename": "其他员工", "msgtime": "2026-07-06 15:00:00"}, ensure_ascii=False)},
+        ]
+
+        counts = db_dashboard._aftersaler_message_counts(
+            ["吴志浩", "杨嘉俊"], messages, group_message_count=99,
+        )
+
+        self.assertEqual(counts, {"吴志浩": 1, "杨嘉俊": 1})
+        self.assertEqual(
+            db_dashboard._aftersaler_message_counts(["吴志浩"], messages, group_message_count=99),
+            {"吴志浩": 99},
+        )
+
+    def test_multi_aftersaler_period_breakdown_uses_personal_speech(self):
+        group_name = "客户多项目群"
+        groups = {
+            group_name: {"dimension": {"aftersalers": ["吴志浩", "杨嘉俊"]}},
+        }
+        chat_rows = {
+            group_name: [
+                {"raw_json": json.dumps({"from": "WuZhihao", "truename": "吴志浩", "msgtime": "2026-07-06 09:00:00"}, ensure_ascii=False)},
+                {"raw_json": json.dumps({"from": "YangJiajun", "truename": "杨嘉俊", "msgtime": "2026-07-06 13:00:00"}, ensure_ascii=False)},
+                {"raw_json": json.dumps({"from": "wmCustomer001", "truename": "客户甲", "msgtime": "2026-07-06 18:00:00"}, ensure_ascii=False)},
+            ],
+        }
+
+        result = db_dashboard._time_period_breakdown(groups, {}, chat_rows)
+        items = {item["aftersaler"]: item for item in result["items"]}
+
+        self.assertEqual(items["吴志浩"]["total"], 1)
+        self.assertEqual(items["吴志浩"]["morning"]["count"], 1)
+        self.assertEqual(items["杨嘉俊"]["total"], 1)
+        self.assertEqual(items["杨嘉俊"]["afternoon"]["count"], 1)
+
     def test_chat_msgtime_prefers_raw_json_msgtime(self):
         row = {
             "msgtime": "2026-07-06 09:00:00",
@@ -997,6 +1036,112 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(diagnostics["unmatched_codes"], ["LC-P404"])
         self.assertEqual(diagnostics["code_to_groups"]["LC-P404"], ["Beta LC-P404"])
         self.assertEqual(diagnostics["groups_without_lims_link"], ["Beta LC-P404"])
+
+
+class DashboardDrilldownTests(unittest.TestCase):
+    def test_drilldown_target_and_measure_are_allowlisted(self):
+        with self.assertRaisesRegex(ValueError, "unsupported drilldown target"):
+            db_dashboard._build_drilldown("raw.sql", "message_count")
+        with self.assertRaisesRegex(ValueError, "unsupported drilldown measure"):
+            db_dashboard._build_drilldown("summary.total_groups", "message_count")
+
+    def test_drilldown_pagination_keeps_reconciliation_total(self):
+        built = {
+            "target": "summary.total_groups", "measure": "group_count",
+            "title": "服务群明细", "level": "group", "definition": "test",
+            "period": {"name": "month", "start": "2026-07-01", "end": "2026-07-31"},
+            "filters": {}, "reconciliation": {"dashboard_value": 45, "detail_value": 45},
+            "columns": [{"key": "group_name", "label": "群聊名称"}],
+            "rows": [{"group_name": f"群{i}"} for i in range(45)],
+        }
+        with patch.object(db_dashboard, "_build_drilldown", return_value=built):
+            result = db_dashboard.get_drilldown(
+                "summary.total_groups", "group_count", page=2, page_size=20,
+            )
+        self.assertEqual(result["total"], 45)
+        self.assertEqual(result["total_pages"], 3)
+        self.assertEqual(len(result["items"]), 20)
+        self.assertEqual(result["items"][0]["group_name"], "群20")
+        self.assertEqual(result["reconciliation"]["detail_value"], 45)
+
+    def test_drilldown_masks_phone_and_wechat_identifiers(self):
+        masked = db_dashboard._mask_drilldown_text("联系 13812345678，账号 wxid_abcdefghijk")
+        self.assertEqual(masked, "联系 138****5678，账号 wxid_abcd***")
+
+    def test_drilldown_excel_contains_scope_and_formula_safe_detail(self):
+        from openpyxl import load_workbook
+
+        built = {
+            "target": "summary.total_groups", "measure": "group_count",
+            "title": "服务群明细", "level": "group", "definition": "一条一群",
+            "period": {"name": "custom", "start": "2026-07-01", "end": "2026-07-02"},
+            "filters": {"region": "华东", "aftersaler": "", "category": "", "key_account": "", "dimension_value": "", "secondary_value": "", "search": ""},
+            "reconciliation": {"dashboard_value": 1, "detail_value": 1, "consistent": True},
+            "columns": [{"key": "group_name", "label": "群聊名称"}],
+            "rows": [{"group_name": "=2+2"}],
+        }
+        with patch.object(db_dashboard, "_build_drilldown", return_value=built):
+            content = db_dashboard.get_drilldown_export_excel(
+                target="summary.total_groups", measure="group_count",
+            )
+        workbook = load_workbook(BytesIO(content), read_only=True)
+        self.assertEqual(workbook.sheetnames, ["导出说明", "明细数据"])
+        self.assertEqual(workbook["明细数据"]["A2"].value, "'=2+2")
+        self.assertEqual(workbook["导出说明"]["B2"].value, "服务群明细")
+
+    def test_drilldown_export_rejects_oversized_result(self):
+        built = {
+            "target": "summary.total_groups", "measure": "group_count",
+            "title": "服务群明细", "level": "group", "definition": "test",
+            "period": {"name": "month", "start": "2026-07-01", "end": "2026-07-31"},
+            "filters": {}, "reconciliation": {}, "columns": [],
+            "rows": [{"group_name": "A"}, {"group_name": "B"}],
+        }
+        with (
+            patch.object(db_dashboard, "_build_drilldown", return_value=built),
+            patch.object(db_dashboard, "DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS", 1),
+        ):
+            with self.assertRaisesRegex(ValueError, "超过单次导出上限"):
+                db_dashboard.get_drilldown_export_excel(
+                    target="summary.total_groups", measure="group_count",
+                )
+
+    def test_drilldown_api_rejects_unknown_target(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        response = TestClient(app).get(
+            "/api/v1/dashboard/drilldown",
+            params={"target": "unknown.target", "measure": "group_count"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("unsupported drilldown target", response.text)
+
+    def test_drilldown_api_returns_preview_and_excel(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        preview = {
+            "title": "服务群明细", "items": [{"group_name": "群A"}],
+            "total": 1, "page": 1, "page_size": 20, "total_pages": 1,
+        }
+        client = TestClient(app)
+        with patch.object(db_dashboard, "get_drilldown", return_value=preview):
+            response = client.get(
+                "/api/v1/dashboard/drilldown",
+                params={"target": "summary.total_groups", "measure": "group_count"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["items"][0]["group_name"], "群A")
+
+        with patch.object(db_dashboard, "get_drilldown_export_excel", return_value=b"xlsx"):
+            response = client.get(
+                "/api/v1/dashboard/drilldown/export",
+                params={"target": "summary.total_groups", "measure": "group_count"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"xlsx")
+        self.assertIn("attachment", response.headers["content-disposition"])
 
 
 class DashboardCacheTests(unittest.TestCase):
