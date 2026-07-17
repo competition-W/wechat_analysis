@@ -1072,6 +1072,193 @@ def _build_top_message_groups(
     }
 
 
+def extract_project_code_year(project_code: Any) -> Optional[int]:
+    """Extract the canonical project year from LC-P/LC-SP project codes."""
+    match = re.match(
+        r"^LC-(?:SP|P)((?:19|20)\d{2})",
+        str(project_code or "").strip().upper(),
+    )
+    return int(match.group(1)) if match else None
+
+
+def parse_lims_start_date(value: Any) -> Optional[date]:
+    """Normalize a LIMS startTime value for deterministic year fallback."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    match = re.search(
+        r"((?:19|20)\d{2})\D{0,2}(\d{1,2})?\D{0,2}(\d{1,2})?",
+        text,
+    )
+    if not match:
+        return None
+    try:
+        return date(
+            int(match.group(1)), int(match.group(2) or 1), int(match.group(3) or 1),
+        )
+    except ValueError:
+        return None
+
+
+def _build_project_year_distribution(
+    groups: Dict[str, dict], current_year: Optional[int] = None,
+) -> dict:
+    """Aggregate unique scoped projects by canonical project year."""
+    as_of_year = int(current_year or date.today().year)
+    projects_by_code: Dict[str, dict] = {}
+
+    for group_name, group in groups.items():
+        dimension = group.get("dimension") or {}
+        records = dimension.get("projects") or []
+        records_by_code: Dict[str, List[dict]] = defaultdict(list)
+        for project in records:
+            code = str(project.get("project_code") or "").strip().upper()
+            if code:
+                records_by_code[code].append(project)
+
+        project_codes = {
+            str(code).strip().upper()
+            for code in dimension.get("codes") or []
+            if str(code).strip()
+        }
+        project_codes.update(records_by_code)
+        if not project_codes:
+            project_codes.update(extract_project_codes(group_name))
+
+        for code in project_codes:
+            aggregate = projects_by_code.setdefault(code, {
+                "project_code": code,
+                "project_names": set(),
+                "customer_names": set(),
+                "work_units": set(),
+                "product_categories": set(),
+                "regions": set(),
+                "aftersalers": set(),
+                "group_names": set(),
+                "start_dates": set(),
+            })
+            aggregate["group_names"].add(group_name)
+            code_records = records_by_code.get(code, [])
+            for project in code_records:
+                for source_key, target_key in (
+                    ("product_name", "project_names"),
+                    ("customer_name", "customer_names"),
+                    ("work_unit", "work_units"),
+                    ("region", "regions"),
+                ):
+                    value = str(project.get(source_key) or "").strip()
+                    if value:
+                        aggregate[target_key].add(value)
+                category = " / ".join(filter(None, (
+                    str(project.get("category_l2") or "").strip(),
+                    str(project.get("category_l3") or "").strip(),
+                )))
+                if category:
+                    aggregate["product_categories"].add(category)
+                aftersaler_name = str(
+                    project.get("final_aftersaler")
+                    or project.get("raw_aftersaler") or ""
+                ).strip()
+                if aftersaler_name:
+                    aggregate["aftersalers"].add(aftersaler_name)
+                start_date = parse_lims_start_date(project.get("start_time"))
+                if start_date:
+                    aggregate["start_dates"].add(start_date)
+            if not code_records:
+                aggregate["aftersalers"].update({
+                    str(value).strip()
+                    for value in dimension.get("aftersalers") or []
+                    if str(value).strip()
+                })
+
+    projects: List[dict] = []
+    for code, aggregate in projects_by_code.items():
+        start_date = min(aggregate["start_dates"], default=None)
+        year = extract_project_code_year(code)
+        if year is not None:
+            year_source = "project_code"
+        elif start_date is not None:
+            year = start_date.year
+            year_source = "lims_start_time"
+        else:
+            year_source = "unknown"
+        projects.append({
+            "project_code": code,
+            "year": year,
+            "year_source": year_source,
+            "start_time": start_date.isoformat() if start_date else "",
+            "project_names": sorted(aggregate["project_names"]),
+            "customer_names": sorted(aggregate["customer_names"]),
+            "work_units": sorted(aggregate["work_units"]),
+            "product_categories": sorted(aggregate["product_categories"]),
+            "regions": sorted(aggregate["regions"]),
+            "aftersalers": sorted(aggregate["aftersalers"]),
+            "group_count": len(aggregate["group_names"]),
+            "group_names": sorted(aggregate["group_names"]),
+        })
+
+    projects.sort(key=lambda item: item["project_code"])
+    grouped: Dict[Optional[int], List[dict]] = defaultdict(list)
+    for project in projects:
+        grouped[project["year"]].append(project)
+
+    total_projects = len(projects)
+    items = []
+    ordered_years = sorted(
+        (year for year in grouped if year is not None), reverse=True,
+    )
+    if None in grouped:
+        ordered_years.append(None)
+    for year in ordered_years:
+        year_projects = grouped[year]
+        if year == as_of_year:
+            label = f"今年（{year}）"
+        elif year == as_of_year - 1:
+            label = f"去年（{year}）"
+        elif year is None:
+            label = "未识别"
+        else:
+            label = f"{year}年"
+        group_names = {
+            group_name
+            for project in year_projects
+            for group_name in project["group_names"]
+        }
+        items.append({
+            "year": year,
+            "label": label,
+            "project_count": len(year_projects),
+            "percentage": _ratio(len(year_projects), total_projects),
+            "group_count": len(group_names),
+            "projects": year_projects,
+        })
+
+    recognized_projects = sum(1 for project in projects if project["year"] is not None)
+    return {
+        "current_year": as_of_year,
+        "total_projects": total_projects,
+        "recognized_projects": recognized_projects,
+        "unknown_projects": total_projects - recognized_projects,
+        "coverage_percentage": _ratio(recognized_projects, total_projects),
+        "current_year_projects": sum(1 for project in projects if project["year"] == as_of_year),
+        "previous_year_projects": sum(1 for project in projects if project["year"] == as_of_year - 1),
+        "older_projects": sum(
+            1 for project in projects
+            if project["year"] is not None and project["year"] < as_of_year - 1
+        ),
+        "source_priority": ["project_code", "lims_start_time"],
+        "items": items,
+    }
+
+
 def _ratio(value: int, total: int) -> float:
     return round(value / total * 100, 1) if total else 0.0
 
@@ -1509,6 +1696,7 @@ def _build_overview(
         })
     account_items.sort(key=lambda value: (-value["group_count"], -value["project_count"], value["key_account"]))
     top_message_groups = _build_top_message_groups(groups, total_messages)
+    project_year_distribution = _build_project_year_distribution(groups)
     attention_items = []
     status_order = {status: index for index, status in enumerate(PROJECT_ATTENTION_STATUSES)}
     for value in attention_projects.values():
@@ -1629,6 +1817,7 @@ def _build_overview(
             ],
             "product_hierarchy": product_hierarchy,
             "key_accounts": account_items,
+            "project_year_distribution": project_year_distribution,
         },
         "project_attention": {
             "target_statuses": list(PROJECT_ATTENTION_STATUSES),
@@ -3063,6 +3252,41 @@ def _top_message_group_export_rows(data: dict) -> List[dict]:
     ]
 
 
+def _project_year_distribution_export_rows(data: dict) -> List[dict]:
+    return [
+        {
+            "年份": item.get("year") if item.get("year") is not None else "未识别",
+            "年份标签": item.get("label"),
+            "项目数": item.get("project_count"),
+            "项目占比(%)": item.get("percentage"),
+            "关联群聊数": item.get("group_count"),
+        }
+        for item in data.get("items") or []
+    ]
+
+
+def _project_year_detail_export_rows(data: dict) -> List[dict]:
+    rows = []
+    for item in data.get("items") or []:
+        for project in item.get("projects") or []:
+            rows.append({
+                "年份": project.get("year") if project.get("year") is not None else "未识别",
+                "年份标签": item.get("label"),
+                "项目号": project.get("project_code"),
+                "年份来源": project.get("year_source"),
+                "LIMS开始时间": project.get("start_time"),
+                "项目或产品": "、".join(project.get("project_names") or []),
+                "客户名称": "、".join(project.get("customer_names") or []),
+                "客户单位": "、".join(project.get("work_units") or []),
+                "产品分类": "、".join(project.get("product_categories") or []),
+                "销售区域": "、".join(project.get("regions") or []),
+                "售后人员": "、".join(project.get("aftersalers") or []),
+                "关联群聊数": project.get("group_count"),
+                "群聊名称": "、".join(project.get("group_names") or []),
+            })
+    return rows
+
+
 def get_export_excel(
     period: str = "month",
     start_date: Optional[str] = None,
@@ -3149,6 +3373,15 @@ def get_export_excel(
     _write_excel_sheet(workbook, "售后人员分布", overview["business"]["aftersalers"])
     _write_excel_sheet(workbook, "产品分类", overview["business"]["product_categories"])
     _write_excel_sheet(workbook, "重点客户", overview["business"]["key_accounts"])
+    project_year_data = overview["business"].get("project_year_distribution") or {}
+    _write_excel_sheet(
+        workbook, "项目年份分布",
+        _project_year_distribution_export_rows(project_year_data),
+    )
+    _write_excel_sheet(
+        workbook, "项目年份明细",
+        _project_year_detail_export_rows(project_year_data),
+    )
     _write_excel_sheet(
         workbook,
         "消息Top5群聊",
