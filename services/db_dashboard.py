@@ -23,6 +23,9 @@ CACHE_TTL_SECONDS = 300
 EVIDENCE_CACHE_TTL_SECONDS = 120
 LIMS_CACHE_TTL_SECONDS = 1800
 LIMS_REQUEST_BUDGET_SECONDS = 10.0
+DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS = max(
+    1, int(os.getenv("DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS", "100000"))
+)
 LIMS_CACHE_FILE = Path(os.getenv("DASHBOARD_LIMS_CACHE_FILE", "logs/dashboard_lims_cache.json"))
 PROJECT_CODE_RE = re.compile(r"LC-(?:SP|P)\d+(?![A-Z0-9])", re.IGNORECASE)
 ALLOWED_PRODUCT_L2 = {"常规转录组", "表观组学", "微生物"}
@@ -38,6 +41,43 @@ _lims_stale: Dict[str, List[dict]] = {}
 _lims_cache_lock = threading.Lock()
 _lims_refresh_lock = threading.Lock()
 _lims_cache_loaded = False
+
+
+DRILLDOWN_TARGETS = {
+    "summary.total_groups": {"title": "服务群明细", "level": "group", "measures": {"group_count"}},
+    "summary.total_messages": {"title": "沟通消息明细", "level": "message", "measures": {"message_count"}},
+    "summary.project_groups": {"title": "项目群明细", "level": "group", "measures": {"group_count"}},
+    "summary.regions": {"title": "销售区域明细", "level": "dimension", "measures": {"dimension_count"}},
+    "summary.aftersalers": {"title": "售后人员明细", "level": "dimension", "measures": {"dimension_count"}},
+    "summary.product_categories": {"title": "产品类别明细", "level": "dimension", "measures": {"dimension_count"}},
+    "summary.key_accounts": {"title": "重点客户明细", "level": "dimension", "measures": {"dimension_count"}},
+    "communication.daily": {"title": "每日趋势明细", "level": "auto", "measures": {"message_count", "group_count", "missed_count"}},
+    "communication.period": {"title": "时段消息明细", "level": "message", "measures": {"morning", "afternoon", "after_hours", "weekend", "total"}},
+    "communication.top_group": {"title": "高消息量群聊明细", "level": "message", "measures": {"message_count"}},
+    "communication.active_duration": {"title": "群活跃周期明细", "level": "group", "measures": {"group_count"}},
+    "communication.highfreq": {"title": "高频主题证据", "level": "message", "measures": {"occurrence_count"}},
+    "business.region": {"title": "销售区域下钻", "level": "auto", "measures": {"group_count", "message_count"}},
+    "business.aftersaler": {"title": "售后人员下钻", "level": "auto", "measures": {"project_count", "group_count", "message_count"}},
+    "business.product": {"title": "产品分类下钻", "level": "auto", "measures": {"project_count", "group_count", "message_count"}},
+    "business.key_account": {"title": "重点客户下钻", "level": "auto", "measures": {"project_count", "group_count", "message_count"}},
+    "business.project_year": {"title": "项目年份明细", "level": "project", "measures": {"project_count"}},
+    "business.project_attention": {"title": "异常交付项目明细", "level": "auto", "measures": {"project_count", "group_count", "message_count"}},
+    "cross.region_sales": {"title": "区域销售结构明细", "level": "auto", "measures": {"group_count", "message_count"}},
+    "cross.region_after": {"title": "区域售后结构明细", "level": "auto", "measures": {"group_count", "message_count"}},
+    "cross.region_product": {"title": "区域产品结构明细", "level": "auto", "measures": {"group_count", "message_count"}},
+    "service.unanswered": {"title": "待回复消息明细", "level": "message", "measures": {"missed_count"}},
+    "service.answered": {"title": "已响应或无待回复群聊", "level": "group", "measures": {"group_count"}},
+    "service.customer_positive": {"title": "客户好评分析明细", "level": "analysis", "measures": {"analysis_count"}},
+    "service.customer_negative": {"title": "客户负向证据", "level": "message", "measures": {"analysis_count"}},
+    "service.employee_positive": {"title": "积极服务分析明细", "level": "analysis", "measures": {"analysis_count"}},
+    "service.employee_negative": {"title": "服务负向证据", "level": "message", "measures": {"analysis_count"}},
+    "quality.groups_without_project_code": {"title": "未提取项目号群", "level": "group", "measures": {"group_count"}},
+    "quality.unmatched_project_codes": {"title": "LIMS 未返回项目号", "level": "project_code", "measures": {"project_count"}},
+    "quality.groups_without_lims_link": {"title": "完全无 LIMS 关联群", "level": "group", "measures": {"group_count"}},
+    "quality.mapping_fallback_records": {"title": "售后映射回退明细", "level": "project", "measures": {"project_count"}},
+    "quality.mapping_conflict_records": {"title": "售后映射冲突明细", "level": "project", "measures": {"project_count"}},
+    "quality.duplicate_rows_removed": {"title": "被去重分析记录", "level": "analysis", "measures": {"analysis_count"}},
+}
 
 
 @contextmanager
@@ -1361,9 +1401,70 @@ def _scope_dimension(
     return scoped
 
 
+def _normalize_person_identity(value: Any) -> str:
+    """Normalize a display name for matching a LIMS owner to a chat sender."""
+    import unicodedata
+
+    return re.sub(r"[\s\u3000]+", "", unicodedata.normalize("NFKC", str(value or "")).casefold())
+
+
+def _sender_matches_aftersaler(message: dict, aftersaler: str) -> bool:
+    """Only attribute a message when it is clearly authored by that employee."""
+    sender_role = str(message.get("sender_role") or chat_sender_role(message) or "")
+    if sender_role not in {"员工", "售后", "销售"}:
+        return False
+    sender = _normalize_person_identity(message.get("sender_name") or chat_sender(message))
+    owner = _normalize_person_identity(aftersaler)
+    if not sender or not owner:
+        return False
+    if sender == owner:
+        return True
+    # Some enterprise address books append a phone number or a role in brackets
+    # to the real name. Keep this narrow so similarly named people never share
+    # one message.
+    suffix = sender[len(owner):] if sender.startswith(owner) else ""
+    return bool(
+        suffix
+        and (
+            re.fullmatch(r"1\d{10}", suffix)
+            or re.fullmatch(r"[（(][^()（）]{1,20}[)）]", suffix)
+        )
+    )
+
+
+def _aftersaler_message_rows(aftersalers: Iterable[str], messages: Iterable[dict]) -> Dict[str, List[dict]]:
+    """Apply the group/personal hybrid attribution required by the dashboard.
+
+    A group with one final owner keeps the historical group-volume definition.
+    A group with multiple final owners attributes only each owner's own messages.
+    """
+    people = sorted({str(person or "").strip() for person in aftersalers if str(person or "").strip()})
+    rows = list(messages or [])
+    if not people:
+        return {}
+    if len(people) == 1:
+        return {people[0]: rows}
+    attributed = {person: [] for person in people}
+    for message in rows:
+        matches = [person for person in people if _sender_matches_aftersaler(message, person)]
+        if len(matches) == 1:
+            attributed[matches[0]].append(message)
+    return attributed
+
+
+def _aftersaler_message_counts(
+    aftersalers: Iterable[str], messages: Iterable[dict], group_message_count: int,
+) -> Dict[str, int]:
+    """Return the exact message count shown for each final after-saler."""
+    attributed = _aftersaler_message_rows(aftersalers, messages)
+    if len(attributed) <= 1:
+        return {person: max(0, int(group_message_count or 0)) for person in attributed}
+    return {person: len(rows) for person, rows in attributed.items()}
+
+
 
 def _time_period_breakdown(groups, dimensions, chat_rows_by_group: Optional[Dict[str, List[dict]]] = None):
-    """按售后员统计真实消息时间所在时段的消息数量和群聊数量。"""
+    """按最终售后统计群消息；多售后群仅统计各售后本人的发言。"""
     aftersaler_stats = {}
     chat_rows_by_group = chat_rows_by_group or {}
     for group_name, item in groups.items():
@@ -1372,24 +1473,25 @@ def _time_period_breakdown(groups, dimensions, chat_rows_by_group: Optional[Dict
         messages = chat_rows_by_group.get(group_name, [])
         if not messages:
             continue
-        buckets = {"morning": 0, "afternoon": 0, "after_hours": 0, "weekend": 0}
-        for message in messages:
-            msg_time = chat_msgtime(message)
-            if not msg_time:
+        attributed_rows = _aftersaler_message_rows(aftersalers, messages)
+        for person, person_messages in attributed_rows.items():
+            buckets = {"morning": 0, "afternoon": 0, "after_hours": 0, "weekend": 0}
+            for message in person_messages:
+                msg_time = chat_msgtime(message)
+                if not msg_time:
+                    continue
+                minutes = msg_time.hour * 60 + msg_time.minute
+                if msg_time.weekday() >= 5:
+                    buckets["weekend"] += 1
+                elif 8 * 60 + 30 <= minutes < 12 * 60:
+                    buckets["morning"] += 1
+                elif 12 * 60 <= minutes < 17 * 60 + 30:
+                    buckets["afternoon"] += 1
+                else:
+                    buckets["after_hours"] += 1
+            total_msgs = sum(buckets.values())
+            if total_msgs == 0:
                 continue
-            minutes = msg_time.hour * 60 + msg_time.minute
-            if msg_time.weekday() >= 5:
-                buckets["weekend"] += 1
-            elif 8 * 60 + 30 <= minutes < 12 * 60:
-                buckets["morning"] += 1
-            elif 12 * 60 <= minutes < 17 * 60 + 30:
-                buckets["afternoon"] += 1
-            else:
-                buckets["after_hours"] += 1
-        total_msgs = sum(buckets.values())
-        if total_msgs == 0:
-            continue
-        for person in aftersalers:
             s = aftersaler_stats.setdefault(person, {
                 "aftersaler": person, "groups": set(),
                 "morning": 0, "afternoon": 0, "after_hours": 0, "weekend": 0,
@@ -1560,9 +1662,15 @@ def _build_overview(
             for project in dim.get("projects", [])
             if project.get("project_code")
         }
+        group_aftersalers = dim.get("aftersalers", [])
+        attributed_message_counts = _aftersaler_message_counts(
+            group_aftersalers,
+            chat_rows_by_group.get(group_name, []),
+            item["messages"],
+        )
         for person in dim.get("aftersalers", []):
             aftersalers[person] += 1
-            aftersaler_messages[person] += item["messages"]
+            aftersaler_messages[person] += attributed_message_counts.get(person, 0)
             aftersaler_projects[person].update(project_codes_for_group)
         for person in dim.get("tentative_aftersalers", []):
             tentative_aftersalers[person] += 1
@@ -1791,6 +1899,7 @@ def _build_overview(
             "top_message_groups": top_message_groups,
         },
         "business": {
+            "aftersaler_message_definition": "单一最终售后群统计群内全部消息；多最终售后群仅统计各售后本人发送的消息。",
             "aftersalers": [
                 {
                     "name": name,
@@ -3092,6 +3201,693 @@ def _project_code_set(rows: List[dict], *columns: str) -> set:
             if value:
                 values.add(str(value).upper())
     return values
+
+
+_DRILLDOWN_COLUMN_LABELS = {
+    "name": "名称", "region": "销售区域", "aftersaler": "售后人员",
+    "category": "产品分类", "key_account": "重点客户", "work_unit": "客户单位",
+    "customer_name": "客户名称", "group_name": "群聊名称", "group_count": "群聊数",
+    "project_count": "项目数", "message_count": "消息数", "project_code": "项目号",
+    "project_codes": "项目号", "project_name": "项目/产品", "product_name": "项目/产品",
+    "category_l2": "产品二级分类", "category_l3": "产品三级分类",
+    "sales_person": "销售员", "aftersalers": "售后人员", "regions": "销售区域",
+    "key_accounts": "重点客户", "active_day": "活跃天数", "active_days": "活跃天数",
+    "analysis_time": "分析时间", "analysis_date": "分析日期", "analysis_id": "分析记录ID",
+    "msgtime": "消息时间", "sender_name": "发送人", "sender_role": "发送者角色",
+    "content": "消息内容", "status": "项目状态", "start_time": "开始时间",
+    "end_time": "结束时间", "year": "项目年份", "year_source": "年份来源",
+    "source": "数据来源", "mapping_source": "售后确定来源", "raw_aftersaler": "LIMS 原售后",
+    "mapping_conflict": "映射冲突",
+    "final_aftersaler": "最终售后", "days": "统计天数", "missed_days": "待回复分析天数",
+    "high_frequency_top5": "高频主题 Top5", "metric_value": "指标值",
+}
+
+
+def _mask_drilldown_text(value: Any) -> str:
+    """Mask contact details before a message reaches preview or Excel."""
+    text = str(value or "")
+    text = re.sub(r"(?<!\d)(1\d{2})\d{4}(\d{4})(?!\d)", r"\1****\2", text)
+    text = re.sub(
+        r"(?i)\b(wxid_[a-z0-9_-]{4})[a-z0-9_-]+\b",
+        lambda match: match.group(1) + "***",
+        text,
+    )
+    return text
+
+
+def _joined(values: Iterable[Any]) -> str:
+    return "、".join(sorted({str(value).strip() for value in values if str(value or "").strip()}))
+
+
+def _dimension_project_values(dimension: dict, key: str) -> set[str]:
+    return {
+        str(project.get(key) or "").strip()
+        for project in dimension.get("projects", [])
+        if str(project.get(key) or "").strip()
+    }
+
+
+def _drilldown_group_rows(scope: dict, groups: Dict[str, dict]) -> List[dict]:
+    result = []
+    for group_name in scope.get("group_names", []):
+        dimension = scope.get("dimensions", {}).get(group_name, {})
+        aggregate = groups.get(group_name, {})
+        projects = dimension.get("projects", [])
+        analysis_times = [
+            str(row.get("CREATEDTIME") or "")[:19].replace("T", " ")
+            for row in aggregate.get("rows", [])
+            if row.get("CREATEDTIME")
+        ]
+        result.append({
+            "group_name": group_name,
+            "project_codes": _joined(dimension.get("codes", [])),
+            "project_count": len({p.get("project_code") for p in projects if p.get("project_code")}),
+            "regions": _joined(dimension.get("regions", [])),
+            "aftersalers": _joined(dimension.get("aftersalers", [])),
+            "category_l2": _joined(p.get("category_l2") for p in projects),
+            "key_accounts": _joined(p.get("key_account") for p in projects),
+            "message_count": int(aggregate.get("messages") or 0),
+            "days": len(aggregate.get("dates", set())),
+            "missed_days": int(aggregate.get("missed_days") or 0),
+            "analysis_time": max(analysis_times, default=""),
+            "source": "qx_analysis_result + qx_group + LIMS",
+        })
+    return result
+
+
+def _drilldown_project_rows(scope: dict, groups: Dict[str, dict]) -> List[dict]:
+    projects: Dict[str, dict] = {}
+    for group_name, dimension in scope.get("dimensions", {}).items():
+        aggregate = groups.get(group_name, {})
+        for index, project in enumerate(dimension.get("projects", [])):
+            code = str(project.get("project_code") or "").strip().upper()
+            identity = code or f"{group_name}:{index}:{project.get('product_name') or ''}"
+            item = projects.setdefault(identity, {
+                "project_code": code,
+                "project_name": project.get("product_name") or "",
+                "customer_name": project.get("customer_name") or "",
+                "work_unit": project.get("work_unit") or "",
+                "category_l2": project.get("category_l2") or "",
+                "category_l3": project.get("category_l3") or "",
+                "region": project.get("region") or "",
+                "sales_person": project.get("sales_person") or "",
+                "raw_aftersaler": project.get("raw_aftersaler") or "",
+                "final_aftersaler": project.get("final_aftersaler") or project.get("raw_aftersaler") or "",
+                "mapping_source": project.get("aftersaler_source") or "",
+                "mapping_conflict": bool(project.get("mapping_conflict")),
+                "key_account": project.get("key_account") or "",
+                "status": project.get("analysis_simple_remark") or "",
+                "active_day": project.get("active_day"),
+                "start_time": project.get("start_time") or "",
+                "end_time": project.get("end_time") or "",
+                "group_names": set(),
+                "message_count": 0,
+                "source": "LIMS base_data API",
+            })
+            if group_name not in item["group_names"]:
+                item["group_names"].add(group_name)
+                item["message_count"] += int(aggregate.get("messages") or 0)
+    result = []
+    for item in projects.values():
+        row = dict(item)
+        row["group_count"] = len(item["group_names"])
+        row["group_name"] = _joined(item["group_names"])
+        row.pop("group_names", None)
+        result.append(row)
+    return sorted(result, key=lambda row: (row.get("project_code") or "", row.get("project_name") or ""))
+
+
+def _drilldown_message_rows(scope: dict) -> List[dict]:
+    grouped = _raw_messages_by_group(scope.get("group_rows", []), scope.get("chat_rows", []))
+    dimensions = scope.get("dimensions", {})
+    result = []
+    for group_name, messages in grouped.items():
+        dimension = dimensions.get(group_name, {})
+        projects = dimension.get("projects", [])
+        for message in messages:
+            result.append({
+                "msgtime": message.get("msgtime") or "",
+                "group_name": group_name,
+                "sender_name": _mask_drilldown_text(message.get("sender_name") or "未知发送人"),
+                "sender_role": message.get("sender_role") or "未知",
+                "content": _mask_drilldown_text(message.get("content") or ""),
+                "project_codes": _joined(dimension.get("codes", [])),
+                "regions": _joined(dimension.get("regions", [])),
+                "aftersalers": _joined(dimension.get("aftersalers", [])),
+                "category_l2": _joined(p.get("category_l2") for p in projects),
+                "key_accounts": _joined(p.get("key_account") for p in projects),
+                "source": "qx_chat",
+            })
+    return sorted(result, key=lambda row: (row.get("msgtime") or "", row.get("group_name") or ""), reverse=True)
+
+
+def _drilldown_analysis_rows(scope: dict) -> List[dict]:
+    dimensions = scope.get("dimensions", {})
+    result = []
+    for row in scope.get("raw_rows", []):
+        group_name = row.get("groupName") or ""
+        dimension = dimensions.get(group_name, {})
+        result.append({
+            "analysis_id": row.get("id"),
+            "analysis_time": str(row.get("CREATEDTIME") or "")[:19].replace("T", " "),
+            "group_name": group_name,
+            "message_count": int(row.get("messageToDayCount") or 0),
+            "project_codes": _joined(dimension.get("codes", [])),
+            "regions": _joined(dimension.get("regions", [])),
+            "aftersalers": _joined(dimension.get("aftersalers", [])),
+            "customer_emotion": row.get("customerEmotionAnalysis") or "",
+            "employee_emotion": row.get("saleEmotionAnalysis") or "",
+            "high_frequency_top5": row.get("highFrequencyWords") or "",
+            "source": "qx_analysis_result",
+            "_raw": row,
+        })
+    return result
+
+
+def _duration_bucket(value: Optional[float]) -> str:
+    if value is None:
+        return "未返回"
+    if value <= 7:
+        return "≤7天"
+    if value <= 30:
+        return "8-30天"
+    if value <= 90:
+        return "1-3个月"
+    if value <= 180:
+        return "3-6个月"
+    if value <= 365:
+        return "6-12个月"
+    return ">12个月"
+
+
+def _message_in_period_bucket(row: dict, bucket: str) -> bool:
+    msg_time = parse_msg_datetime(row.get("msgtime"))
+    if not msg_time:
+        return False
+    minutes = msg_time.hour * 60 + msg_time.minute
+    if bucket == "weekend":
+        return msg_time.weekday() >= 5
+    if msg_time.weekday() >= 5:
+        return False
+    if bucket == "morning":
+        return 8 * 60 + 30 <= minutes < 12 * 60
+    if bucket == "afternoon":
+        return 12 * 60 <= minutes < 17 * 60 + 30
+    if bucket == "after_hours":
+        return minutes < 8 * 60 + 30 or minutes >= 17 * 60 + 30
+    return bucket == "total"
+
+
+def _evidence_drilldown_rows(data: dict) -> List[dict]:
+    rows = []
+    for item in data.get("items", []):
+        base = {
+            "group_name": item.get("group_name") or "",
+            "analysis_time": item.get("analysis_time") or item.get("analysis_date") or "",
+            "project_codes": _joined(item.get("project_codes", [])),
+            "aftersalers": _joined(item.get("aftersalers", [])),
+            "source": "qx_analysis_result + qx_chat",
+        }
+        messages = item.get("messages") or []
+        if messages:
+            for message in messages:
+                rows.append({
+                    "msgtime": message.get("msgtime") or "",
+                    **base,
+                    "sender_name": _mask_drilldown_text(message.get("sender_name") or "未知发送人"),
+                    "sender_role": message.get("sender_role") or "未知",
+                    "content": _mask_drilldown_text(message.get("content") or ""),
+                })
+        else:
+            rows.append({**base, "content": _mask_drilldown_text(item.get("content") or "")})
+    return rows
+
+
+def _group_matches_drilldown(
+    target: str, dimension: dict, dimension_value: str, secondary_value: str,
+) -> bool:
+    projects = dimension.get("projects", [])
+    if target == "business.region":
+        return dimension_value in dimension.get("regions", [])
+    if target == "business.aftersaler":
+        return dimension_value in dimension.get("aftersalers", [])
+    if target == "business.product":
+        return any(project.get("category_l2") == dimension_value for project in projects)
+    if target == "business.key_account":
+        return any(project.get("key_account") == dimension_value for project in projects)
+    if target == "business.project_attention":
+        return any(
+            project.get("analysis_simple_remark") == dimension_value
+            and (not secondary_value or project.get("project_code") == secondary_value)
+            for project in projects
+        )
+    if target.startswith("cross."):
+        for project in projects:
+            if project.get("region") != dimension_value:
+                continue
+            if not secondary_value:
+                return True
+            if target == "cross.region_sales" and project.get("sales_person") == secondary_value:
+                return True
+            if target == "cross.region_product" and project.get("category_l2") == secondary_value:
+                return True
+        if target == "cross.region_after":
+            return dimension_value in dimension.get("regions", []) and secondary_value in dimension.get("aftersalers", [])
+        return False
+    return True
+
+
+def _expected_drilldown_value(
+    overview: dict, target: str, measure: str, dimension_value: str, secondary_value: str,
+) -> Optional[int]:
+    summary_map = {
+        "summary.total_groups": "total_groups", "summary.total_messages": "total_messages",
+        "summary.project_groups": "project_groups", "summary.regions": "regions",
+        "summary.aftersalers": "aftersaler_count", "summary.product_categories": "product_categories",
+        "summary.key_accounts": "key_accounts",
+    }
+    if target in summary_map:
+        return int(overview.get("summary", {}).get(summary_map[target]) or 0)
+    if target == "communication.daily":
+        key = {"message_count": "messages", "group_count": "groups", "missed_count": "missed"}[measure]
+        item = next((row for row in overview["communication"]["trend"] if row.get("date") == dimension_value), {})
+        return int(item.get(key) or 0)
+    if target == "communication.period":
+        item = next((row for row in overview["communication"]["time_period_breakdown"].get("items", []) if row.get("aftersaler") == dimension_value), {})
+        value = item.get(measure, 0)
+        return int(value.get("count") if isinstance(value, dict) else value or 0)
+    if target == "communication.top_group":
+        item = next((row for row in overview["communication"]["top_message_groups"].get("items", []) if row.get("group_name") == dimension_value), {})
+        return int(item.get("message_count") or 0)
+    if target == "communication.active_duration":
+        item = next((row for row in overview["communication"]["active_duration"] if row.get("range") == dimension_value), {})
+        return int(item.get("count") or 0)
+    if target == "communication.highfreq":
+        item = next((row for row in overview["communication"]["high_frequency"] if row.get("word") == dimension_value), {})
+        return int(item.get("count") or 0)
+    business_key = {
+        "business.region": ("regions", "region"), "business.aftersaler": ("aftersalers", "name"),
+        "business.product": ("product_categories", "category"),
+        "business.key_account": ("key_accounts", "key_account"),
+    }.get(target)
+    if business_key:
+        collection, identity = business_key
+        item = next((row for row in overview["business"].get(collection, []) if str(row.get(identity) or "") == dimension_value), {})
+        return int(item.get(measure) or item.get("count") or 0)
+    if target == "business.project_year":
+        item = next((row for row in overview["business"].get("project_year_distribution", {}).get("items", []) if str(row.get("year") if row.get("year") is not None else "unknown") == dimension_value), {})
+        return int(item.get("project_count") or 0)
+    if target == "business.project_attention":
+        items = overview.get("project_attention", {}).get("items", [])
+        if secondary_value:
+            item = next((row for row in items if row.get("project_code") == secondary_value), {})
+            return int(item.get(measure) or (1 if measure == "project_count" and item else 0))
+        summary = next((row for row in overview.get("project_attention", {}).get("summary", []) if row.get("status") == dimension_value), {})
+        return int(summary.get(measure) or 0)
+    if target.startswith("cross."):
+        key = target.split(".", 1)[1]
+        item = next((row for row in overview.get("cross_analysis", {}).get(key, []) if row.get("region") == dimension_value), {})
+        if secondary_value and measure == "group_count":
+            subkey = "category" if target == "cross.region_product" else "name"
+            detail = next((row for row in item.get("items", []) if row.get(subkey) == secondary_value), {})
+            return int(detail.get("count") or 0)
+        return int(item.get(measure) or 0)
+    service_map = {
+        "service.unanswered": ("unanswered", "missed_groups"),
+        "service.answered": ("unanswered", "answered_groups"),
+        "service.customer_positive": ("sentiment", "customer_good"),
+        "service.customer_negative": ("sentiment", "customer_bad"),
+        "service.employee_positive": ("sentiment", "employee_positive"),
+        "service.employee_negative": ("sentiment", "employee_negative"),
+    }
+    if target in service_map:
+        section, key = service_map[target]
+        return int(overview.get("service_quality", {}).get(section, {}).get(key) or 0)
+    if target.startswith("quality."):
+        return int(overview.get("data_quality", {}).get(target.split(".", 1)[1]) or 0)
+    return None
+
+
+def _drilldown_columns(rows: List[dict]) -> List[dict]:
+    preferred = [
+        "msgtime", "analysis_time", "group_name", "project_code", "project_codes",
+        "project_name", "customer_name", "work_unit", "region", "regions", "sales_person",
+        "aftersaler", "aftersalers", "raw_aftersaler", "final_aftersaler", "mapping_source",
+        "category_l2", "category_l3", "key_account", "key_accounts", "status", "sender_name",
+        "sender_role", "content", "project_count", "group_count", "message_count", "active_day",
+        "days", "missed_days", "start_time", "end_time", "year", "year_source", "source",
+    ]
+    available = {key for row in rows for key in row if not key.startswith("_")}
+    ordered = [key for key in preferred if key in available]
+    ordered.extend(sorted(available - set(ordered)))
+    return [{"key": key, "label": _DRILLDOWN_COLUMN_LABELS.get(key, key)} for key in ordered]
+
+
+def _drilldown_definition(target: str, level: str, measure: str) -> str:
+    units = {
+        "group": "一条明细代表一个去重后的群聊。",
+        "message": "一条明细代表一条 qx_chat 原始消息，正文中的手机号和用户标识已脱敏。",
+        "project": "一条明细代表一个唯一项目号；无项目号记录按群聊和产品区分。",
+        "analysis": "一条明细代表一条 qx_analysis_result 分析记录。",
+        "dimension": "一条明细代表一个去重后的业务维度值。",
+        "project_code": "一条明细代表一个从群名提取但未被 LIMS 返回的项目号。",
+    }
+    note = units.get(level, "一条明细代表当前指标的一条核对记录。")
+    if measure == "message_count":
+        note += " 看板消息数来自分析汇总，明细核对值来自原始消息，差异会原样显示。"
+    if target == "communication.highfreq":
+        note += " 看板值是词频累计，明细核对值是涉及的证据记录数，两者统计单位不同。"
+    return note
+
+
+def _build_drilldown(
+    target: str,
+    measure: str,
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    dimension_value: str = "",
+    secondary_value: str = "",
+    search: str = "",
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> dict:
+    spec = DRILLDOWN_TARGETS.get(target)
+    if not spec:
+        raise ValueError("unsupported drilldown target")
+    if measure not in spec["measures"]:
+        raise ValueError("unsupported drilldown measure for target")
+    start, end, normalized_period = resolve_period(period, start_date, end_date)
+    overview = get_overview(
+        period=period, start_date=start_date, end_date=end_date,
+        region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+    )
+
+    evidence_metric = {
+        "service.unanswered": "unanswered", "service.customer_negative": "customer_negative",
+        "service.employee_negative": "employee_negative", "communication.highfreq": "highfreq",
+    }.get(target)
+    if target == "communication.daily" and measure == "missed_count":
+        evidence_metric = "unanswered"
+    if evidence_metric:
+        evidence_start = dimension_value if target == "communication.daily" else start.isoformat()
+        evidence_end = dimension_value if target == "communication.daily" else end.isoformat()
+        evidence = _build_evidence(
+            metric=evidence_metric, period="custom", start_date=evidence_start, end_date=evidence_end,
+            keyword=dimension_value if target == "communication.highfreq" else None,
+            region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+            page=1, page_size=DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS + 1,
+        )
+        rows = _evidence_drilldown_rows(evidence)
+        level = "message"
+    else:
+        with database("dashboard.drilldown") as conn:
+            scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
+        groups = _group_aggregates(scope.get("latest_rows", []), scope.get("dimensions", {}))
+        group_rows = _drilldown_group_rows(scope, groups)
+        project_rows = _drilldown_project_rows(scope, groups)
+        message_rows = _drilldown_message_rows(scope)
+        analysis_rows = _drilldown_analysis_rows(scope)
+        selected_groups = set(scope.get("group_names", []))
+
+        if target in {"business.region", "business.aftersaler", "business.product", "business.key_account", "business.project_attention"} or target.startswith("cross."):
+            selected_groups = {
+                name for name, dim in scope.get("dimensions", {}).items()
+                if _group_matches_drilldown(target, dim, dimension_value, secondary_value)
+            }
+        if target == "summary.project_groups":
+            selected_groups = {
+                name for name, dim in scope.get("dimensions", {}).items() if dim.get("codes")
+            }
+        if target == "service.answered":
+            unanswered = _build_evidence(
+                metric="unanswered", period=period, start_date=start_date, end_date=end_date,
+                region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+                page=1, page_size=DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS + 1,
+            )
+            missed_group_names = {item.get("group_name") for item in unanswered.get("items", [])}
+            selected_groups = set(scope.get("group_names", [])) - missed_group_names
+        if target == "quality.groups_without_project_code":
+            selected_groups = {
+                name for name, dim in scope.get("dimensions", {}).items() if not dim.get("codes")
+            }
+        if target == "quality.groups_without_lims_link":
+            selected_groups = {
+                name for name, dim in scope.get("dimensions", {}).items() if not dim.get("projects")
+            }
+        if target == "communication.top_group":
+            selected_groups = {dimension_value}
+        if target == "communication.daily":
+            selected_groups = {
+                row.get("groupName") for row in scope.get("latest_rows", [])
+                if str(row.get("CREATEDTIME") or "")[:10] == dimension_value
+            }
+        if target == "communication.active_duration":
+            durations = _active_durations_from_lims(scope.get("dimensions", {}))
+            selected_groups = {name for name, value in durations.items() if _duration_bucket(value) == dimension_value}
+
+        if target.startswith("summary.") and spec["level"] == "dimension":
+            dimension_sources = {
+                "summary.regions": (overview["business"].get("regions", []), "region"),
+                "summary.aftersalers": (overview["business"].get("aftersalers", []), "name"),
+                "summary.product_categories": (overview["business"].get("product_categories", []), "category"),
+                "summary.key_accounts": (overview["business"].get("key_accounts", []), "key_account"),
+            }
+            source, identity = dimension_sources[target]
+            rows = [{"name": row.get(identity), **row, "source": "看板业务维度汇总"} for row in source]
+            level = "dimension"
+        elif target == "business.project_year":
+            year_item = next((item for item in overview["business"].get("project_year_distribution", {}).get("items", []) if str(item.get("year") if item.get("year") is not None else "unknown") == dimension_value), {})
+            rows = []
+            for project in year_item.get("projects", []):
+                rows.append({
+                    "year": project.get("year"), "project_code": project.get("project_code"),
+                    "year_source": project.get("year_source"), "start_time": project.get("start_time"),
+                    "project_name": _joined(project.get("project_names", [])),
+                    "customer_name": _joined(project.get("customer_names", [])),
+                    "work_unit": _joined(project.get("work_units", [])),
+                    "category_l2": _joined(project.get("product_categories", [])),
+                    "region": _joined(project.get("regions", [])),
+                    "aftersalers": _joined(project.get("aftersalers", [])),
+                    "group_count": project.get("group_count"),
+                    "group_name": _joined(project.get("group_names", [])), "source": "LIMS + 项目号年份",
+                })
+            level = "project"
+        elif target == "quality.unmatched_project_codes":
+            rows = []
+            for group_name, dim in scope.get("dimensions", {}).items():
+                matched = {str(p.get("project_code") or "").upper() for p in dim.get("projects", [])}
+                for code in dim.get("codes", []):
+                    if str(code).upper() not in matched:
+                        rows.append({"project_code": str(code).upper(), "group_name": group_name, "source": "群名提取 / LIMS 未返回"})
+            unique = {}
+            for row in rows:
+                unique.setdefault(row["project_code"], row)
+            rows = list(unique.values())
+            level = "project_code"
+        elif target in {"quality.mapping_fallback_records", "quality.mapping_conflict_records"}:
+            if target.endswith("fallback_records"):
+                rows = [
+                    row for row in project_rows
+                    if row.get("mapping_source") == "lims_fallback" and not row.get("mapping_conflict")
+                ]
+            else:
+                rows = [row for row in project_rows if row.get("mapping_conflict")]
+            level = "project"
+        elif target == "quality.duplicate_rows_removed":
+            kept_ids = {str(row.get("id")) for row in scope.get("latest_rows", []) if row.get("id") is not None}
+            rows = [row for row in analysis_rows if str(row.get("analysis_id")) not in kept_ids]
+            level = "analysis"
+        elif target in {"service.customer_positive", "service.employee_positive"}:
+            rows = []
+            latest_ids = {str(item.get("id")) for item in scope.get("latest_rows", []) if item.get("id") is not None}
+            for row in analysis_rows:
+                if latest_ids and str(row.get("analysis_id")) not in latest_ids:
+                    continue
+                raw = row.get("_raw", {})
+                mapping = parse_emotion_field(raw.get("customerEmotionAnalysis") if target == "service.customer_positive" else raw.get("saleEmotionAnalysis"))
+                labels = ("好评", "正向", "满意") if target == "service.customer_positive" else ("积极", "正向")
+                value = _emotion_total(mapping, labels)
+                if value > 0:
+                    rows.append({**row, "metric_value": value})
+            level = "analysis"
+        elif target == "communication.period":
+            selected_groups = {
+                name for name, dim in scope.get("dimensions", {}).items()
+                if dimension_value in dim.get("aftersalers", [])
+            }
+            rows = []
+            messages_by_group = defaultdict(list)
+            for row in message_rows:
+                messages_by_group[row.get("group_name")].append(row)
+            for group_name in selected_groups:
+                owners = scope.get("dimensions", {}).get(group_name, {}).get("aftersalers", [])
+                candidates = messages_by_group.get(group_name, [])
+                if len(owners) > 1:
+                    candidates = [row for row in candidates if _sender_matches_aftersaler(row, dimension_value)]
+                rows.extend(row for row in candidates if _message_in_period_bucket(row, measure))
+            level = "message"
+        else:
+            if measure == "project_count":
+                rows = [row for row in project_rows if any(name in selected_groups for name in str(row.get("group_name") or "").split("、"))]
+                if target == "business.region":
+                    rows = [row for row in rows if row.get("region") == dimension_value]
+                elif target == "business.aftersaler":
+                    rows = [row for row in rows if row.get("final_aftersaler") == dimension_value]
+                elif target == "business.product":
+                    rows = [row for row in rows if row.get("category_l2") == dimension_value]
+                elif target == "business.key_account":
+                    rows = [row for row in rows if row.get("key_account") == dimension_value]
+                elif target == "business.project_attention":
+                    rows = [
+                        row for row in rows
+                        if row.get("status") == dimension_value
+                        and (not secondary_value or row.get("project_code") == secondary_value)
+                    ]
+                level = "project"
+            elif measure == "message_count":
+                rows = [row for row in message_rows if row.get("group_name") in selected_groups]
+                level = "message"
+                if target == "communication.daily":
+                    rows = [row for row in rows if str(row.get("msgtime") or "")[:10] == dimension_value]
+                if target == "business.aftersaler":
+                    filtered = []
+                    for row in rows:
+                        owners = scope.get("dimensions", {}).get(row.get("group_name"), {}).get("aftersalers", [])
+                        if len(owners) <= 1 or _sender_matches_aftersaler(row, dimension_value):
+                            filtered.append(row)
+                    rows = filtered
+            else:
+                rows = [row for row in group_rows if row.get("group_name") in selected_groups]
+                level = "group"
+
+    for row in rows:
+        row.pop("_raw", None)
+    if search:
+        term = search.casefold().strip()
+        rows = [
+            row for row in rows
+            if term in json.dumps(row, ensure_ascii=False, default=str).casefold()
+        ]
+    expected = _expected_drilldown_value(overview, target, measure, dimension_value, secondary_value)
+    if measure in {"group_count", "missed_count"}:
+        detail_value = len({row.get("group_name") for row in rows if row.get("group_name")})
+    elif measure == "project_count":
+        identities = {
+            row.get("project_code") or f"{row.get('group_name')}:{row.get('project_name')}"
+            for row in rows
+        }
+        detail_value = len(identities)
+    elif target in {"service.customer_positive", "service.employee_positive"}:
+        detail_value = sum(int(row.get("metric_value") or 0) for row in rows)
+    else:
+        detail_value = len(rows)
+    non_comparable_targets = {
+        "communication.highfreq", "service.customer_negative", "service.employee_negative",
+        "quality.mapping_fallback_records", "quality.mapping_conflict_records",
+    }
+    comparable = target not in non_comparable_targets and not bool(search.strip())
+    consistent = (expected == detail_value) if expected is not None and comparable else None
+    if search.strip():
+        reconciliation_note = "已应用抽屉内搜索，当前为看板全集的子集，不直接判断一致性。"
+    elif comparable:
+        reconciliation_note = "统计单位一致，可直接核对。"
+    else:
+        reconciliation_note = "看板汇总值与当前证据明细统计单位不同，仅供追溯。"
+    return {
+        "target": target, "measure": measure, "title": spec["title"], "level": level,
+        "definition": _drilldown_definition(target, level, measure),
+        "period": {"name": normalized_period, "start": start.isoformat(), "end": end.isoformat()},
+        "filters": {
+            "region": region, "aftersaler": aftersaler, "category": category,
+            "key_account": key_account, "dimension_value": dimension_value,
+            "secondary_value": secondary_value, "search": search,
+        },
+        "reconciliation": {
+            "dashboard_value": expected, "detail_value": detail_value,
+            "comparable": comparable, "consistent": consistent,
+            "note": reconciliation_note,
+        },
+        "columns": _drilldown_columns(rows), "rows": rows,
+    }
+
+
+def get_drilldown(
+    target: str,
+    measure: str,
+    period: str = "month",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    dimension_value: str = "",
+    secondary_value: str = "",
+    search: str = "",
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict:
+    if page < 1:
+        raise ValueError("page must be greater than or equal to 1")
+    if page_size < 1 or page_size > 100:
+        raise ValueError("page_size must be between 1 and 100")
+    data = _build_drilldown(
+        target=target, measure=measure, period=period, start_date=start_date, end_date=end_date,
+        dimension_value=dimension_value, secondary_value=secondary_value, search=search,
+        region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+    )
+    rows = data.pop("rows")
+    total = len(rows)
+    offset = (page - 1) * page_size
+    return {
+        **data, "total": total, "page": page, "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+        "items": rows[offset:offset + page_size],
+    }
+
+
+def get_drilldown_export_excel(**kwargs) -> bytes:
+    """Export exactly the same scoped rows used by the drilldown preview."""
+    from io import BytesIO
+    from openpyxl import Workbook
+
+    data = _build_drilldown(**kwargs)
+    rows = data.pop("rows")
+    if len(rows) > DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS:
+        raise ValueError(
+            f"明细共 {len(rows)} 行，超过单次导出上限 {DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS} 行，请缩小筛选范围"
+        )
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    recon = data["reconciliation"]
+    filters = data["filters"]
+    _write_excel_sheet(workbook, "导出说明", [
+        {"项目": "明细标题", "内容": data["title"]},
+        {"项目": "统计口径", "内容": data["definition"]},
+        {"项目": "开始日期", "内容": data["period"]["start"]},
+        {"项目": "结束日期", "内容": data["period"]["end"]},
+        {"项目": "销售区域", "内容": filters.get("region") or "全部"},
+        {"项目": "售后人员", "内容": filters.get("aftersaler") or "全部"},
+        {"项目": "产品分类", "内容": filters.get("category") or "全部"},
+        {"项目": "重点客户", "内容": filters.get("key_account") or "全部"},
+        {"项目": "点击维度", "内容": filters.get("dimension_value") or "-"},
+        {"项目": "次级维度", "内容": filters.get("secondary_value") or "-"},
+        {"项目": "搜索条件", "内容": filters.get("search") or "-"},
+        {"项目": "看板值", "内容": recon.get("dashboard_value")},
+        {"项目": "导出明细数", "内容": len(rows)},
+        {"项目": "核对结果", "内容": "一致" if recon.get("consistent") is True else ("不一致" if recon.get("consistent") is False else "统计单位不同")},
+        {"项目": "生成时间", "内容": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+    ], ["项目", "内容"])
+    columns = [item["key"] for item in data["columns"]]
+    labels = {item["key"]: item["label"] for item in data["columns"]}
+    export_rows = [{labels[key]: row.get(key) for key in columns} for row in rows]
+    _write_excel_sheet(workbook, "明细数据", export_rows, [labels[key] for key in columns])
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
 
 
 def _csv_cell(value: Any) -> Any:

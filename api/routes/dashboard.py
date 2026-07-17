@@ -112,6 +112,69 @@ def evidence(
     )
 
 
+@router.get("/drilldown")
+def drilldown(
+    target: str = Query(..., pattern=r"^[a-z0-9_.]+$", max_length=100),
+    measure: str = Query(..., pattern=r"^[a-z0-9_]+$", max_length=50),
+    period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    dimension_value: str = Query("", max_length=200),
+    secondary_value: str = Query("", max_length=200),
+    search: str = Query("", max_length=100),
+    region: str = Query("", max_length=100),
+    aftersaler: str = Query("", max_length=100),
+    category: str = Query("", max_length=100),
+    key_account: str = Query("", max_length=100),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    return _success(
+        "drilldown", db_dashboard.get_drilldown,
+        target=target, measure=measure, period=period, start_date=start_date, end_date=end_date,
+        dimension_value=dimension_value, secondary_value=secondary_value, search=search,
+        region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+        page=page, page_size=page_size,
+    )
+
+
+@router.get("/drilldown/export")
+def drilldown_export(
+    target: str = Query(..., pattern=r"^[a-z0-9_.]+$", max_length=100),
+    measure: str = Query(..., pattern=r"^[a-z0-9_]+$", max_length=50),
+    period: str = Query("month", pattern="^(today|daily|week|weekly|month|monthly|quarter|quarterly|year|yearly|custom)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    dimension_value: str = Query("", max_length=200),
+    secondary_value: str = Query("", max_length=200),
+    search: str = Query("", max_length=100),
+    region: str = Query("", max_length=100),
+    aftersaler: str = Query("", max_length=100),
+    category: str = Query("", max_length=100),
+    key_account: str = Query("", max_length=100),
+):
+    from urllib.parse import quote
+    from fastapi.responses import Response
+
+    try:
+        excel_content = db_dashboard.get_drilldown_export_excel(
+            target=target, measure=measure, period=period, start_date=start_date, end_date=end_date,
+            dimension_value=dimension_value, secondary_value=secondary_value, search=search,
+            region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("dashboard.drilldown_export.error target={} error={}", target, exc)
+        raise HTTPException(status_code=500, detail="dashboard drilldown export failed") from exc
+    filename = quote(f"看板明细_{target}_{start_date or period}_{end_date or ''}.xlsx")
+    return Response(
+        content=excel_content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
 @router.post("/cache/clear")
 def clear_cache():
     db_dashboard.clear_cache()
