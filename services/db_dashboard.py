@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -33,6 +34,7 @@ PROJECT_ATTENTION_STATUSES = ("问题项目", "暂不交付")
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_success: Dict[str, dict] = {}
 _evidence_cache: Dict[str, Tuple[float, dict]] = {}
+_dashboard_snapshot_cache: Dict[str, Tuple[float, str, dict]] = {}
 _overview_inflight: Dict[str, threading.Event] = {}
 _evidence_inflight: Dict[str, threading.Event] = {}
 _cache_lock = threading.Lock()
@@ -194,6 +196,7 @@ def clear_cache() -> None:
         _cache.clear()
         _last_success.clear()
         _evidence_cache.clear()
+        _dashboard_snapshot_cache.clear()
     with _lims_cache_lock:
         _lims_cache.clear()
         _lims_stale.clear()
@@ -210,6 +213,54 @@ def clear_analytics_cache() -> None:
         _cache.clear()
         _last_success.clear()
         _evidence_cache.clear()
+        _dashboard_snapshot_cache.clear()
+
+
+def _dashboard_snapshot_scope_key(
+    start: date,
+    end: date,
+    period: str,
+    region: str = "",
+    aftersaler: str = "",
+    category: str = "",
+    key_account: str = "",
+) -> str:
+    return json.dumps(
+        [start.isoformat(), end.isoformat(), period, region, aftersaler, category, key_account],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _store_dashboard_snapshot(scope_key: str, snapshot: dict) -> str:
+    """Keep the exact inputs behind a rendered dashboard for its drilldowns."""
+    now = time.time()
+    token = uuid.uuid4().hex
+    snapshot["_snapshot_id"] = token
+    with _cache_lock:
+        expired = [
+            key for key, (created_at, _scope_key, _snapshot) in _dashboard_snapshot_cache.items()
+            if now - created_at >= CACHE_TTL_SECONDS
+        ]
+        for key in expired:
+            _dashboard_snapshot_cache.pop(key, None)
+        _dashboard_snapshot_cache[token] = (now, scope_key, snapshot)
+    return token
+
+
+def _get_dashboard_snapshot(token: str, scope_key: str) -> Optional[dict]:
+    if not token:
+        return None
+    now = time.time()
+    with _cache_lock:
+        cached = _dashboard_snapshot_cache.get(token)
+        if not cached:
+            return None
+        created_at, cached_scope_key, snapshot = cached
+        if now - created_at >= CACHE_TTL_SECONDS or cached_scope_key != scope_key:
+            _dashboard_snapshot_cache.pop(token, None)
+            return None
+        return snapshot
 
 
 def extract_project_codes(group_name: str) -> List[str]:
@@ -1401,6 +1452,37 @@ def _scope_dimension(
     return scoped
 
 
+def _dashboard_filter_options(dimensions: Dict[str, dict]) -> dict:
+    """Build stable filter choices before applying the current business filter."""
+    base_dimensions = {
+        group_name: _scope_dimension(dimension)
+        for group_name, dimension in dimensions.items()
+        if _dimension_matches_or_degrades(dimension)
+    }
+    return {
+        "regions": sorted({
+            value for dimension in base_dimensions.values()
+            for value in dimension.get("regions", [])
+        }),
+        "aftersalers": sorted({
+            value for dimension in base_dimensions.values()
+            for value in dimension.get("aftersalers", [])
+        }),
+        "categories": sorted({
+            project.get("category_l2")
+            for dimension in base_dimensions.values()
+            for project in dimension.get("projects", [])
+            if project.get("category_l2") in ALLOWED_PRODUCT_L2
+        }),
+        "key_accounts": sorted({
+            project.get("key_account")
+            for dimension in base_dimensions.values()
+            for project in dimension.get("projects", [])
+            if project.get("key_account")
+        }),
+    }
+
+
 def _normalize_person_identity(value: Any) -> str:
     """Normalize a display name for matching a LIMS owner to a chat sender."""
     import unicodedata
@@ -1455,10 +1537,14 @@ def _aftersaler_message_rows(aftersalers: Iterable[str], messages: Iterable[dict
 def _aftersaler_message_counts(
     aftersalers: Iterable[str], messages: Iterable[dict], group_message_count: int,
 ) -> Dict[str, int]:
-    """Return the exact message count shown for each final after-saler."""
+    """Count the same qx_chat rows that are exposed by the drilldown.
+
+    ``group_message_count`` is retained for compatibility with older callers but
+    is deliberately ignored.  Using the analysis aggregate for single-owner
+    groups and qx_chat for multi-owner groups made the dashboard impossible to
+    reconcile with its own detail rows.
+    """
     attributed = _aftersaler_message_rows(aftersalers, messages)
-    if len(attributed) <= 1:
-        return {person: max(0, int(group_message_count or 0)) for person in attributed}
     return {person: len(rows) for person, rows in attributed.items()}
 
 
@@ -1561,56 +1647,83 @@ def _build_overview(
     aftersaler: str = "",
     category: str = "",
     key_account: str = "",
+    snapshot: Optional[dict] = None,
 ) -> dict:
-    with database("dashboard.overview") as conn:
-        rows, raw_count = _latest_rows(conn, start, end)
-        mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
-        dimensions, quality = _load_dimensions(conn, rows, mapping_snapshot)
-        base_dimensions = {
-            group_name: _scope_dimension(dim)
-            for group_name, dim in dimensions.items()
-            if _dimension_matches_or_degrades(dim)
-        }
-        filter_options = {
-            "regions": sorted({value for dim in base_dimensions.values() for value in dim.get("regions", [])}),
-            "aftersalers": sorted({value for dim in base_dimensions.values() for value in dim.get("aftersalers", [])}),
-            "categories": sorted({
-                p.get("category_l2")
-                for dim in base_dimensions.values()
-                for p in dim.get("projects", [])
-                if p.get("category_l2") in ALLOWED_PRODUCT_L2
-            }),
-            "key_accounts": sorted({
-                p.get("key_account")
-                for dim in base_dimensions.values()
-                for p in dim.get("projects", [])
-                if p.get("key_account")
-            }),
-        }
-        allowed_groups = {
-            group_name
-            for group_name, dim in dimensions.items()
-            if _dimension_matches_or_degrades(dim, region, aftersaler, category, key_account)
-        }
-        rows = [row for row in rows if row["groupName"] in allowed_groups]
-        dimensions = {
-            name: _scope_dimension(value, region, category, key_account, aftersaler)
-            for name, value in dimensions.items()
-            if name in allowed_groups
-        }
-        quality = _quality_from_dimensions(dimensions, quality)
-        groups = _group_aggregates(rows, dimensions)
-        durations = _active_durations_from_lims(dimensions)
-        missing_duration_groups = sorted(name for name in groups if name not in durations)
-        scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
-        raw_count = _raw_analysis_count(conn, start, end, scoped_group_names)
-        group_rows = _query_group_rows(conn, scoped_group_names)
-        audit_start = start - timedelta(days=2)
-        audit_end = end + timedelta(days=1)
-        audit_chat_rows = _query_chat_rows(conn, group_rows, audit_start, audit_end)
-        chat_rows = _filter_chat_rows_by_period(audit_chat_rows, start, end)
-        chat_rows_by_group = _chat_rows_by_group_name(group_rows, chat_rows)
-        audit_raw_messages = _raw_messages_by_group(group_rows, audit_chat_rows)
+    provided_snapshot = snapshot is not None
+    if snapshot is None:
+        with database("dashboard.overview") as conn:
+            rows, raw_count = _latest_rows(conn, start, end)
+            mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
+            dimensions, quality = _load_dimensions(conn, rows, mapping_snapshot)
+            filter_options = _dashboard_filter_options(dimensions)
+            allowed_groups = {
+                group_name
+                for group_name, dim in dimensions.items()
+                if _dimension_matches_or_degrades(dim, region, aftersaler, category, key_account)
+            }
+            rows = [row for row in rows if row["groupName"] in allowed_groups]
+            dimensions = {
+                name: _scope_dimension(value, region, category, key_account, aftersaler)
+                for name, value in dimensions.items()
+                if name in allowed_groups
+            }
+            quality = _quality_from_dimensions(dimensions, quality)
+            scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
+            raw_count = _raw_analysis_count(conn, start, end, scoped_group_names)
+            group_rows = _query_group_rows(conn, scoped_group_names)
+            audit_start = start - timedelta(days=2)
+            audit_end = end + timedelta(days=1)
+            audit_chat_rows = _query_chat_rows(conn, group_rows, audit_start, audit_end)
+            chat_rows = _filter_chat_rows_by_period(audit_chat_rows, start, end)
+            chat_rows_by_group = _raw_messages_by_group(group_rows, chat_rows)
+            audit_raw_messages = _raw_messages_by_group(group_rows, audit_chat_rows)
+            snapshot_raw_rows = list(rows)
+            if raw_count > len(rows) and scoped_group_names:
+                snapshot_raw_rows = _query_by_chunks(
+                    conn,
+                    "overview.analysis_raw_snapshot",
+                    """SELECT * FROM qx_analysis_result
+                       WHERE CREATEDTIME >= %s AND CREATEDTIME < %s
+                         AND groupName IN ({placeholders})
+                       ORDER BY CREATEDTIME""",
+                    scoped_group_names,
+                    prefix_params=[start.isoformat(), (end + timedelta(days=1)).isoformat()],
+                )
+            snapshot = {
+                "latest_rows": rows,
+                "raw_rows": snapshot_raw_rows,
+                "raw_count_before_filter": raw_count,
+                "dimensions": dimensions,
+                "quality": quality,
+                "filter_options": filter_options,
+                "group_names": scoped_group_names,
+                "project_codes": sorted({
+                    str(code).upper()
+                    for dimension in dimensions.values()
+                    for code in dimension.get("codes", [])
+                    if code
+                }),
+                "group_rows": group_rows,
+                "chat_rows": chat_rows,
+                "chat_rows_by_group": chat_rows_by_group,
+                "audit_chat_rows": audit_chat_rows,
+                "audit_raw_messages": audit_raw_messages,
+            }
+    else:
+        rows = snapshot.get("latest_rows", [])
+        dimensions = snapshot.get("dimensions", {})
+        quality = snapshot.get("quality", {})
+        filter_options = snapshot.get("filter_options", _dashboard_filter_options(dimensions))
+        raw_count = int(snapshot.get("raw_count_before_filter") or len(snapshot.get("raw_rows", [])))
+        group_rows = snapshot.get("group_rows", [])
+        chat_rows = snapshot.get("chat_rows", [])
+        chat_rows_by_group = snapshot.get("chat_rows_by_group") or _raw_messages_by_group(group_rows, chat_rows)
+        audit_chat_rows = snapshot.get("audit_chat_rows", chat_rows)
+        audit_raw_messages = snapshot.get("audit_raw_messages") or _raw_messages_by_group(group_rows, audit_chat_rows)
+
+    groups = _group_aggregates(rows, dimensions)
+    durations = _active_durations_from_lims(dimensions)
+    missing_duration_groups = sorted(name for name in groups if name not in durations)
 
     _filter_region = region
     _filter_aftersaler = aftersaler
@@ -1663,6 +1776,7 @@ def _build_overview(
             if project.get("project_code")
         }
         group_aftersalers = dim.get("aftersalers", [])
+        raw_group_message_count = len(chat_rows_by_group.get(group_name, []))
         attributed_message_counts = _aftersaler_message_counts(
             group_aftersalers,
             chat_rows_by_group.get(group_name, []),
@@ -1680,6 +1794,8 @@ def _build_overview(
             region_group_count[region] = region_group_count.get(region, 0) + 1
             region_messages[region] += item["messages"]
         seen_pairs = set()
+        seen_message_categories = set()
+        seen_message_leaves = set()
         for project in dim.get("projects", []):
             region = project.get("region") or "未关联区域"
             category = project.get("category_l2") or ""
@@ -1689,14 +1805,19 @@ def _build_overview(
                     categories[category] += 1
                     category_projects[category].add(project.get("project_code"))
                     category_groups[category].add(group_name)
-                    category_messages[category] += item["messages"]
                     region_product[region][category] += 1
                     level3 = project.get("category_l3") or "未细分"
                     leaf = product_tree[category][level3]
                     leaf["projects"].add(project.get("project_code"))
                     leaf["groups"].add(group_name)
-                    leaf["messages"] += item["messages"]
                     seen_pairs.add(pair)
+                if category not in seen_message_categories:
+                    category_messages[category] += raw_group_message_count
+                    seen_message_categories.add(category)
+                leaf_key = (category, project.get("category_l3") or "未细分")
+                if leaf_key not in seen_message_leaves:
+                    product_tree[leaf_key[0]][leaf_key[1]]["messages"] += raw_group_message_count
+                    seen_message_leaves.add(leaf_key)
             attention_status = str(project.get("analysis_simple_remark") or "").strip()
             if attention_status in PROJECT_ATTENTION_STATUSES:
                 if group_name not in attention_status_groups[attention_status]:
@@ -1861,10 +1982,19 @@ def _build_overview(
     cross_after = [{"region": region, "group_count": region_group_count.get(region, 0), "message_count": region_messages.get(region, 0), "items": _counter_items(counter)} for region, counter in region_after.items()]
     cross_product = [{"region": region, "group_count": region_group_count.get(region, 0), "message_count": region_messages.get(region, 0), "items": _counter_items(counter, "category")} for region, counter in region_product.items()]
 
+    scope_key = _dashboard_snapshot_scope_key(
+        start, end, period, region, aftersaler, category, key_account,
+    )
+    snapshot_id = (
+        str(snapshot.get("_snapshot_id") or "")
+        if provided_snapshot
+        else _store_dashboard_snapshot(scope_key, snapshot)
+    )
     return {
         "meta": {
             "period": period, "start_date": start.isoformat(), "end_date": end.isoformat(),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "snapshot_id": snapshot_id,
             "source_min_date": min((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
             "source_max_date": max((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
             "filters": {"region": region, "aftersaler": aftersaler, "category": category, "key_account": key_account},
@@ -1899,7 +2029,7 @@ def _build_overview(
             "top_message_groups": top_message_groups,
         },
         "business": {
-            "aftersaler_message_definition": "单一最终售后群统计群内全部消息；多最终售后群仅统计各售后本人发送的消息。",
+            "aftersaler_message_definition": "消息统一来自 qx_chat：单一最终售后群统计群内全部原始消息；多最终售后群仅统计各售后本人发送的原始消息。",
             "aftersalers": [
                 {
                     "name": name,
@@ -3084,6 +3214,7 @@ def _current_dashboard_scope(
     latest_rows, raw_count = _latest_rows(conn, start, end)
     mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
     dimensions, quality = _load_dimensions(conn, latest_rows, mapping_snapshot)
+    filter_options = _dashboard_filter_options(dimensions)
     allowed_groups = {
         group_name
         for group_name, dim in dimensions.items()
@@ -3121,6 +3252,7 @@ def _current_dashboard_scope(
         "raw_count_before_filter": raw_count,
         "dimensions": dimensions,
         "quality": quality,
+        "filter_options": filter_options,
         "group_names": group_names,
         "project_codes": project_codes,
     }
@@ -3183,13 +3315,17 @@ def _query_qx_raw_scope(
 ) -> dict:
     scope = _current_dashboard_scope(conn, start, end, region, aftersaler, category, key_account)
     group_rows = _query_group_rows(conn, scope["group_names"])
-    chat_rows = _filter_chat_rows_by_period(
-        _query_chat_rows(conn, group_rows, start, end), start, end
+    audit_chat_rows = _query_chat_rows(
+        conn, group_rows, start - timedelta(days=2), end + timedelta(days=1)
     )
+    chat_rows = _filter_chat_rows_by_period(audit_chat_rows, start, end)
     return {
         **scope,
         "group_rows": group_rows,
         "chat_rows": chat_rows,
+        "chat_rows_by_group": _raw_messages_by_group(group_rows, chat_rows),
+        "audit_chat_rows": audit_chat_rows,
+        "audit_raw_messages": _raw_messages_by_group(group_rows, audit_chat_rows),
     }
 
 
@@ -3554,7 +3690,10 @@ def _drilldown_definition(target: str, level: str, measure: str) -> str:
     }
     note = units.get(level, "一条明细代表当前指标的一条核对记录。")
     if measure == "message_count":
-        note += " 看板消息数来自分析汇总，明细核对值来自原始消息，差异会原样显示。"
+        if target in {"business.aftersaler", "business.product"}:
+            note += " 看板值与明细核对值均由本次请求中的同一批 qx_chat 原始消息计算。"
+        else:
+            note += " 看板消息数来自分析汇总，明细核对值来自原始消息，差异会原样显示。"
     if target == "communication.highfreq":
         note += " 看板值是词频累计，明细核对值是涉及的证据记录数，两者统计单位不同。"
     return note
@@ -3573,6 +3712,7 @@ def _build_drilldown(
     aftersaler: str = "",
     category: str = "",
     key_account: str = "",
+    snapshot_id: str = "",
 ) -> dict:
     spec = DRILLDOWN_TARGETS.get(target)
     if not spec:
@@ -3580,9 +3720,19 @@ def _build_drilldown(
     if measure not in spec["measures"]:
         raise ValueError("unsupported drilldown measure for target")
     start, end, normalized_period = resolve_period(period, start_date, end_date)
-    overview = get_overview(
-        period=period, start_date=start_date, end_date=end_date,
+    scope_key = _dashboard_snapshot_scope_key(
+        start, end, normalized_period, region, aftersaler, category, key_account,
+    )
+    scope = _get_dashboard_snapshot(snapshot_id, scope_key) if snapshot_id else None
+    if snapshot_id and scope is None:
+        raise ValueError("看板数据快照已过期或与当前筛选不匹配，请刷新看板后重试")
+    if scope is None:
+        with database("dashboard.drilldown") as conn:
+            scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
+    overview = _build_overview(
+        start=start, end=end, period=normalized_period,
         region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+        snapshot=scope,
     )
 
     evidence_metric = {
@@ -3603,8 +3753,6 @@ def _build_drilldown(
         rows = _evidence_drilldown_rows(evidence)
         level = "message"
     else:
-        with database("dashboard.drilldown") as conn:
-            scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
         groups = _group_aggregates(scope.get("latest_rows", []), scope.get("dimensions", {}))
         group_rows = _drilldown_group_rows(scope, groups)
         project_rows = _drilldown_project_rows(scope, groups)
@@ -3827,6 +3975,7 @@ def get_drilldown(
     aftersaler: str = "",
     category: str = "",
     key_account: str = "",
+    snapshot_id: str = "",
     page: int = 1,
     page_size: int = 20,
 ) -> dict:
@@ -3838,6 +3987,7 @@ def get_drilldown(
         target=target, measure=measure, period=period, start_date=start_date, end_date=end_date,
         dimension_value=dimension_value, secondary_value=secondary_value, search=search,
         region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+        snapshot_id=snapshot_id,
     )
     rows = data.pop("rows")
     total = len(rows)

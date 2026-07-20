@@ -544,7 +544,7 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertEqual(counts, {"吴志浩": 1, "杨嘉俊": 1})
         self.assertEqual(
             db_dashboard._aftersaler_message_counts(["吴志浩"], messages, group_message_count=99),
-            {"吴志浩": 99},
+            {"吴志浩": 4},
         )
 
     def test_multi_aftersaler_period_breakdown_uses_personal_speech(self):
@@ -1039,6 +1039,106 @@ class DashboardParsingTests(unittest.TestCase):
 
 
 class DashboardDrilldownTests(unittest.TestCase):
+    @staticmethod
+    def _shared_business_snapshot():
+        group_name = "客户 LC-P100 LC-P101 项目群"
+        chat_rows = [
+            {
+                "id": index, "roomid": "room-1", "msgtime": f"2026-07-06 09:0{index}:00",
+                "raw_json": json.dumps({
+                    "from": f"wmCustomer{index}", "truename": f"客户{index}",
+                    "content": f"消息{index}", "msgtime": f"2026-07-06 09:0{index}:00",
+                }, ensure_ascii=False),
+            }
+            for index in range(1, 4)
+        ]
+        projects = [
+            {
+                "project_code": code, "product_name": code, "region": "华东",
+                "raw_aftersaler": "张三", "final_aftersaler": "张三",
+                "aftersaler_source": "mapping", "category_l2": "常规转录组",
+                "category_l3": "mRNA", "key_account": "重点客户甲", "active_day": 20,
+            }
+            for code in ("LC-P100", "LC-P101")
+        ]
+        latest_rows = [{
+            "id": 1, "groupName": group_name, "CREATEDTIME": "2026-07-06 23:00:00",
+            "messageToDayCount": 999, "isMissedMessage": 0,
+            "customerEmotionAnalysis": "", "saleEmotionAnalysis": "", "highFrequencyWords": "",
+        }]
+        group_rows = [{"name": group_name, "chat_id": "room-1", "member_list_json": "[]"}]
+        dimensions = {
+            group_name: {
+                "codes": ["LC-P100", "LC-P101"], "projects": projects,
+                "regions": ["华东"], "aftersalers": ["张三"], "raw_aftersalers": ["张三"],
+                "tentative_aftersalers": [],
+            }
+        }
+        quality = {
+            "project_codes": 2, "matched_project_codes": 2,
+            "product_projects": 2, "matched_products": 2,
+            "groups_with_aftersaler": 1, "groups_with_confirmed_aftersaler": 1,
+        }
+        normalized = db_dashboard._raw_messages_by_group(group_rows, chat_rows)
+        return {
+            "latest_rows": latest_rows, "raw_rows": latest_rows,
+            "raw_count_before_filter": 1, "dimensions": dimensions, "quality": quality,
+            "filter_options": db_dashboard._dashboard_filter_options(dimensions),
+            "group_names": [group_name], "project_codes": ["LC-P100", "LC-P101"],
+            "group_rows": group_rows, "chat_rows": chat_rows,
+            "chat_rows_by_group": normalized, "audit_chat_rows": chat_rows,
+            "audit_raw_messages": normalized,
+        }
+
+    def test_business_message_metrics_share_qx_chat_and_deduplicate_group_category(self):
+        snapshot = self._shared_business_snapshot()
+        overview = db_dashboard._build_overview(
+            date(2026, 7, 1), date(2026, 7, 17), "custom", snapshot=snapshot,
+        )
+
+        aftersaler = next(item for item in overview["business"]["aftersalers"] if item["name"] == "张三")
+        product = next(item for item in overview["business"]["product_categories"] if item["category"] == "常规转录组")
+        product_leaf = overview["business"]["product_hierarchy"][0]["children"][0]
+
+        self.assertEqual(aftersaler["message_count"], 3)
+        self.assertEqual(product["project_count"], 2)
+        self.assertEqual(product["message_count"], 3)
+        self.assertEqual(product_leaf["message_count"], 3)
+
+    def test_drilldown_dashboard_value_uses_same_snapshot_as_detail_rows(self):
+        snapshot = self._shared_business_snapshot()
+        scope_key = db_dashboard._dashboard_snapshot_scope_key(
+            date(2026, 7, 1), date(2026, 7, 17), "custom",
+        )
+        snapshot_id = db_dashboard._store_dashboard_snapshot(scope_key, snapshot)
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_query_qx_raw_scope", side_effect=AssertionError("snapshot must be reused")),
+            patch.object(db_dashboard, "get_overview", side_effect=AssertionError("cached overview must not be used")),
+        ):
+            aftersaler = db_dashboard._build_drilldown(
+                "business.aftersaler", "message_count", period="custom",
+                start_date="2026-07-01", end_date="2026-07-17", dimension_value="张三",
+                snapshot_id=snapshot_id,
+            )
+            product = db_dashboard._build_drilldown(
+                "business.product", "message_count", period="custom",
+                start_date="2026-07-01", end_date="2026-07-17", dimension_value="常规转录组",
+                snapshot_id=snapshot_id,
+            )
+
+        self.assertEqual(aftersaler["reconciliation"]["dashboard_value"], 3)
+        self.assertEqual(aftersaler["reconciliation"]["detail_value"], 3)
+        self.assertTrue(aftersaler["reconciliation"]["consistent"])
+        self.assertEqual(product["reconciliation"]["dashboard_value"], 3)
+        self.assertEqual(product["reconciliation"]["detail_value"], 3)
+        self.assertTrue(product["reconciliation"]["consistent"])
+
     def test_drilldown_target_and_measure_are_allowlisted(self):
         with self.assertRaisesRegex(ValueError, "unsupported drilldown target"):
             db_dashboard._build_drilldown("raw.sql", "message_count")
