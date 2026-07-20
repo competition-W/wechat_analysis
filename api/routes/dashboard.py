@@ -126,6 +126,7 @@ def drilldown(
     aftersaler: str = Query("", max_length=100),
     category: str = Query("", max_length=100),
     key_account: str = Query("", max_length=100),
+    snapshot_id: str = Query("", pattern=r"^[a-f0-9]*$", max_length=64),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
@@ -134,6 +135,7 @@ def drilldown(
         target=target, measure=measure, period=period, start_date=start_date, end_date=end_date,
         dimension_value=dimension_value, secondary_value=secondary_value, search=search,
         region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+        snapshot_id=snapshot_id,
         page=page, page_size=page_size,
     )
 
@@ -152,6 +154,7 @@ def drilldown_export(
     aftersaler: str = Query("", max_length=100),
     category: str = Query("", max_length=100),
     key_account: str = Query("", max_length=100),
+    snapshot_id: str = Query("", pattern=r"^[a-f0-9]*$", max_length=64),
 ):
     from urllib.parse import quote
     from fastapi.responses import Response
@@ -161,6 +164,7 @@ def drilldown_export(
             target=target, measure=measure, period=period, start_date=start_date, end_date=end_date,
             dimension_value=dimension_value, secondary_value=secondary_value, search=search,
             region=region, aftersaler=aftersaler, category=category, key_account=key_account,
+            snapshot_id=snapshot_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
