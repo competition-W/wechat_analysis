@@ -286,7 +286,7 @@ class DashboardParsingTests(unittest.TestCase):
         rows = [
             {
                 "groupName": "允许产品群", "CREATEDTIME": "2026-07-08 10:00:00",
-                "messageToDayCount": 10, "isMissedMessage": "0",
+                "messageToDayCount": 10, "isMissedMessage": "1",
                 "customerEmotionAnalysis": "好评:1", "saleEmotionAnalysis": "积极:1",
                 "highFrequencyWords": "允许主题:3",
             },
@@ -341,6 +341,7 @@ class DashboardParsingTests(unittest.TestCase):
         with (
             patch.object(db_dashboard, "database", fake_database),
             patch.object(db_dashboard, "_latest_rows", return_value=(rows, 2)),
+            patch.object(db_dashboard, "_latest_unanswered_rows", return_value=[]),
             patch.object(db_dashboard, "_load_dimensions", return_value=(dimensions, {})),
             patch.object(db_dashboard, "_raw_analysis_count", return_value=1),
             patch.object(db_dashboard, "_query_group_rows", return_value=[]),
@@ -376,6 +377,11 @@ class DashboardParsingTests(unittest.TestCase):
             ["华东"],
         )
         self.assertEqual(result["service_quality"]["unanswered"]["missed_groups"], 0)
+        self.assertEqual(result["service_quality"]["unanswered"]["total_groups"], 0)
+        self.assertEqual(
+            result["service_quality"]["unanswered"]["source"],
+            "qx_analysis_result_sale",
+        )
         self.assertEqual(result["project_attention"]["total_projects"], 2)
         self.assertEqual(
             [item["status"] for item in result["project_attention"]["summary"]],
@@ -389,6 +395,54 @@ class DashboardParsingTests(unittest.TestCase):
             [item["project_code"] for item in microbe_result["project_attention"]["items"]],
             ["LC-P4"],
         )
+
+    def test_overview_uses_nightly_sale_rows_for_unanswered_summary_and_trend(self):
+        group_name = "客户 LC-P2026001 项目群"
+        analysis_row = {
+            "id": 1, "groupName": group_name,
+            "CREATEDTIME": "2026-07-11 17:00:00",
+            "messageToDayCount": 8, "isMissedMessage": "0",
+            "customerEmotionAnalysis": "", "saleEmotionAnalysis": "",
+            "highFrequencyWords": "",
+        }
+        nightly_row = {
+            **analysis_row,
+            "id": 2, "CREATEDTIME": "2026-07-11 00:20:00",
+            "isMissedMessage": "1", "missedMessageList": "客户甲:什么时候出结果？",
+        }
+        raw_message = {
+            "msgid": "c1", "sender_name": "客户甲", "sender_userid": "wmCustomer001",
+            "sender_role": "客户", "roomid": "room-1", "content": "什么时候出结果？",
+            "msgtime": "2026-07-10 18:00:00", "time_source": "original_message",
+        }
+        dimensions = {
+            group_name: {
+                "codes": ["LC-P2026001"], "projects": [], "regions": [],
+                "aftersalers": [], "tentative_aftersalers": [],
+            },
+        }
+        snapshot = {
+            "latest_rows": [analysis_row], "unanswered_rows": [nightly_row],
+            "raw_rows": [analysis_row], "raw_count_before_filter": 1,
+            "dimensions": dimensions, "quality": {
+                "matched_project_codes": 0, "project_codes": 1,
+                "matched_products": 0, "product_projects": 0,
+            },
+            "filter_options": db_dashboard._dashboard_filter_options(dimensions),
+            "group_names": [group_name], "project_codes": ["LC-P2026001"],
+            "group_rows": [], "chat_rows": [], "chat_rows_by_group": {},
+            "audit_chat_rows": [], "audit_raw_messages": {group_name: [raw_message]},
+        }
+
+        result = db_dashboard._build_overview(
+            date(2026, 7, 11), date(2026, 7, 11), "custom", snapshot=snapshot,
+        )
+
+        self.assertEqual(result["service_quality"]["unanswered"]["missed_groups"], 1)
+        self.assertEqual(result["service_quality"]["unanswered"]["total_groups"], 1)
+        self.assertEqual(result["service_quality"]["unanswered"]["answered_groups"], 0)
+        self.assertEqual(result["communication"]["trend"][0]["missed"], 1)
+        self.assertEqual(result["meta"]["unanswered_source"], "qx_analysis_result_sale")
 
     def test_excel_export_splits_dashboard_modules_and_raw_sources_into_sheets(self):
         from openpyxl import load_workbook
@@ -452,6 +506,7 @@ class DashboardParsingTests(unittest.TestCase):
         scope = {
             "project_codes": ["LC-P1"], "group_names": ["允许产品群"],
             "raw_rows": [{"groupName": "允许产品群"}],
+            "raw_unanswered_rows": [{"groupName": "允许产品群", "isMissedMessage": "0"}],
             "group_rows": [{"name": "允许产品群"}],
             "chat_rows": [{"roomid": "room-1", "content": "测试"}],
         }
@@ -479,7 +534,7 @@ class DashboardParsingTests(unittest.TestCase):
         self.assertTrue({
             "导出说明", "经营摘要", "高频关注主题", "重点客户", "消息Top5群聊",
             "项目年份分布", "项目年份明细", "项目状态关注", "服务质量",
-            "analysis原始数据", "group原始数据", "chat原始数据", "LIMS原始数据",
+            "analysis原始数据", "夜间漏回原始数据", "group原始数据", "chat原始数据", "LIMS原始数据",
         }.issubset(set(workbook.sheetnames)))
         self.assertEqual(workbook["高频关注主题"]["A2"].value, "转录")
         self.assertEqual(workbook["消息Top5群聊"]["B2"].value, "允许产品群")
@@ -790,6 +845,7 @@ class DashboardParsingTests(unittest.TestCase):
         with (
             patch.object(db_dashboard, "database", fake_database),
             patch.object(db_dashboard, "_latest_rows", return_value=([mock_row], 1)),
+            patch.object(db_dashboard, "_latest_unanswered_rows", return_value=[mock_row]),
             patch.object(db_dashboard, "_load_dimensions", return_value=(test_dimension, {"matched_project_codes": 1})),
             patch.object(db_dashboard, "_query_group_rows", return_value=[]),
             patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
@@ -839,6 +895,7 @@ class DashboardParsingTests(unittest.TestCase):
         with (
             patch.object(db_dashboard, "database", fake_database),
             patch.object(db_dashboard, "_latest_rows", return_value=([mock_row], 1)),
+            patch.object(db_dashboard, "_latest_unanswered_rows", return_value=[mock_row]),
             patch.object(db_dashboard, "_load_dimensions", return_value=(test_dimension, {"matched_project_codes": 1})),
             patch.object(db_dashboard, "_query_group_rows", return_value=[]),
             patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
@@ -892,6 +949,7 @@ class DashboardParsingTests(unittest.TestCase):
         with (
             patch.object(db_dashboard, "database", fake_database),
             patch.object(db_dashboard, "_latest_rows", return_value=([mock_row], 1)),
+            patch.object(db_dashboard, "_latest_unanswered_rows", return_value=[mock_row]),
             patch.object(db_dashboard, "_load_dimensions", return_value=(test_dimension, {"matched_project_codes": 1})),
             patch.object(db_dashboard, "_query_group_rows", return_value=[]),
             patch.object(db_dashboard, "_query_chat_rows", return_value=[]),
