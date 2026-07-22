@@ -24,6 +24,7 @@ CACHE_TTL_SECONDS = 300
 EVIDENCE_CACHE_TTL_SECONDS = 120
 LIMS_CACHE_TTL_SECONDS = 1800
 LIMS_REQUEST_BUDGET_SECONDS = 10.0
+UNANSWERED_RESULT_TABLE = "qx_analysis_result_sale"
 DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS = max(
     1, int(os.getenv("DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS", "100000"))
 )
@@ -939,6 +940,58 @@ def _latest_rows(conn, start: date, end: date) -> Tuple[List[dict], int]:
     return rows, raw_count
 
 
+def _latest_unanswered_rows(
+    conn,
+    start: date,
+    end: date,
+    group_names: Optional[List[str]] = None,
+) -> List[dict]:
+    """Load the latest nightly unanswered-analysis row for each group and day."""
+    params: List[Any] = [start.isoformat(), (end + timedelta(days=1)).isoformat()]
+    group_filter = ""
+    if group_names is not None:
+        if not group_names:
+            return []
+        placeholders = ",".join(["%s"] * len(group_names))
+        group_filter = f" AND groupName IN ({placeholders})"
+        params.extend(group_names)
+    sql = f"""
+        SELECT a.*
+        FROM {UNANSWERED_RESULT_TABLE} a
+        JOIN (
+            SELECT groupName, DATE(CREATEDTIME) analysis_date, MAX(id) latest_id
+            FROM {UNANSWERED_RESULT_TABLE}
+            WHERE CREATEDTIME >= %s AND CREATEDTIME < %s{group_filter}
+            GROUP BY groupName, DATE(CREATEDTIME)
+        ) latest ON latest.latest_id = a.id
+        ORDER BY a.CREATEDTIME
+    """
+    return [
+        row for row in _query(conn, "unanswered.latest_nightly", sql, params)
+        if is_focus_group_name(row.get("groupName", ""))
+    ]
+
+
+def _raw_unanswered_rows(
+    conn,
+    start: date,
+    end: date,
+    group_names: List[str],
+) -> List[dict]:
+    if not group_names:
+        return []
+    return _query_by_chunks(
+        conn,
+        "unanswered.scoped_raw",
+        f"""SELECT * FROM {UNANSWERED_RESULT_TABLE}
+           WHERE CREATEDTIME >= %s AND CREATEDTIME < %s
+             AND groupName IN ({{placeholders}})
+           ORDER BY CREATEDTIME""",
+        group_names,
+        prefix_params=[start.isoformat(), (end + timedelta(days=1)).isoformat()],
+    )
+
+
 def _raw_analysis_count(
     conn,
     start: date,
@@ -1063,7 +1116,16 @@ def _active_durations_from_lims(dimensions: Dict[str, dict]) -> Dict[str, float]
     return durations
 
 
-def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str, dict]:
+def _group_aggregates(
+    rows: List[dict],
+    dimensions: Dict[str, dict],
+    unanswered_rows: Optional[List[dict]] = None,
+) -> Dict[str, dict]:
+    missed_dates_by_group: Dict[str, set] = defaultdict(set)
+    missed_source_rows = rows if unanswered_rows is None else unanswered_rows
+    for row in missed_source_rows:
+        if str(row.get("isMissedMessage")) == "1" and row.get("groupName"):
+            missed_dates_by_group[str(row["groupName"])].add(str(row.get("CREATEDTIME"))[:10])
     groups: Dict[str, dict] = {}
     for row in rows:
         name = row["groupName"]
@@ -1075,7 +1137,6 @@ def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str
         })
         item["messages"] += int(row.get("messageToDayCount") or 0)
         item["dates"].add(str(row.get("CREATEDTIME"))[:10])
-        item["missed_days"] += 1 if str(row.get("isMissedMessage")) == "1" else 0
         customer = parse_emotion_field(row.get("customerEmotionAnalysis"))
         employee = parse_emotion_field(row.get("saleEmotionAnalysis"))
         item["customer_good"] += _emotion_total(customer, ("好评", "正向", "满意"))
@@ -1085,6 +1146,8 @@ def _group_aggregates(rows: List[dict], dimensions: Dict[str, dict]) -> Dict[str
         for word in parse_high_freq(row.get("highFrequencyWords")):
             item["high_freq"][word["word"]] += word["count"]
         item["rows"].append(row)
+    for group_name, item in groups.items():
+        item["missed_days"] = len(missed_dates_by_group.get(group_name, set()))
     return groups
 
 
@@ -1670,6 +1733,7 @@ def _build_overview(
             quality = _quality_from_dimensions(dimensions, quality)
             scoped_group_names = sorted({row.get("groupName") for row in rows if row.get("groupName")})
             raw_count = _raw_analysis_count(conn, start, end, scoped_group_names)
+            unanswered_rows = _latest_unanswered_rows(conn, start, end, scoped_group_names)
             group_rows = _query_group_rows(conn, scoped_group_names)
             audit_start = start - timedelta(days=2)
             audit_end = end + timedelta(days=1)
@@ -1691,6 +1755,7 @@ def _build_overview(
                 )
             snapshot = {
                 "latest_rows": rows,
+                "unanswered_rows": unanswered_rows,
                 "raw_rows": snapshot_raw_rows,
                 "raw_count_before_filter": raw_count,
                 "dimensions": dimensions,
@@ -1711,6 +1776,7 @@ def _build_overview(
             }
     else:
         rows = snapshot.get("latest_rows", [])
+        unanswered_rows = snapshot.get("unanswered_rows", [])
         dimensions = snapshot.get("dimensions", {})
         quality = snapshot.get("quality", {})
         filter_options = snapshot.get("filter_options", _dashboard_filter_options(dimensions))
@@ -1721,7 +1787,7 @@ def _build_overview(
         audit_chat_rows = snapshot.get("audit_chat_rows", chat_rows)
         audit_raw_messages = snapshot.get("audit_raw_messages") or _raw_messages_by_group(group_rows, audit_chat_rows)
 
-    groups = _group_aggregates(rows, dimensions)
+    groups = _group_aggregates(rows, dimensions, unanswered_rows)
     durations = _active_durations_from_lims(dimensions)
     missing_duration_groups = sorted(name for name in groups if name not in durations)
 
@@ -1731,7 +1797,13 @@ def _build_overview(
     _filter_key_account = key_account
     total_groups = len(groups)
     total_messages = sum(item["messages"] for item in groups.values())
-    unanswered_summary = _reconciled_unanswered_summary(rows, audit_raw_messages)
+    unanswered_summary = _reconciled_unanswered_summary(unanswered_rows, audit_raw_messages)
+    unanswered_group_names = {
+        str(row.get("groupName") or "").strip()
+        for row in unanswered_rows
+        if str(row.get("groupName") or "").strip()
+    }
+    unanswered_total_groups = len(unanswered_group_names)
     missed_groups = len(unanswered_summary["groups"])
     daily: Dict[str, dict] = defaultdict(lambda: {"messages": 0, "groups": set(), "missed": 0})
     customer_good = customer_bad = employee_positive = employee_negative = 0
@@ -1997,6 +2069,13 @@ def _build_overview(
             "snapshot_id": snapshot_id,
             "source_min_date": min((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
             "source_max_date": max((str(row["CREATEDTIME"])[:10] for row in rows), default=None),
+            "unanswered_source": UNANSWERED_RESULT_TABLE,
+            "unanswered_source_min_date": min(
+                (str(row["CREATEDTIME"])[:10] for row in unanswered_rows), default=None,
+            ),
+            "unanswered_source_max_date": max(
+                (str(row["CREATEDTIME"])[:10] for row in unanswered_rows), default=None,
+            ),
             "filters": {"region": region, "aftersaler": aftersaler, "category": category, "key_account": key_account},
             "allowed_product_categories": sorted(ALLOWED_PRODUCT_L2),
             "filter_options": filter_options,
@@ -2012,12 +2091,13 @@ def _build_overview(
         },
         "service_quality": {
             "unanswered": {
-                "total_groups": total_groups,
+                "total_groups": unanswered_total_groups,
                 "missed_groups": missed_groups,
-                "answered_groups": max(0, total_groups - missed_groups),
-                "missed_rate": _ratio(missed_groups, total_groups),
+                "answered_groups": max(0, unanswered_total_groups - missed_groups),
+                "missed_rate": _ratio(missed_groups, unanswered_total_groups),
                 "review_groups": len(unanswered_summary["review_groups"]),
-                "definition": "截至统计截止仍未发现员工回复、且能匹配到原始客户消息的待回复群。",
+                "definition": "分母和漏回判定均来自每日零点夜间分析表；漏回消息还需匹配原始客户消息，且截至统计截止未发现员工回复。",
+                "source": UNANSWERED_RESULT_TABLE,
             },
             "sentiment": {"customer_good": customer_good, "customer_bad": customer_bad, "employee_positive": employee_positive, "employee_negative": employee_negative},
         },
@@ -2205,19 +2285,25 @@ def _build_evidence(
     page_size: int = 20,
 ) -> dict:
     start, end, normalized_period = resolve_period(period, start_date, end_date)
+    metric = metric.lower()
     with database("dashboard.evidence") as conn:
-        rows, _ = _latest_rows(conn, start, end)
+        analysis_rows, _ = _latest_rows(conn, start, end)
         mapping_snapshot = aftersaler_mapping.get_mapping_snapshot(end, conn=conn)
-        dimensions, _ = _load_dimensions(conn, rows, mapping_snapshot)
+        dimensions, _ = _load_dimensions(conn, analysis_rows, mapping_snapshot)
         dimensions = {
             group_name: _scope_dimension(dim, region, category, key_account, aftersaler)
             for group_name, dim in dimensions.items()
             if _dimension_matches_or_degrades(dim, region, aftersaler, category, key_account)
         }
         allowed_groups = [
-            row.get("groupName") for row in rows
+            row.get("groupName") for row in analysis_rows
             if row.get("groupName") in dimensions
         ]
+        rows = (
+            _latest_unanswered_rows(conn, start, end, sorted(set(allowed_groups)))
+            if metric == "unanswered"
+            else analysis_rows
+        )
         group_rows = _query_group_rows(conn, sorted(set(allowed_groups)))
         audit_chat_rows = _query_chat_rows(
             conn, group_rows, start - timedelta(days=2), end + timedelta(days=1)
@@ -2227,7 +2313,6 @@ def _build_evidence(
     unanswered_items: Dict[str, dict] = {}
     verification_counts = Counter()
     seen_unanswered = set()
-    metric = metric.lower()
     for row in reversed(rows):
         group_name = row.get("groupName") or ""
         dim = dimensions.get(group_name, {})
@@ -2327,7 +2412,8 @@ def _build_evidence(
         "definition": ({
             "unit": "一条明细是一条能匹配到 qx_chat 原始记录、由客户发送且截至统计截止仍未发现员工后续回复的消息。",
             "message_time": "消息发送时间来自 qx_chat.msgtime，是客户原消息的发送时间。",
-            "analysis_time": "分析时间来自 qx_analysis_result.CREATEDTIME，是系统执行分析的批次时间，不是消息发送时间。",
+            "analysis_time": f"分析时间来自 {UNANSWERED_RESULT_TABLE}.CREATEDTIME，是每日零点夜间分析的批次时间，不是消息发送时间。",
+            "source": f"漏回判定统一来自 {UNANSWERED_RESULT_TABLE}，原始消息仅用于证据匹配和后续回复核验。",
             "sender": "发送人姓名仅取原始姓名字段；from/roomid 只用于身份核验，不作为姓名展示。",
             "deduplication": "同一 msgid，或同一发送人、正文和原始发送时间，只展示一次。",
         } if metric == "unanswered" else {}),
@@ -2977,6 +3063,8 @@ def get_verification_stats(
         project_codes = scope["project_codes"]
         latest_rows = scope["latest_rows"]
         raw_rows = scope["raw_rows"]
+        unanswered_rows = scope["unanswered_rows"]
+        raw_unanswered_rows = scope["raw_unanswered_rows"]
         dimensions = scope["dimensions"]
         group_rows = _query_group_rows(conn, scope["group_names"])
         chat_rows = _query_chat_rows(conn, group_rows, start, end)
@@ -2984,9 +3072,12 @@ def get_verification_stats(
     lims_records_by_code, lims_stats = fetch_lims_base_data(project_codes)
 
     group_names = scope["group_names"]
+    nightly_group_names = {
+        row.get("groupName") for row in unanswered_rows if row.get("groupName")
+    }
     dashboard_missed_groups = {
         row.get("groupName")
-        for row in latest_rows
+        for row in unanswered_rows
         if row.get("groupName") and str(row.get("isMissedMessage")) == "1"
     }
     qx_group_names = {str(row.get("name") or "") for row in group_rows if row.get("name")}
@@ -3064,7 +3155,10 @@ def get_verification_stats(
                 ["项目号数", project_total, project_total, "从命中群名提取 LC-* 项目号后去重"],
                 ["分析原始记录数", len(raw_rows), len(raw_rows), "qx_analysis_result 当前范围原始记录"],
                 ["看板去重记录数", len(latest_rows), len(latest_rows), "按 groupName + DATE(CREATEDTIME) 取最新记录"],
-                ["漏回群数", len(group_names), len(dashboard_missed_groups), f"漏回率 {_ratio(len(dashboard_missed_groups), len(group_names))}%"],
+                ["夜间漏回原始记录数", len(raw_unanswered_rows), len(raw_unanswered_rows), f"{UNANSWERED_RESULT_TABLE} 当前范围原始记录"],
+                ["夜间漏回去重记录数", len(unanswered_rows), len(unanswered_rows), "按 groupName + DATE(CREATEDTIME) 取夜间最新记录"],
+                ["夜间分析覆盖群数", len(group_names), len(nightly_group_names), "漏回模块分母仅包含夜间表实际覆盖的群"],
+                ["漏回群数", len(nightly_group_names), len(dashboard_missed_groups), f"漏回判定来自 {UNANSWERED_RESULT_TABLE}；漏回率 {_ratio(len(dashboard_missed_groups), len(nightly_group_names))}%"],
             ],
         },
         {
@@ -3097,6 +3191,7 @@ def get_verification_stats(
             "columns": ["验证项", "当前范围", "命中值", "说明"],
             "rows": [
                 ["qx_analysis_result 原始记录", len(group_names), len(raw_rows), "当前周期和筛选条件内的分析结果原始记录"],
+                [UNANSWERED_RESULT_TABLE + " 原始记录", len(group_names), len(raw_unanswered_rows), "当前周期和筛选条件内的每日零点漏回分析结果"],
                 ["qx_group 群信息", len(group_names), len(qx_group_names), "按 qx_analysis_result.groupName = qx_group.name 匹配"],
                 ["qx_chat 原始消息", len(qx_group_ids), len(qx_chat_room_ids), "按 qx_group.chat_id = qx_chat.roomid 匹配"],
                 ["qx_chat 消息时间", len(chat_rows), qx_chat_with_msgtime, "原始消息 msgtime 非空数量"],
@@ -3128,9 +3223,12 @@ def get_verification_stats(
             "groups_without_lims_link": len(diagnostics["groups_without_lims_link"]),
             "raw_analysis_rows": len(raw_rows),
             "latest_analysis_rows": len(latest_rows),
+            "raw_unanswered_rows": len(raw_unanswered_rows),
+            "latest_unanswered_rows": len(unanswered_rows),
+            "unanswered_groups": len(nightly_group_names),
         },
         "sections": sections,
-        "note": "数据源限定为数据库 qx_analysis_result/qx_chat/qx_group 与 LIMS base_data 接口；不再读取其他业务表补数。",
+        "note": f"数据源限定为数据库 qx_analysis_result/{UNANSWERED_RESULT_TABLE}/qx_chat/qx_group 与 LIMS base_data 接口；漏回模块统一读取夜间分析表。",
     }
 
 
@@ -3230,6 +3328,8 @@ def _current_dashboard_scope(
 
     group_names = sorted({row.get("groupName") for row in latest_rows if row.get("groupName")})
     raw_count = _raw_analysis_count(conn, start, end, group_names)
+    unanswered_rows = _latest_unanswered_rows(conn, start, end, group_names)
+    raw_unanswered_rows = _raw_unanswered_rows(conn, start, end, group_names)
     project_codes = sorted({
         code.upper()
         for dim in dimensions.values()
@@ -3248,7 +3348,9 @@ def _current_dashboard_scope(
     ) if group_names else []
     return {
         "latest_rows": latest_rows,
+        "unanswered_rows": unanswered_rows,
         "raw_rows": raw_rows,
+        "raw_unanswered_rows": raw_unanswered_rows,
         "raw_count_before_filter": raw_count,
         "dimensions": dimensions,
         "quality": quality,
@@ -3406,7 +3508,7 @@ def _drilldown_group_rows(scope: dict, groups: Dict[str, dict]) -> List[dict]:
             "days": len(aggregate.get("dates", set())),
             "missed_days": int(aggregate.get("missed_days") or 0),
             "analysis_time": max(analysis_times, default=""),
-            "source": "qx_analysis_result + qx_group + LIMS",
+            "source": f"qx_analysis_result + {UNANSWERED_RESULT_TABLE} + qx_group + LIMS",
         })
     return result
 
@@ -3542,7 +3644,7 @@ def _evidence_drilldown_rows(data: dict) -> List[dict]:
             "analysis_time": item.get("analysis_time") or item.get("analysis_date") or "",
             "project_codes": _joined(item.get("project_codes", [])),
             "aftersalers": _joined(item.get("aftersalers", [])),
-            "source": "qx_analysis_result + qx_chat",
+            "source": f"{UNANSWERED_RESULT_TABLE} + qx_chat",
         }
         messages = item.get("messages") or []
         if messages:
@@ -3753,7 +3855,11 @@ def _build_drilldown(
         rows = _evidence_drilldown_rows(evidence)
         level = "message"
     else:
-        groups = _group_aggregates(scope.get("latest_rows", []), scope.get("dimensions", {}))
+        groups = _group_aggregates(
+            scope.get("latest_rows", []),
+            scope.get("dimensions", {}),
+            scope.get("unanswered_rows", []),
+        )
         group_rows = _drilldown_group_rows(scope, groups)
         project_rows = _drilldown_project_rows(scope, groups)
         message_rows = _drilldown_message_rows(scope)
@@ -3776,7 +3882,12 @@ def _build_drilldown(
                 page=1, page_size=DASHBOARD_DRILLDOWN_EXPORT_MAX_ROWS + 1,
             )
             missed_group_names = {item.get("group_name") for item in unanswered.get("items", [])}
-            selected_groups = set(scope.get("group_names", [])) - missed_group_names
+            analyzed_group_names = {
+                row.get("groupName")
+                for row in scope.get("unanswered_rows", [])
+                if row.get("groupName")
+            }
+            selected_groups = analyzed_group_names - missed_group_names
         if target == "quality.groups_without_project_code":
             selected_groups = {
                 name for name, dim in scope.get("dimensions", {}).items() if not dim.get("codes")
@@ -4107,6 +4218,11 @@ def get_export_csv(
     w.writerow(["LIMS API请求", lims_stats.get("requests", 0), "返回记录", lims_stats.get("records", 0), "错误", lims_stats.get("errors", 0)])
 
     _write_raw_csv_section(w, "qx_analysis_result 原始记录", scope["raw_rows"])
+    _write_raw_csv_section(
+        w,
+        f"{UNANSWERED_RESULT_TABLE} 夜间漏回原始记录",
+        scope.get("raw_unanswered_rows", []),
+    )
     _write_raw_csv_section(w, "qx_group 原始记录", scope["group_rows"])
     _write_raw_csv_section(w, "qx_chat 原始记录", scope["chat_rows"])
     _write_raw_csv_section(w, "LIMS base_data API 原始返回", lims_rows)
@@ -4352,6 +4468,7 @@ def get_export_excel(
         {"指标": key, "值": value} for key, value in overview["data_quality"].items()
     ], ["指标", "值"])
     _write_excel_sheet(workbook, "analysis原始数据", scope["raw_rows"])
+    _write_excel_sheet(workbook, "夜间漏回原始数据", scope.get("raw_unanswered_rows", []))
     _write_excel_sheet(workbook, "group原始数据", scope["group_rows"])
     _write_excel_sheet(workbook, "chat原始数据", scope["chat_rows"])
     _write_excel_sheet(workbook, "LIMS原始数据", lims_rows)
