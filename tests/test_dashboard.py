@@ -1193,9 +1193,40 @@ class DashboardDrilldownTests(unittest.TestCase):
         self.assertEqual(aftersaler["reconciliation"]["dashboard_value"], 3)
         self.assertEqual(aftersaler["reconciliation"]["detail_value"], 3)
         self.assertTrue(aftersaler["reconciliation"]["consistent"])
+        self.assertEqual(aftersaler["snapshot_status"], "hit")
         self.assertEqual(product["reconciliation"]["dashboard_value"], 3)
         self.assertEqual(product["reconciliation"]["detail_value"], 3)
         self.assertTrue(product["reconciliation"]["consistent"])
+
+    def test_drilldown_rebuilds_scope_when_process_local_snapshot_is_missing(self):
+        snapshot = self._shared_business_snapshot()
+        missing_snapshot_id = "a" * 32
+        db_dashboard._dashboard_snapshot_cache.clear()
+
+        @contextmanager
+        def fake_database(_operation):
+            yield object()
+
+        with (
+            patch.object(db_dashboard, "database", fake_database),
+            patch.object(db_dashboard, "_query_qx_raw_scope", return_value=snapshot) as rebuild,
+        ):
+            result = db_dashboard._build_drilldown(
+                "summary.total_groups", "group_count", period="custom",
+                start_date="2026-07-01", end_date="2026-07-17",
+                snapshot_id=missing_snapshot_id,
+            )
+            cached_result = db_dashboard._build_drilldown(
+                "summary.total_groups", "group_count", period="custom",
+                start_date="2026-07-01", end_date="2026-07-17",
+                snapshot_id=missing_snapshot_id,
+            )
+
+        self.assertEqual(result["snapshot_status"], "rebuilt")
+        self.assertEqual(result["reconciliation"]["dashboard_value"], 1)
+        self.assertEqual(result["reconciliation"]["detail_value"], 1)
+        self.assertEqual(cached_result["snapshot_status"], "hit")
+        rebuild.assert_called_once()
 
     def test_drilldown_target_and_measure_are_allowlisted(self):
         with self.assertRaisesRegex(ValueError, "unsupported drilldown target"):
