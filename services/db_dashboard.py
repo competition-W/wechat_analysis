@@ -233,10 +233,14 @@ def _dashboard_snapshot_scope_key(
     )
 
 
-def _store_dashboard_snapshot(scope_key: str, snapshot: dict) -> str:
-    """Keep the exact inputs behind a rendered dashboard for its drilldowns."""
+def _store_dashboard_snapshot(
+    scope_key: str,
+    snapshot: dict,
+    token: Optional[str] = None,
+) -> str:
+    """Keep or rehydrate the exact inputs behind a rendered dashboard."""
     now = time.time()
-    token = uuid.uuid4().hex
+    token = token or uuid.uuid4().hex
     snapshot["_snapshot_id"] = token
     with _cache_lock:
         expired = [
@@ -249,19 +253,28 @@ def _store_dashboard_snapshot(scope_key: str, snapshot: dict) -> str:
     return token
 
 
-def _get_dashboard_snapshot(token: str, scope_key: str) -> Optional[dict]:
+def _get_dashboard_snapshot(token: str, scope_key: str) -> Tuple[Optional[dict], str]:
     if not token:
-        return None
+        return None, "not_requested"
     now = time.time()
     with _cache_lock:
         cached = _dashboard_snapshot_cache.get(token)
         if not cached:
-            return None
+            logger.warning("dashboard.snapshot.miss token_prefix={}", token[:8])
+            return None, "missing"
         created_at, cached_scope_key, snapshot = cached
-        if now - created_at >= CACHE_TTL_SECONDS or cached_scope_key != scope_key:
+        if now - created_at >= CACHE_TTL_SECONDS:
             _dashboard_snapshot_cache.pop(token, None)
-            return None
-        return snapshot
+            logger.warning(
+                "dashboard.snapshot.expired token_prefix={} age_seconds={:.1f}",
+                token[:8],
+                now - created_at,
+            )
+            return None, "expired"
+        if cached_scope_key != scope_key:
+            logger.warning("dashboard.snapshot.scope_mismatch token_prefix={}", token[:8])
+            return None, "scope_mismatch"
+        return snapshot, "hit"
 
 
 def extract_project_codes(group_name: str) -> List[str]:
@@ -3825,12 +3838,22 @@ def _build_drilldown(
     scope_key = _dashboard_snapshot_scope_key(
         start, end, normalized_period, region, aftersaler, category, key_account,
     )
-    scope = _get_dashboard_snapshot(snapshot_id, scope_key) if snapshot_id else None
-    if snapshot_id and scope is None:
-        raise ValueError("看板数据快照已过期或与当前筛选不匹配，请刷新看板后重试")
+    scope, snapshot_lookup = _get_dashboard_snapshot(snapshot_id, scope_key)
+    snapshot_status = "hit" if scope is not None else ("rebuilt" if snapshot_id else "not_requested")
     if scope is None:
+        if snapshot_id:
+            logger.warning(
+                "dashboard.snapshot.rebuild target={} token_prefix={} period={} start={} end={}",
+                target,
+                snapshot_id[:8],
+                normalized_period,
+                start,
+                end,
+            )
         with database("dashboard.drilldown") as conn:
             scope = _query_qx_raw_scope(conn, start, end, region, aftersaler, category, key_account)
+        if snapshot_id and snapshot_lookup in {"missing", "expired"}:
+            _store_dashboard_snapshot(scope_key, scope, token=snapshot_id)
     overview = _build_overview(
         start=start, end=end, period=normalized_period,
         region=region, aftersaler=aftersaler, category=category, key_account=key_account,
@@ -4057,6 +4080,7 @@ def _build_drilldown(
         reconciliation_note = "看板汇总值与当前证据明细统计单位不同，仅供追溯。"
     return {
         "target": target, "measure": measure, "title": spec["title"], "level": level,
+        "snapshot_status": snapshot_status,
         "definition": _drilldown_definition(target, level, measure),
         "period": {"name": normalized_period, "start": start.isoformat(), "end": end.isoformat()},
         "filters": {
